@@ -22,22 +22,18 @@ The [script](install.sh) checks the download against the release's checksums.
 ## Install with Homebrew
 
 ```sh
-brew tap synth-sh/synth https://github.com/synth-sh/synth.git
-brew install synth-sh/synth/synth
+brew install synth-sh/tap/synth
 ```
 
-The tap lives in this repository. The explicit Git URL is required because its
-name does not start with `homebrew-`. The formula downloads the published binary
-for macOS arm64 or Linux x86-64; Zig is not required. It currently tracks the
-rolling [`dev` prerelease](https://github.com/synth-sh/synth/releases/tag/dev),
-and the release workflows update its version, URLs, and checksums after publishing.
+The [Synth tap](https://github.com/synth-sh/homebrew-tap) tracks stable releases
+for Apple Silicon Macs and for Linux on arm64 and x86-64. Zig is not required.
 A model server with tool-call support is still required.
 
-To update to the latest published build:
+To upgrade:
 
 ```sh
 brew update
-brew upgrade synth-sh/synth/synth
+brew upgrade synth-sh/tap/synth
 ```
 
 ## Build from source
