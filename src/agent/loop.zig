@@ -254,6 +254,9 @@ turn_start_seq: ?u64 = null,
 tools_json: ?[]u8 = null,
 /// Base instructions, before the agent's and the project's are appended.
 system_prompt: []const u8 = base_prompt.default,
+/// What the model is asked to end its commit messages with. Empty asks for
+/// nothing.
+commit_trailer: []const u8 = "",
 /// Where the app is running, for the environment block. Borrowed.
 project: ?*const Project = null,
 /// The skills this project offers, for the `<skills>` block. Borrowed, and
@@ -525,6 +528,7 @@ fn systemPrompt(self: *Loop) []const u8 {
         self.agent.prompt,
         project,
         self.skills,
+        self.commit_trailer,
     ) catch self.system_prompt;
 }
 

@@ -26,7 +26,7 @@ pub fn dump(init: std.process.Init) !void {
     defer skills.deinit();
 
     const base = config.system_prompt orelse base_prompt.default;
-    const prompt = try Context.build(allocator, io, base, &project, skills.skills);
+    const prompt = try Context.build(allocator, io, base, &project, skills.skills, config.commit_trailer);
     defer allocator.free(prompt);
 
     var buffer: [4096]u8 = undefined;

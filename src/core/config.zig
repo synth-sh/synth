@@ -142,6 +142,12 @@ hook_timeout_ms: u64 = Hooks.default_timeout_ms,
 prune: Database.Policy = .{ .shed_after_days = 30 },
 /// When a finished turn rings the terminal bell.
 bell: Bell = .unfocused,
+/// The trailer the model is asked to end its commit messages with. Empty asks
+/// for none.
+commit_trailer: []const u8 = default_commit_trailer,
+
+/// Credits synth's GitHub account, which owns this address, as co-author.
+pub const default_commit_trailer = "Co-Authored-By: synth <noreply@getsynth.sh>";
 
 /// When a finished turn says so. `unfocused` needs the terminal to report focus;
 /// one that does not never rings, which is what `always` is for.
@@ -177,6 +183,7 @@ const File = struct {
         shed_after_days: ?u32 = null,
     } = null,
     bell: ?Bell = null,
+    commit_trailer: ?[]const u8 = null,
     /// The single-provider shape this file used to have. Still read, so an
     /// existing `config.json` keeps working; nothing writes it any more, and
     /// where a provider lives is the database's business now.
@@ -301,6 +308,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     }
 
     if (parsed.bell) |value| self.bell = value;
+    if (parsed.commit_trailer) |value| self.commit_trailer = value;
 
     if (parsed.ollama) |ollama| {
         if (ollama.host) |value| self.host_override = value;
@@ -493,6 +501,31 @@ test "the bell setting is read from the file" {
 
     try config.applyFile(io, path);
     try testing.expectEqual(Bell.always, config.bell);
+}
+
+test "the commit trailer defaults to synth's, and the file can change or clear it" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "config.json" });
+    defer testing.allocator.free(path);
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    try testing.expectEqualStrings(default_commit_trailer, config.commit_trailer);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"commit_trailer\":\"Assisted-by: synth\"}" });
+    try config.applyFile(io, path);
+    try testing.expectEqualStrings("Assisted-by: synth", config.commit_trailer);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"commit_trailer\":\"\"}" });
+    try config.applyFile(io, path);
+    try testing.expectEqualStrings("", config.commit_trailer);
 }
 
 test "approvals are read from the file" {

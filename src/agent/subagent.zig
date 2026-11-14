@@ -229,6 +229,7 @@ pub const Runner = struct {
         child.loop.project = parent.project;
         child.loop.skills = parent.skills;
         child.loop.system_prompt = parent.system_prompt;
+        child.loop.commit_trailer = parent.commit_trailer;
         child.loop.delegate = null;
         // Its calls are not the session's, so they have no card for a terminal to show in.
         child.loop.handoff = .{ .files = parent.handoff.files };
