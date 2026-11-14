@@ -187,6 +187,11 @@
             ],
             "default": "unfocused",
             "description": "When a finished turn says so, by desktop notification and BEL. 'unfocused' needs the terminal to report focus; one that does not never rings, so use 'always' there. Under tmux both need focus-events and allow-passthrough on."
+        },
+        "commit_trailer": {
+            "type": "string",
+            "default": "Co-Authored-By: synth <noreply@getsynth.sh>",
+            "description": "The trailer the model is asked to end its commit messages with, in a git project. An empty string asks for none."
         }
     },
     "$defs": {

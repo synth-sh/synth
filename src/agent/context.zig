@@ -50,6 +50,7 @@ pub const Cache = struct {
         agent_prompt: []const u8,
         project: *const Project,
         available: []const skills.Skill,
+        commit_trailer: []const u8,
     ) ![]const u8 {
         const now: std.Io.Timestamp = .now(io, .awake);
         if (self.text) |text| {
@@ -57,7 +58,7 @@ pub const Cache = struct {
             if (age < cache_ms * std.time.ns_per_ms) return text;
         }
 
-        const built = try buildWithAgent(allocator, io, base_prompt, agent_prompt, project, available);
+        const built = try buildWithAgent(allocator, io, base_prompt, agent_prompt, project, available, commit_trailer);
         self.invalidate(allocator);
         self.text = built;
         self.built_at = now;
@@ -75,12 +76,13 @@ fn buildWithAgent(
     agent_prompt: []const u8,
     project: *const Project,
     available: []const skills.Skill,
+    commit_trailer: []const u8,
 ) ![]const u8 {
-    if (agent_prompt.len == 0) return build(allocator, io, base, project, available);
+    if (agent_prompt.len == 0) return build(allocator, io, base, project, available, commit_trailer);
 
     const joined = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ base, agent_prompt });
     defer allocator.free(joined);
-    return build(allocator, io, joined, project, available);
+    return build(allocator, io, joined, project, available, commit_trailer);
 }
 
 /// Assemble the full system prompt. Caller owns the result.
@@ -90,6 +92,7 @@ pub fn build(
     base_prompt: []const u8,
     project: *const Project,
     available: []const skills.Skill,
+    commit_trailer: []const u8,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -99,6 +102,7 @@ pub fn build(
 
     try writeInstructions(w, io, allocator, project.root);
     try writeSkills(w, available);
+    try writeCommits(w, project, commit_trailer);
     try writeEnvironment(w, project);
     try writeTree(w, io, allocator, project.root);
 
@@ -131,6 +135,18 @@ fn writeSkills(w: *std.Io.Writer, available: []const skills.Skill) !void {
         try w.print("{s}: {s}\n", .{ entry.id, entry.description });
     }
     try w.writeAll("</skills>\n");
+}
+
+fn writeCommits(w: *std.Io.Writer, project: *const Project, trailer: []const u8) !void {
+    if (project.vcs != .git or trailer.len == 0) return;
+    try w.print(
+        \\
+        \\<commits>
+        \\End every commit message you write with this trailer, after a blank line:
+        \\{s}
+        \\</commits>
+        \\
+    , .{trailer});
 }
 
 fn writeEnvironment(w: *std.Io.Writer, project: *const Project) !void {
@@ -200,7 +216,7 @@ test "build describes the current project, volatile parts last" {
     var project = try Project.detect(allocator, io, cwd_buf[0..n]);
     defer project.deinit(allocator);
 
-    const prompt = try build(allocator, io, "base instructions", &project, &.{});
+    const prompt = try build(allocator, io, "base instructions", &project, &.{}, "");
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.startsWith(u8, prompt, "base instructions"));
@@ -227,15 +243,15 @@ test "a cached prompt is shared by the steps of a turn" {
     var cache: Cache = .{};
     defer cache.deinit(allocator);
 
-    const first = try cache.get(allocator, io, "base", "", &project, &.{});
-    const second = try cache.get(allocator, io, "base", "", &project, &.{});
+    const first = try cache.get(allocator, io, "base", "", &project, &.{}, "");
+    const second = try cache.get(allocator, io, "base", "", &project, &.{}, "");
     try std.testing.expectEqual(first.ptr, second.ptr);
 
     const copy = try allocator.dupe(u8, first);
     defer allocator.free(copy);
 
     cache.invalidate(allocator);
-    const third = try cache.get(allocator, io, "base", "", &project, &.{});
+    const third = try cache.get(allocator, io, "base", "", &project, &.{}, "");
     try std.testing.expectEqualStrings(copy, third);
 }
 
@@ -254,7 +270,7 @@ test "skills are named in the prompt, and only the ones a model could pick" {
         .{ .id = "silent", .name = "silent", .description = "", .dir = "/p/silent", .body = "b" },
     };
 
-    const prompt = try build(allocator, io, "base", &project, available);
+    const prompt = try build(allocator, io, "base", &project, available, "");
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "commit: how commits are written") != null);
@@ -263,7 +279,35 @@ test "skills are named in the prompt, and only the ones a model could pick" {
     const block = std.mem.indexOf(u8, prompt, "<skills>").?;
     try std.testing.expect(block < std.mem.indexOf(u8, prompt, "<environment>").?);
 
-    const none = try build(allocator, io, "base", &project, &.{});
+    const none = try build(allocator, io, "base", &project, &.{}, "");
     defer allocator.free(none);
     try std.testing.expect(std.mem.indexOf(u8, none, "<skills>") == null);
+}
+
+test "a git project is asked for the commit trailer, unless it is turned off" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try std.process.currentPath(io, &cwd_buf);
+
+    var project = try Project.detect(allocator, io, cwd_buf[0..n]);
+    defer project.deinit(allocator);
+    project.vcs = .git;
+
+    const trailer = "Co-Authored-By: synth <noreply@getsynth.sh>";
+    const asked = try build(allocator, io, "base", &project, &.{}, trailer);
+    defer allocator.free(asked);
+    const block = std.mem.indexOf(u8, asked, "<commits>").?;
+    try std.testing.expect(std.mem.indexOf(u8, asked[block..], trailer) != null);
+    try std.testing.expect(block < std.mem.indexOf(u8, asked, "<environment>").?);
+
+    const off = try build(allocator, io, "base", &project, &.{}, "");
+    defer allocator.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "<commits>") == null);
+
+    project.vcs = .none;
+    const untracked = try build(allocator, io, "base", &project, &.{}, trailer);
+    defer allocator.free(untracked);
+    try std.testing.expect(std.mem.indexOf(u8, untracked, "<commits>") == null);
 }

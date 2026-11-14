@@ -126,6 +126,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     if (config.max_stall_ms) |ms| self.loop.max_stall_ms = ms;
     if (config.max_turn_tokens) |tokens| self.loop.max_turn_tokens = tokens;
     if (config.system_prompt) |text| self.loop.system_prompt = text;
+    self.loop.commit_trailer = config.commit_trailer;
     self.loop.project = &self.project;
     self.loop.skills = self.skills.skills;
     try self.loop.useAgent(agents.default_id);

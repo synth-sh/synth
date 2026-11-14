@@ -30,6 +30,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `web` | object | none | Settings for the web tools. See below. |
 | `prune` | object | shed after 30 days | What a prune throws away. See [Pruning](#pruning). |
 | `bell` | string | `unfocused` | When a finished turn says so: `unfocused`, `always` or `never`. See below. |
+| `commit_trailer` | string | `Co-Authored-By: synth <noreply@getsynth.sh>` | The trailer the model ends its commit messages with, in a git project. `""` turns it off. See below. |
 
 ```json
 {
@@ -87,6 +88,16 @@ both halves need turning on, and neither is the default:
 ```
 set -g focus-events on
 set -g allow-passthrough on
+```
+
+`"commit_trailer"` is the line synth asks the model to end its commit messages
+with, so commits it writes credit it on GitHub. It applies in git projects
+only. Set your own trailer, such as `"Assisted-by: synth"`, or `""` for none:
+
+```json
+{
+  "commit_trailer": ""
+}
 ```
 
 ## Pruning
