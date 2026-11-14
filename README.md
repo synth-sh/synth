@@ -26,24 +26,14 @@ brew install synth-sh/tap/synth
 ```
 
 The [Synth tap](https://github.com/synth-sh/homebrew-tap) tracks stable releases
-for macOS arm64 and Linux x86-64. Zig is not required. A model server with
-tool-call support is still required.
+for Apple Silicon Macs and for Linux on arm64 and x86-64. Zig is not required.
+A model server with tool-call support is still required.
 
 To upgrade:
 
 ```sh
 brew update
 brew upgrade synth-sh/tap/synth
-```
-
-If Homebrew asks you to migrate an existing install from the old
-`synth-sh/synth` tap:
-
-```sh
-brew tap synth-sh/tap
-brew trust --formula synth-sh/tap/synth
-brew reinstall synth-sh/tap/synth
-brew untap synth-sh/synth
 ```
 
 ## Build from source
