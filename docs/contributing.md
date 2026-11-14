@@ -90,5 +90,6 @@ only for what the code cannot say.
 
 ## Homebrew release updates
 
-The stable release workflow downloads the published archives and opens a
-formula-only PR from `chore/update-homebrew-vX.Y.Z`. This will be done automatically, no code changes are required as part of the PR.
+The [Synth tap](https://github.com/synth-sh/homebrew-tap) checks for stable
+GitHub releases and opens a formula update PR. To propose the update immediately
+after publishing, run **Sync stable releases** in the tap's Actions tab.

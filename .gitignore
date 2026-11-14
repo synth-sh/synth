@@ -12,7 +12,8 @@ zig-pkg
 *.log
 *.tar.gz
 
-# Configs, except the schema
+# Local configs
 *.json
 !*.schema.json
+!/tap_migrations.json
 *.json.lock
