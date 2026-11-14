@@ -90,6 +90,6 @@ only for what the code cannot say.
 
 ## Homebrew release updates
 
-The [Synth tap](https://github.com/synth-sh/homebrew-tap) checks for stable
-GitHub releases and opens a formula update PR. To propose the update immediately
-after publishing, run **Sync stable releases** in the tap's Actions tab.
+After publishing a stable release, open
+[Actions → Sync stable releases](https://github.com/synth-sh/homebrew-tap/actions/workflows/sync.yml)
+in the tap and click **Run workflow** to propose the formula update PR.

@@ -98,14 +98,3 @@ jobs:
             install -m755 synth /usr/local/bin/synth
             ```
           token: ${{ secrets.GITHUB_TOKEN }}
-
-  homebrew:
-    name: Notify Homebrew tap
-    needs: release
-    if: github.repository == 'synth-sh/synth' && vars.HOMEBREW_APP_CLIENT_ID != ''
-    permissions: {}
-    uses: synth-sh/homebrew-tap/.github/workflows/notify-release.yml@main
-    with:
-      client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
-    secrets:
-      private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
