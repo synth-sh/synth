@@ -64,6 +64,7 @@ pub const Hook = struct {
     id: []const u8 = "",
     trusted: bool = true,
     enabled: bool = true,
+    transcript: bool = false,
     source: []const u8 = "config",
     timeout_ms: ?u64 = null,
     async: bool = false,
@@ -136,7 +137,12 @@ pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []cons
             } else "";
             if (definition.object.get("hooks")) |group| {
                 if (group != .array or definition.object.contains("command")) return error.InvalidHooks;
+                var group_fields = definition.object.iterator();
+                while (group_fields.next()) |field| {
+                    if (!std.mem.eql(u8, field.key_ptr.*, "matcher") and !std.mem.eql(u8, field.key_ptr.*, "hooks")) return error.InvalidHookDefinition;
+                }
                 for (group.array.items) |handler| {
+                    try validateDefinition(handler, false);
                     const encoded = try std.json.Stringify.valueAlloc(allocator, handler, .{});
                     var hook = try std.json.parseFromSliceLeaky(Hook, allocator, encoded, .{});
                     if (hook.type == .command and hook.command.len == 0) return error.InvalidHooks;
@@ -153,6 +159,7 @@ pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []cons
                     try hooks.append(allocator, hook);
                 }
             } else {
+                try validateDefinition(definition, true);
                 const encoded = try std.json.Stringify.valueAlloc(allocator, definition, .{});
                 var hook = try std.json.parseFromSliceLeaky(Hook, allocator, encoded, .{});
                 if (hook.command.len == 0 or hook.type != .command or hook.async) return error.InvalidHooks;
@@ -167,6 +174,20 @@ pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []cons
         }
     }
     return set;
+}
+
+fn validateDefinition(value: std.json.Value, legacy: bool) !void {
+    if (value != .object) return error.InvalidHooks;
+    var entries = value.object.iterator();
+    while (entries.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (legacy and std.mem.eql(u8, key, "matcher")) continue;
+        var valid = false;
+        inline for (.{ "type", "command", "timeout_ms", "async", "server", "tool", "arguments", "transcript" }) |allowed| {
+            if (std.mem.eql(u8, key, allowed)) valid = true;
+        }
+        if (!valid) return error.InvalidHookDefinition;
+    }
 }
 
 pub const Invocation = struct {
@@ -190,6 +211,22 @@ pub const Invocation = struct {
     input_tokens: u32 = 0,
     output_tokens: u32 = 0,
     transcript_path: ?[]const u8 = null,
+    last_assistant_message: ?[]const u8 = null,
+    parent_session_id: []const u8 = "",
+    reason: []const u8 = "",
+    request_id: u64 = 0,
+    attempt: u32 = 0,
+
+    pub fn dupe(self: Invocation, arena: std.mem.Allocator) !Invocation {
+        var copy = self;
+        inline for (std.meta.fields(Invocation)) |field| {
+            if (field.type == []const u8) @field(copy, field.name) = try arena.dupe(u8, @field(self, field.name));
+            if (field.type == ?[]const u8) {
+                if (@field(self, field.name)) |value| @field(copy, field.name) = try arena.dupe(u8, value);
+            }
+        }
+        return copy;
+    }
 };
 
 pub const Record = struct {
@@ -198,6 +235,11 @@ pub const Record = struct {
     started_ms: i64,
     duration_ms: i64,
     status: []const u8,
+    exit_code: ?u8 = null,
+    error_name: []const u8 = "",
+    session_id: [64]u8 = @splat(0),
+    turn_id: [64]u8 = @splat(0),
+    call_id: [64]u8 = @splat(0),
 };
 
 pub const Runtime = struct {
@@ -211,10 +253,14 @@ pub const Runtime = struct {
     records_len: usize = 0,
     records_next: usize = 0,
     records_mutex: std.Io.Mutex = .init,
+    pending: Result = .{},
+    temp_dir: ?[]u8 = null,
+    temp_mutex: std.Io.Mutex = .init,
 
-    fn enter(self: *Runtime, stop: ?*const std.atomic.Value(bool)) !void {
+    fn enter(self: *Runtime, stop: ?*const std.atomic.Value(bool), deadline_ms: ?i64) !void {
         while (true) {
             if (self.stop.load(.acquire)) return error.Cancelled;
+            if (deadline_ms) |deadline| if (std.Io.Clock.now(.awake, self.io).toMilliseconds() >= deadline) return error.Timeout;
             if (stop) |flag| if (flag.load(.acquire)) return error.Cancelled;
             const active = self.active.load(.acquire);
             if (active < 8 and self.active.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) return;
@@ -224,30 +270,73 @@ pub const Runtime = struct {
     fn leave(self: *Runtime) void {
         _ = self.active.fetchSub(1, .release);
     }
-    fn record(self: *Runtime, hook: Hook, invocation: Invocation, started: i64, status: []const u8) void {
+    fn record(self: *Runtime, hook: Hook, invocation: Invocation, started: i64, status: []const u8, exit_code: ?u8, error_name: []const u8) void {
         self.records_mutex.lockUncancelable(self.io);
         defer self.records_mutex.unlock(self.io);
         var record_value: Record = .{ .event = invocation.event, .started_ms = started, .duration_ms = std.Io.Clock.now(.awake, self.io).toMilliseconds() - started, .status = status };
+        record_value.exit_code = exit_code;
+        record_value.error_name = error_name;
+        inline for (.{ .{ "session_id", "session_id" }, .{ "turn_id", "turn_id" }, .{ "call_id", "tool_call_id" } }) |pair| {
+            const value = @field(invocation, pair[1]);
+            const length = @min(64, value.len);
+            @memcpy(@field(record_value, pair[0])[0..length], value[0..length]);
+        }
         @memcpy(record_value.id[0..@min(64, hook.id.len)], hook.id[0..@min(64, hook.id.len)]);
         self.records[self.records_next] = record_value;
         self.records_next = (self.records_next + 1) % self.records.len;
         self.records_len = @min(self.records_len + 1, self.records.len);
     }
     fn launch(self: *Runtime, runner: Runner, hook: Hook, invocation: Invocation) !void {
+        while (true) {
+            self.background_mutex.lockUncancelable(self.io);
+            if (self.background.items.len < 64) {
+                defer self.background_mutex.unlock(self.io);
+                var session_runner = runner;
+                session_runner.stop = &self.stop;
+                const job = try Job.start(self.allocator, session_runner, hook, invocation, null);
+                errdefer job.destroy();
+                try self.background.append(self.allocator, job);
+                return;
+            }
+            const oldest = self.background.orderedRemove(0);
+            self.background_mutex.unlock(self.io);
+            defer oldest.destroy();
+            oldest.join();
+            self.background_mutex.lockUncancelable(self.io);
+            defer self.background_mutex.unlock(self.io);
+            try self.collect(oldest);
+        }
+    }
+    fn collect(self: *Runtime, job: *Job) !void {
+        if (job.failed) |err| {
+            const message = try std.fmt.allocPrint(self.allocator, "Background hook failed: {s}", .{@errorName(err)});
+            if (self.pending.message) |old| self.allocator.free(old);
+            self.pending.message = message;
+            return;
+        }
+        if (job.result.blocked != null or job.result.replacement != null or job.result.permission != null or job.result.feedback != null or job.result.stop) {
+            if (job.result.message) |old| job.arena.allocator().free(old);
+            job.result.message = try job.arena.allocator().dupe(u8, "Background hook control effects were ignored");
+        }
+        job.result.blocked = null;
+        job.result.replacement = null;
+        job.result.feedback = null;
+        job.result.permission = null;
+        job.result.stop = false;
+        try self.pending.merge(self.allocator, job.result);
+        try self.bound(self.allocator, &self.pending);
+    }
+    pub fn notice(self: *Runtime, message: []const u8) !void {
         self.background_mutex.lockUncancelable(self.io);
         defer self.background_mutex.unlock(self.io);
-        if (self.background.items.len >= 64) return error.BackgroundHookQueueFull;
-        var session_runner = runner;
-        session_runner.stop = &self.stop;
-        const job = try Job.start(self.allocator, session_runner, hook, invocation, null);
-        errdefer job.destroy();
-        try self.background.append(self.allocator, job);
+        const copy = try self.allocator.dupe(u8, message);
+        if (self.pending.message) |old| self.allocator.free(old);
+        self.pending.message = copy;
+        try self.bound(self.allocator, &self.pending);
     }
     pub fn drain(self: *Runtime, allocator: std.mem.Allocator) !Result {
         self.background_mutex.lockUncancelable(self.io);
         defer self.background_mutex.unlock(self.io);
-        var result: Result = .{};
-        errdefer result.deinit(allocator);
         var i: usize = 0;
         while (i < self.background.items.len) {
             const job = self.background.items[i];
@@ -258,25 +347,66 @@ pub const Runtime = struct {
             _ = self.background.orderedRemove(i);
             defer job.destroy();
             job.join();
-            if (job.failed != null) continue;
-            if (job.result.blocked != null or job.result.replacement != null or job.result.permission != null or job.result.stop) {
-                if (job.result.message) |old| job.arena.allocator().free(old);
-                job.result.message = try job.arena.allocator().dupe(u8, "Background hook control effects were ignored");
-            }
-            if (job.result.blocked) |old| job.arena.allocator().free(old);
-            if (job.result.replacement) |old| job.arena.allocator().free(old);
-            job.result.blocked = null;
-            job.result.replacement = null;
-            job.result.permission = null;
-            job.result.stop = false;
-            try result.merge(allocator, job.result);
+            try self.collect(job);
         }
+        var result: Result = .{};
+        errdefer result.deinit(allocator);
+        try result.merge(allocator, self.pending);
+        self.pending.deinit(self.allocator);
         return result;
     }
-    pub fn deinit(self: *Runtime) void {
+    pub fn privatePath(self: *Runtime, allocator: std.mem.Allocator, extension: []const u8) ![]u8 {
+        self.temp_mutex.lockUncancelable(self.io);
+        defer self.temp_mutex.unlock(self.io);
+        var nonce: [16]u8 = undefined;
+        self.io.random(&nonce);
+        if (self.temp_dir == null) {
+            const path = try std.fmt.allocPrint(self.allocator, "/tmp/synth-hooks-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+            errdefer self.allocator.free(path);
+            try std.Io.Dir.cwd().createDir(self.io, path, .fromMode(0o700));
+            self.temp_dir = path;
+            self.io.random(&nonce);
+        }
+        return std.fmt.allocPrint(allocator, "{s}/{s}.{s}", .{ self.temp_dir.?, std.fmt.bytesToHex(nonce, .lower), extension });
+    }
+    pub fn bound(self: *Runtime, allocator: std.mem.Allocator, result: *Result) !void {
+        inline for (.{ "context", "message", "blocked" }) |field| {
+            if (@field(result, field)) |value| {
+                if (value.len > 8192) {
+                    const path = try self.privatePath(allocator, "txt");
+                    defer allocator.free(path);
+                    const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+                    defer file.close(self.io);
+                    var buffer: [4096]u8 = undefined;
+                    var writer = file.writer(self.io, &buffer);
+                    try writer.interface.writeAll(value);
+                    try writer.interface.flush();
+                    var preview_end: usize = 4096;
+                    while (preview_end > 0 and value[preview_end] & 0xc0 == 0x80) preview_end -= 1;
+                    const preview = try std.fmt.allocPrint(allocator, "{s}\n[Full hook output: {s}]", .{ value[0..preview_end], path });
+                    allocator.free(value);
+                    @field(result, field) = preview;
+                }
+            }
+        }
+    }
+    pub fn cancelBackground(self: *Runtime) void {
         self.stop.store(true, .release);
+        self.background_mutex.lockUncancelable(self.io);
+        defer self.background_mutex.unlock(self.io);
         for (self.background.items) |job| job.destroy();
+        self.background.clearRetainingCapacity();
+        self.pending.deinit(self.allocator);
+        self.stop.store(false, .release);
+    }
+    pub fn deinit(self: *Runtime) void {
+        self.cancelBackground();
         self.background.deinit(self.allocator);
+        self.pending.deinit(self.allocator);
+        if (self.temp_dir) |path| {
+            std.Io.Dir.cwd().deleteTree(self.io, path) catch {};
+            self.allocator.free(path);
+        }
     }
 };
 
@@ -301,10 +431,7 @@ const Job = struct {
             self.arena.deinit();
             allocator.destroy(self);
         }
-        inline for (std.meta.fields(Invocation)) |field| {
-            if (field.type == []const u8) @field(self.invocation, field.name) = try self.arena.allocator().dupe(u8, @field(invocation, field.name));
-        }
-        if (invocation.transcript_path) |path| self.invocation.transcript_path = try self.arena.allocator().dupe(u8, path);
+        self.invocation = try invocation.dupe(self.arena.allocator());
         self.future = try runner.io.concurrent(run, .{self});
         return self;
     }
@@ -336,6 +463,7 @@ pub const Runner = struct {
     set: Set,
     timeout_ms: u64 = default_timeout_ms,
     runtime: ?*Runtime = null,
+    deadline_ms: ?i64 = null,
     mcp_executor: ?McpExecutor = null,
 
     /// Raised when the turn is cancelled. Checked between hooks and on every
@@ -368,6 +496,7 @@ pub const Runner = struct {
         var at: usize = 0;
         var completion: std.atomic.Value(usize) = .init(0);
         var replacement_order: usize = 0;
+        var failure: ?anyerror = null;
         while (at < definitions.len) {
             const hook = definitions[at];
             if (self.givenUp()) return error.Cancelled;
@@ -401,7 +530,6 @@ pub const Runner = struct {
                     count += 1;
                 }
             }
-            var failure: ?anyerror = null;
             for (jobs[0..count]) |maybe| {
                 const job = maybe.?;
                 job.join();
@@ -415,23 +543,36 @@ pub const Runner = struct {
                 } else if (job.result.replacement != null) replacement_order = job.order;
                 try outcome.merge(allocator, job.result);
             }
-            if (failure) |err| return err;
+            if (self.runtime) |runtime| try runtime.bound(allocator, &outcome);
         }
+        if (failure) |err| return err;
         return outcome;
     }
 
     fn runHook(self: Runner, allocator: std.mem.Allocator, hook: Hook, invocation: Invocation) !Result {
-        if (self.runtime) |runtime| try runtime.enter(self.stop);
+        if (self.runtime) |runtime| try runtime.enter(self.stop, self.deadline_ms);
         defer if (self.runtime) |runtime| runtime.leave();
         var configured = self;
         configured.timeout_ms = hook.timeout_ms orelse self.timeout_ms;
         if (invocation.event == .session_end or invocation.event == .interrupt) configured.timeout_ms = @min(hook.timeout_ms orelse 1000, 3000);
         const started = std.Io.Clock.now(.awake, self.io).toMilliseconds();
-        if (self.runtime) |runtime| runtime.record(hook, invocation, started, "started");
-        var failed = true;
-        defer if (self.runtime) |runtime| runtime.record(hook, invocation, started, if (failed) "failed" else "completed");
+        if (self.deadline_ms) |deadline| {
+            if (started >= deadline) return error.Timeout;
+            configured.timeout_ms = @min(configured.timeout_ms, @as(u64, @intCast(deadline - started)));
+        }
+        if (self.runtime) |runtime| runtime.record(hook, invocation, started, "started", null, "");
+        var exit_code: ?u8 = null;
+        const result = configured.executeHook(allocator, hook, invocation, &exit_code) catch |err| {
+            if (self.runtime) |runtime| runtime.record(hook, invocation, started, "failed", exit_code, @errorName(err));
+            return err;
+        };
+        if (self.runtime) |runtime| runtime.record(hook, invocation, started, "completed", exit_code, "");
+        return result;
+    }
+
+    fn executeHook(self: Runner, allocator: std.mem.Allocator, hook: Hook, invocation: Invocation, exit_code: *?u8) !Result {
         const command = if (hook.type == .command)
-            try configured.runCommand(allocator, hook.command, invocation)
+            try self.runCommand(allocator, hook.command, invocation)
         else blk: {
             const executor = self.mcp_executor orelse return error.McpHooksUnavailable;
             var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -441,27 +582,35 @@ pub const Runner = struct {
             const input = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), payload.written(), .{});
             const expanded = try @import("hook_interpolation.zig").expand(arena.allocator(), hook.arguments, input);
             const args = try std.json.Stringify.valueAlloc(arena.allocator(), expanded, .{});
-            const response = try executor.call(executor.userdata, allocator, hook, args, configured.timeout_ms, self.stop);
+            const response = try executor.call(executor.userdata, allocator, hook, args, self.timeout_ms, self.stop);
             errdefer allocator.free(response);
             break :blk CommandResult{ .code = 0, .stdout = response, .stderr = try allocator.dupe(u8, ""), .overflow = response.len > stderr_limit };
         };
+        exit_code.* = command.code;
         defer allocator.free(command.stderr);
         defer allocator.free(command.stdout);
         if (!hook.legacy and command.overflow) return error.HookOutputTooLarge;
         var result: Result = .{};
         errdefer result.deinit(allocator);
-        if (command.code == 2 and (invocation.event != .post_tool_use or !hook.legacy)) {
+        const advisory = invocation.event == .pre_model_request or invocation.event == .post_model_request or invocation.event == .interrupt or invocation.event == .session_end or invocation.event == .subagent_start;
+        if (command.code == 2 and advisory) {
+            result.message = try allocator.dupe(u8, "Observation hook exited 2; control effect ignored");
+        } else if (command.code == 2 and (invocation.event != .post_tool_use or !hook.legacy)) {
             const reason = std.mem.trim(u8, command.stderr, " \t\r\n");
             result.blocked = try allocator.dupe(u8, if (reason.len > 0) reason else "blocked by hook");
         } else if (!hook.legacy and command.code == 0) {
             result = try output.parse(allocator, command.stdout, invocation.event.name());
         }
-        if (result.context) |context| {
-            const attributed = try std.fmt.allocPrint(allocator, "[Hook {s}{s}]\n{s}", .{ hook.source, if (hook.type == .mcp_tool) " / external MCP tool" else "", context });
-            allocator.free(context);
-            result.context = attributed;
+        if (result.feedback != null and !std.mem.startsWith(u8, invocation.tool_name, "mcp__")) return error.UnsupportedHookEffect;
+        inline for (.{ "context", "blocked", "feedback" }) |field| {
+            if (@field(result, field)) |text_value| {
+                if (!hook.legacy or !std.mem.eql(u8, field, "blocked")) {
+                    const attributed = try std.fmt.allocPrint(allocator, "[Hook {s}{s}]\n{s}", .{ hook.source, if (hook.type == .mcp_tool) " / external MCP tool" else "", text_value });
+                    allocator.free(text_value);
+                    @field(result, field) = attributed;
+                }
+            }
         }
-        failed = false;
         return result;
     }
 
@@ -488,6 +637,7 @@ pub const Runner = struct {
         const payload = try payload_writer.toOwnedSlice();
         defer allocator.free(payload);
 
+        if (self.givenUp()) return error.Cancelled;
         var child = try std.process.spawn(self.io, .{
             .argv = &.{ "bash", "-lc", command },
             .cwd = .{ .dir = dir },
@@ -621,6 +771,7 @@ fn killGroup(io: std.Io, child: *std.process.Child) void {
 }
 
 pub const Dispatch = struct {
+    arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
     runner: Runner,
     invocation: Invocation,
@@ -639,9 +790,12 @@ pub const Dispatch = struct {
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
+            .arena = .init(allocator),
             .runner = runner,
             .invocation = invocation,
         };
+        errdefer self.arena.deinit();
+        self.invocation = try invocation.dupe(self.arena.allocator());
         self.runner.stop = &self.stop;
         self.future = try runner.io.concurrent(run, .{self});
         return self;
@@ -683,6 +837,7 @@ pub const Dispatch = struct {
         const allocator = self.allocator;
         if (self.blocked) |blocked| allocator.free(blocked);
         self.result.deinit(allocator);
+        self.arena.deinit();
         allocator.destroy(self);
     }
 
@@ -703,7 +858,7 @@ fn compileMatcher(allocator: std.mem.Allocator, pattern: []const u8) !regex.Rege
     while (index < pattern.len) : (index += 1) {
         if (pattern[index] == '\\' and index + 1 < pattern.len) {
             index += 1;
-            if (std.ascii.isDigit(pattern[index])) return error.UnsupportedHookRegex;
+            if (std.ascii.isAlphanumeric(pattern[index]) and std.mem.indexOfScalar(u8, "dDwWsSbBntr0", pattern[index]) == null) return error.UnsupportedHookRegex;
         }
     }
     return regex.compile(allocator, pattern, .{});
@@ -736,9 +891,18 @@ fn writeJson(
     try w.writeAll(",\"cwd\":");
     try std.json.Stringify.encodeJsonString(root, .{}, w);
 
-    inline for (.{ "session_id", "turn_id", "tool_call_id", "agent_id", "agent_type", "model", "permission_mode", "source", "trigger", "status", "error_message" }) |field| {
+    inline for (.{ "session_id", "turn_id", "tool_call_id", "agent_id", "agent_type", "model", "permission_mode", "source", "trigger", "status", "error_message", "parent_session_id", "reason" }) |field| {
         try w.writeAll(",\"" ++ field ++ "\":");
         try std.json.Stringify.encodeJsonString(@field(invocation, field), .{}, w);
+    }
+    try w.writeAll(",\"tool_use_id\":");
+    try std.json.Stringify.encodeJsonString(invocation.tool_call_id, .{}, w);
+    try w.writeAll(",\"last_assistant_message\":");
+    try std.json.Stringify.value(invocation.last_assistant_message, .{}, w);
+    try w.print(",\"request_id\":{d},\"attempt\":{d}", .{ invocation.request_id, invocation.attempt });
+    if (invocation.event == .subagent_stop) {
+        try w.writeAll(",\"agent_transcript_path\":");
+        try std.json.Stringify.value(invocation.transcript_path, .{}, w);
     }
     try w.writeAll(",\"transcript_path\":");
     try std.json.Stringify.value(invocation.transcript_path, .{}, w);
@@ -933,4 +1097,115 @@ test "event payload keeps empty fields and a nullable transcript" {
     try std.testing.expectEqualStrings("", parsed.value.object.get("tool_response").?.string);
     try std.testing.expect(parsed.value.object.get("transcript_path").? == .null);
     try std.testing.expectEqualStrings("", parsed.value.object.get("session_id").?.string);
+}
+
+test "grouped hooks all run despite denial and the last completed rewrite wins" {
+    const a = std.testing.allocator;
+    const slow: Hook = .{ .legacy = false, .command = "sleep 0.08; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"slow\"}}}'" };
+    const fast: Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"fast\"}}}'" };
+    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
+    defer runtime.deinit();
+    const runner: Runner = .{ .io = std.testing.io, .root = ".", .runtime = &runtime, .set = .{ .pre_tool_use = &.{ slow, fast, .{ .legacy = false, .command = "exit 2" } } } };
+    var result = try runner.evaluate(a, .{ .event = .pre_tool_use });
+    defer result.deinit(a);
+    try std.testing.expect(result.blocked != null);
+    try std.testing.expectEqualStrings("{\"command\":\"slow\"}", result.replacement.?);
+    try std.testing.expectEqual(@as(usize, 6), runtime.records_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.active.load(.acquire));
+}
+
+test "grouped matcher aliases and alternation invoke a handler once" {
+    const a = std.testing.allocator;
+    const hook: Hook = .{ .legacy = false, .matcher = "^(Bash|bash|Edit)$", .command = "true" };
+    try std.testing.expect(try hookMatches(a, hook, .{ .event = .pre_tool_use, .tool_name = "bash" }));
+    try std.testing.expect(try hookMatches(a, hook, .{ .event = .pre_tool_use, .tool_name = "edit" }));
+    try std.testing.expect(!try hookMatches(a, hook, .{ .event = .pre_tool_use, .tool_name = "read" }));
+    try std.testing.expectError(error.UnsupportedHookRegex, compileMatcher(a, "(?=bash)"));
+    try std.testing.expectError(error.UnsupportedHookRegex, compileMatcher(a, "(bash)\\1"));
+}
+
+test "background output waits for a boundary and has no control authority" {
+    const a = std.testing.allocator;
+    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
+    defer runtime.deinit();
+    const hook: Hook = .{ .legacy = false, .async = true, .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"ignored\",\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"background context\"}}'" };
+    const runner: Runner = .{ .io = std.testing.io, .root = ".", .runtime = &runtime, .set = .{ .pre_tool_use = &.{hook} } };
+    var immediate = try runner.evaluate(a, .{ .event = .pre_tool_use });
+    defer immediate.deinit(a);
+    try std.testing.expect(immediate.blocked == null);
+    try std.testing.expect(immediate.context == null);
+    runtime.background.items[0].join();
+    var delivered = try runtime.drain(a);
+    defer delivered.deinit(a);
+    try std.testing.expect(delivered.blocked == null);
+    try std.testing.expect(std.mem.indexOf(u8, delivered.context.?, "background context") != null);
+    try std.testing.expectEqualStrings("Background hook control effects were ignored", delivered.message.?);
+}
+
+test "large hook context spills to an owner-only file" {
+    const a = std.testing.allocator;
+    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
+    defer runtime.deinit();
+    var result: Result = .{ .context = try a.alloc(u8, 20_000) };
+    defer result.deinit(a);
+    @memset(result.context.?, 'x');
+    try runtime.bound(a, &result);
+    try std.testing.expect(result.context.?.len < 8192);
+    const start = std.mem.indexOf(u8, result.context.?, "/tmp/synth-hooks-").?;
+    const path = result.context.?[start .. result.context.?.len - 1];
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    const stat = try file.stat(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 20_000), stat.size);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+}
+
+test "concurrent dispatches share the session admission bound" {
+    const Probe = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        fn call(raw: *anyopaque, a: std.mem.Allocator, _: Hook, _: []const u8, _: u64, _: ?*const std.atomic.Value(bool)) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const count = self.active.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(count, .acq_rel);
+            defer _ = self.active.fetchSub(1, .release);
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(40), .awake);
+            return a.dupe(u8, "{}");
+        }
+    };
+    const a = std.testing.allocator;
+    var probe: Probe = .{};
+    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
+    defer runtime.deinit();
+    const definitions = [_]Hook{.{ .legacy = false, .type = .mcp_tool, .server = "test", .tool = "gate" }} ** 8;
+    const runner: Runner = .{ .io = std.testing.io, .root = ".", .runtime = &runtime, .mcp_executor = .{ .userdata = &probe, .call = Probe.call }, .set = .{ .pre_tool_use = &definitions } };
+    const first = try Dispatch.start(a, runner, .{ .event = .pre_tool_use });
+    defer first.destroy();
+    const second = try Dispatch.start(a, runner, .{ .event = .pre_tool_use });
+    defer second.destroy();
+    first.join();
+    second.join();
+    try std.testing.expect(first.failed == null);
+    try std.testing.expect(second.failed == null);
+    try std.testing.expect(probe.peak.load(.acquire) > 1);
+    try std.testing.expect(probe.peak.load(.acquire) <= 8);
+}
+
+test "cancellation while queued prevents a command from starting" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
+    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
+    defer runtime.deinit();
+    runtime.active.store(8, .release);
+    const runner: Runner = .{ .io = std.testing.io, .root = root, .runtime = &runtime, .set = .{ .pre_tool_use = &.{.{ .legacy = false, .command = "touch launched" }} } };
+    const dispatch = try Dispatch.start(a, runner, .{ .event = .pre_tool_use });
+    defer dispatch.destroy();
+    dispatch.requestStop();
+    dispatch.join();
+    runtime.active.store(0, .release);
+    try std.testing.expectEqual(error.Cancelled, dispatch.failed.?);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "launched", .{}));
 }

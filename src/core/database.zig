@@ -646,6 +646,7 @@ pub fn appendBlob(
 ) !void {
     try self.conn.exec(
         \\INSERT INTO blob (message_id, seq, kind, body) VALUES (?, ?, ?, ?)
+        \\ON CONFLICT(message_id, kind, seq) DO UPDATE SET body = excluded.body
     , .{ message_id, seq, kind, body });
 }
 
@@ -1014,14 +1015,15 @@ pub fn updateToolCall(
     message_id: i64,
     seq: i64,
     status: []const u8,
+    arguments: []const u8,
     result: ?[]const u8,
     result_bytes: i64,
     elapsed_ms: ?i64,
 ) !void {
     try self.conn.exec(
-        \\UPDATE tool_call SET status = ?, result = ?, result_bytes = ?, elapsed_ms = ?
+        \\UPDATE tool_call SET status = ?, arguments = ?, result = ?, result_bytes = ?, elapsed_ms = ?
         \\WHERE message_id = ? AND seq = ?
-    , .{ status, result, result_bytes, elapsed_ms, message_id, seq });
+    , .{ status, arguments, result, result_bytes, elapsed_ms, message_id, seq });
 }
 
 /// The row a message was stored as. Asked by seq rather than remembered: a
@@ -2474,7 +2476,7 @@ test "a call's duration survives a round trip" {
     try testing.expect(calls[1].elapsed_ms == null);
 
     // And an update carries it too, for a call timed after it was first stored.
-    try db.updateToolCall(message, 1, "ok", "later", 5, 900);
+    try db.updateToolCall(message, 1, "ok", "{}", "later", 5, 900);
     const again = try db.loadToolCalls(testing.allocator, message);
     defer {
         for (again) |*call| call.deinit(testing.allocator);

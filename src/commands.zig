@@ -822,3 +822,22 @@ fn probeStep(
 
     return status.class() == .success;
 }
+
+pub fn hooks(init_process: std.process.Init, action: @import("core/hook_store.zig").Action, id: []const u8) !void {
+    const store_module = @import("core/hook_store.zig");
+    const a = init_process.arena.allocator();
+    var config = try Config.open(init_process.gpa, init_process.io, init_process.environ_map);
+    defer config.deinit();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init_process.io, ".", a);
+    var project = try Project.detect(init_process.gpa, init_process.io, cwd);
+    defer project.deinit(init_process.gpa);
+    var store = try store_module.Store.init(init_process.gpa, init_process.io, config.hook_state_path);
+    defer store.deinit();
+    var set = try store_module.discover(a, init_process.io, config.hooks, project.root, init_process.environ_map.get("HOME"), config.hook_timeout_ms, store);
+    try store_module.change(a, init_process.io, &set, config.hook_state_path, action, id);
+    const text = try store_module.report(a, set, config.hook_timeout_ms, action == .review, null);
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(init_process.io, &buffer);
+    try writer.interface.writeAll(text);
+    try writer.interface.flush();
+}

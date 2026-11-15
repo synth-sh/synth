@@ -119,6 +119,7 @@ pub fn provider(self: *ChatGPTProvider) Provider {
         .context_limit = self.context_limit,
         .vision = self.supports_vision,
         .userdata = self,
+        .observes_attempts = true,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
@@ -435,7 +436,7 @@ fn respond(
     turn: Provider.Turn,
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
-) !Provider.Reply {
+) anyerror!Provider.Reply {
     const self: *ChatGPTProvider = @ptrCast(@alignCast(ptr));
     const store = self.store orelse return error.NotSignedIn;
     self.startClient();
@@ -446,6 +447,9 @@ fn respond(
     var attempt: usize = 1;
     var refreshed = false;
     while (true) {
+        var hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
+        defer hook_attempt.finish();
+        errdefer |err| hook_attempt.error_message = @errorName(err);
         var arena_state: std.heap.ArenaAllocator = .init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -496,7 +500,7 @@ fn respond(
                 continue;
             }
             if (Provider.mentionsOverflow(why)) return error.ContextTooLarge;
-            return refusal.toError(response.head.status);
+            return @as(anyerror!Provider.Reply, refusal.toError(response.head.status));
         }
 
         var stream: ResponseStream = .init(allocator, sink);
@@ -504,22 +508,23 @@ fn respond(
         stream.readEvents(arena, reader) catch |err| {
             if (stream.failure) |failure| {
                 self.rememberFailure(failure);
-                return failure.toError();
+                return @as(anyerror!Provider.Reply, failure.toError());
             }
             const nothing_shown = !stream.delivered_anything;
             if (nothing_shown and self.waitAndRetry(.service_unavailable, attempt, null, sink)) {
                 attempt += 1;
                 continue;
             }
-            return err;
+            return @as(anyerror!Provider.Reply, err);
         };
         if (stream.failure) |failure| {
             self.rememberFailure(failure);
-            return failure.toError();
+            return @as(anyerror!Provider.Reply, failure.toError());
         }
 
         const reply = try stream.intoReply();
         self.log(arena, logged, reply) catch {};
+        hook_attempt.complete(reply.usage);
         return reply;
     }
 }

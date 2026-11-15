@@ -182,6 +182,7 @@ pub fn provider(self: *OpenAIProvider) Provider {
         .context_limit = self.context_limit,
         .vision = self.supports_vision,
         .userdata = self,
+        .observes_attempts = true,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
@@ -524,7 +525,7 @@ fn respond(
     turn: Provider.Turn,
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
-) !Provider.Reply {
+) anyerror!Provider.Reply {
     const self: *OpenAIProvider = @ptrCast(@alignCast(ptr));
     if (!self.started) try self.startWithoutProbe();
 
@@ -541,6 +542,9 @@ fn respond(
 
     var attempt: usize = 1;
     while (true) {
+        var hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
+        defer hook_attempt.finish();
+        errdefer |err| hook_attempt.error_message = @errorName(err);
         const body = try self.buildRequest(arena, convo, turn);
         // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
@@ -591,10 +595,11 @@ fn respond(
             if (stream.failure) |failure| {
                 const detail = failure.refusal.message;
                 self.captureRejection(.ok, detail);
-                return failure.toError();
+                return @as(anyerror!Provider.Reply, failure.toError());
             }
             const reply = try stream.intoReply();
             self.log(arena, logged, reply) catch {};
+            hook_attempt.complete(reply.usage);
             return reply;
         }
         if (self.wire == .messages) {
@@ -603,17 +608,18 @@ fn respond(
             if (sse) {
                 stream.readEvents(arena, reader) catch |err| {
                     if (stream.rejection.len > 0) self.captureRejection(.ok, stream.rejection);
-                    return err;
+                    return @as(anyerror!Provider.Reply, err);
                 };
             } else {
                 const whole = try reader.allocRemaining(arena, .limited(max_listing_bytes));
                 stream.readWhole(arena, whole) catch |err| {
                     if (stream.rejection.len > 0) self.captureRejection(.ok, stream.rejection);
-                    return err;
+                    return @as(anyerror!Provider.Reply, err);
                 };
             }
             const reply = try stream.intoReply();
             self.log(arena, logged, reply) catch {};
+            hook_attempt.complete(reply.usage);
             return reply;
         }
 
@@ -629,6 +635,7 @@ fn respond(
 
         const reply = try collector.finish();
         self.log(arena, logged, reply) catch {};
+        hook_attempt.complete(reply.usage);
         return reply;
     }
 }

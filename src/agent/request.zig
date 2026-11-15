@@ -16,6 +16,8 @@ conversation: *Conversation,
 /// Owned copy of the turn's strings: the loop is free to rebuild its prompt or
 /// switch agents while this is in flight.
 turn: Provider.Turn,
+hook_arena: std.heap.ArenaAllocator,
+attempt_number: std.atomic.Value(u32) = .init(0),
 thoughts: Thought.Stream,
 /// The answer as it arrives, for the UI to render before the turn lands.
 content: Thought.Stream,
@@ -58,7 +60,10 @@ pub fn start(
             .tools_json = try allocator.dupe(u8, turn.tools_json),
             .instruction = try allocator.dupe(u8, turn.instruction),
             .compacting = turn.compacting,
+            .hooks = turn.hooks,
+            .hook_input = turn.hook_input,
         },
+        .hook_arena = .init(allocator),
         .thoughts = .init(allocator, io),
         .content = .init(allocator, io),
         .progress_ms = .init(tool.monotonicMilliseconds(io)),
@@ -69,6 +74,8 @@ pub fn start(
         self.content.deinit();
     }
 
+    self.turn.hook_input = try turn.hook_input.dupe(self.hook_arena.allocator());
+    self.turn.attempts = &self.attempt_number;
     self.future = try io.concurrent(run, .{self});
     return self;
 }
@@ -124,6 +131,7 @@ pub fn destroy(self: *Request) void {
 }
 
 fn freeTurn(self: *Request) void {
+    self.hook_arena.deinit();
     self.allocator.free(self.turn.system);
     self.allocator.free(self.turn.tools_json);
     self.allocator.free(self.turn.instruction);
@@ -132,6 +140,17 @@ fn freeTurn(self: *Request) void {
 fn run(self: *Request) void {
     defer self.done.store(true, .release);
 
+    var attempt: ?Provider.Attempt = if (self.provider.observes_attempts) null else Provider.Attempt.begin(self.turn, self.allocator, .{
+        .userdata = self,
+        .onThinking = onThinking,
+        .onText = onText,
+        .stopped = stopped,
+    });
+    defer if (attempt) |*value| {
+        if (self.reply) |reply| value.complete(reply.usage);
+        if (self.failed) |err| value.error_message = @errorName(err);
+        value.finish();
+    };
     self.reply = self.provider.respond(
         self.provider.userdata,
         self.conversation,

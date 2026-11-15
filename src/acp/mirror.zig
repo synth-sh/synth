@@ -120,6 +120,7 @@ const Awaited = union(enum) {
     files,
     providers,
     approvals,
+    hooks,
     checkpoints,
     /// A rewind from the agent's `seq`, done or only asked about.
     rewind: struct { seq: u64, apply: bool },
@@ -130,6 +131,7 @@ const Awaited = union(enum) {
 
 /// What a request the TUI made came back with, for it to show.
 pub const Answer = union(enum) {
+    hooks: []u8,
     /// The project's stored sessions. Ids are the agent's, so zero here.
     sessions: []Database.SessionInfo,
     search: struct { query: []u8, hits: []Database.Hit },
@@ -155,6 +157,7 @@ pub const Answer = union(enum) {
 
     pub fn deinit(self: Answer, allocator: std.mem.Allocator) void {
         switch (self) {
+            .hooks => |text| allocator.free(text),
             .sessions => |sessions| {
                 for (sessions) |info| info.deinit(allocator);
                 allocator.free(sessions);
@@ -863,6 +866,7 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             .files => "listing the files",
             .providers => "listing the providers",
             .approvals => "changing the allowances",
+            .hooks => "inspecting hooks",
             .checkpoints => "listing the checkpoints",
             .rewind => "putting the files back",
             .subagent => "loading the subagent's transcript",
@@ -957,6 +961,10 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             errdefer kept.deinit();
             const states = try rpc.parse([]const synth.ProviderState, kept.allocator(), result);
             self.answers.appendAssumeCapacity(.{ .providers = .{ .arena = kept, .states = states } });
+        },
+        .hooks => {
+            const text = try rpc.parse([]const u8, arena, result);
+            try self.answers.append(self.allocator, .{ .hooks = try self.allocator.dupe(u8, text) });
         },
         .approvals => {
             try self.answers.ensureUnusedCapacity(self.allocator, 1);
@@ -2041,4 +2049,8 @@ test "a session another process hosts is attached to on its socket, opening or s
     try switching.attach(handle);
     try testing.expectEqualStrings(handle, switching.status.handle);
     try testing.expect(switching.takeSwitched());
+}
+
+pub fn hooks(self: *Mirror, action: @import("../core/hook_store.zig").Action, id: []const u8) !void {
+    try self.send(synth.method.hooks, synth.Hooks{ .sessionId = self.status.handle, .action = action, .id = id }, .hooks);
 }

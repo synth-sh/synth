@@ -12,6 +12,7 @@ pub const Command = union(enum) {
     run: Run,
     session: Session,
     mcp: Mcp,
+    hooks: struct { action: @import("core/hook_store.zig").Action = .list, id: []const u8 = "" },
     db: Db,
     skills,
     models,
@@ -134,7 +135,7 @@ const subcommand_flags = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Subcommand names. Anything else in the first position is a directory.
 const known = std.StaticStringMap(void).initComptime(.{
-    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"}, .{"acp"}, .{"remote"},
+    .{"hooks"}, .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"}, .{"acp"}, .{"remote"},
 });
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
@@ -162,6 +163,15 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
     if (first) |word| {
         if (known.has(word)) {
             if (std.mem.eql(u8, word, "session")) return parseSession(init, allocator, &iter);
+            if (std.mem.eql(u8, word, "hooks")) {
+                const verb = iter.next() orelse return .{ .hooks = .{} };
+                if (std.mem.eql(u8, verb, "--help") or std.mem.eql(u8, verb, "-h")) return .{ .help = .hooks };
+                const action = std.meta.stringToEnum(@import("core/hook_store.zig").Action, verb) orelse return error.UnknownSubcommand;
+                const id = iter.next() orelse "";
+                if (iter.next() != null) return error.UnexpectedArgument;
+                if (action != .list and action != .review and id.len == 0) return error.MissingHookId;
+                return .{ .hooks = .{ .action = action, .id = try allocator.dupe(u8, id) } };
+            }
             if (std.mem.eql(u8, word, "mcp")) return parseMcp(init, allocator, &iter);
             if (std.mem.eql(u8, word, "db")) return parseDb(init, &iter);
             if (std.mem.eql(u8, word, "run")) return parseRun(init, allocator, &iter);
@@ -364,6 +374,7 @@ fn dupeOptional(allocator: std.mem.Allocator, text: ?[]const u8) !?[]const u8 {
 /// One subcommand's slice of the help. Rows belong to a topic by the word they
 /// start with, which is also how they are invoked.
 pub const Topic = enum {
+    hooks,
     run,
     session,
     mcp,
@@ -414,6 +425,8 @@ const help_sections: []const Section = &.{
             .{ .left = "models", .right = "models the provider offers" },
             .{ .left = "prompt", .right = "print the system prompt" },
             .{ .left = "acp", .right = "speak the Agent Client Protocol on stdio" },
+            .{ .left = "hooks [list|review]", .right = "inspect hook definitions, trust, mode and source" },
+            .{ .left = "hooks <trust|revoke|enable|disable> <id>", .right = "review and control one exact hook definition" },
             .{ .left = "remote list <host>", .right = "sessions on a host, the running ones marked (. is this machine)" },
             .{ .left = "remote connect <host> [session]", .right = "drive a session on a host in the TUI" },
             .{ .left = "remote new <host> [dir]", .right = "start a session on a host, in your home there by default" },

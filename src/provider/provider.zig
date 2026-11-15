@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
+const Hooks = @import("../core/hooks.zig");
 
 /// The seam every model backend plugs into.
 const Provider = @This();
@@ -12,6 +13,7 @@ name: []const u8,
 /// `name`, which is the backend ("Ollama"). Shown together as
 /// "model · backend".
 model: []const u8 = "",
+observes_attempts: bool = false,
 /// Context window in tokens, or 0 when unknown.
 context_limit: u32 = 0,
 /// Whether the model can be shown images. False means an attached image is
@@ -66,6 +68,58 @@ pub const Turn = struct {
     instruction: []const u8 = "",
     /// Reserve less output space while summarizing, but never discard history.
     compacting: bool = false,
+    hooks: ?*const Hooks.Runner = null,
+    attempts: ?*std.atomic.Value(u32) = null,
+    hook_input: Hooks.Invocation = .{ .event = .pre_model_request },
+};
+
+pub const Attempt = struct {
+    allocator: std.mem.Allocator,
+    turn: Turn,
+    sink: ?Sink,
+    status: []const u8 = "failed",
+    error_message: []const u8 = "",
+    usage: Usage = .{},
+
+    pub fn begin(turn: Turn, allocator: std.mem.Allocator, sink: ?Sink) Attempt {
+        var attempt: Attempt = .{ .allocator = allocator, .turn = turn, .sink = sink };
+        attempt.turn.hook_input.attempt = if (turn.attempts) |counter| counter.fetchAdd(1, .acq_rel) + 1 else 1;
+        attempt.emit(.pre_model_request);
+        return attempt;
+    }
+    pub fn complete(self: *Attempt, usage: Usage) void {
+        self.status = "completed";
+        self.usage = usage;
+    }
+    pub fn finish(self: *Attempt) void {
+        if (self.sink) |sink| {
+            if (sink.stopped(sink.userdata)) self.status = "cancelled";
+        }
+        self.emit(.post_model_request);
+    }
+    fn emit(self: *Attempt, event: Hooks.Event) void {
+        const configured = self.turn.hooks orelse return;
+        var runner = configured.*;
+        runner.stop = null;
+        var invocation = self.turn.hook_input;
+        invocation.event = event;
+        invocation.status = if (event == .post_model_request) self.status else "";
+        invocation.error_message = self.error_message;
+        invocation.input_tokens = self.usage.prompt_tokens;
+        invocation.output_tokens = self.usage.completion_tokens;
+        var result = runner.evaluate(self.allocator, invocation) catch |err| {
+            if (runner.runtime) |runtime| {
+                const message = std.fmt.allocPrint(self.allocator, "{s} hook failed: {s}", .{ event.name(), @errorName(err) }) catch return;
+                defer self.allocator.free(message);
+                runtime.notice(message) catch {};
+            }
+            return;
+        };
+        defer result.deinit(self.allocator);
+        if (result.message) |message| {
+            if (runner.runtime) |runtime| runtime.notice(message) catch {};
+        }
+    }
 };
 
 /// Where a backend should point, and what to call it there. The label is the

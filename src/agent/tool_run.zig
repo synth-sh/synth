@@ -23,6 +23,7 @@ pub const Result = struct {
 };
 
 allocator: std.mem.Allocator,
+hook_arena: std.heap.ArenaAllocator,
 io: std.Io,
 registry: *const Registry,
 project_root: []const u8,
@@ -81,6 +82,7 @@ const Reporter = struct {
 };
 
 pub const Call = struct {
+    hook_input: Hooks.Invocation = .{ .event = .post_tool_use },
     prechecked: bool = false,
     /// The message that asked for it, by seq.
     seq: u64 = 0,
@@ -107,6 +109,8 @@ pub fn start(
     const self = try allocator.create(ToolRun);
     errdefer allocator.destroy(self);
 
+    var hook_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer hook_arena.deinit();
     const calls = try allocator.alloc(Call, approved.len);
     var built: usize = 0;
     errdefer {
@@ -119,6 +123,7 @@ pub fn start(
     for (approved, calls) |src, *dst| {
         dst.* = .{
             .seq = src.seq,
+            .hook_input = try src.hook_input.dupe(hook_arena.allocator()),
             .index = src.index,
             .name = try allocator.dupe(u8, src.name),
             .arguments = try allocator.dupe(u8, src.arguments),
@@ -144,6 +149,7 @@ pub fn start(
 
     self.* = .{
         .allocator = allocator,
+        .hook_arena = hook_arena,
         .io = io,
         .registry = registry,
         .project_root = project_root,
@@ -221,6 +227,7 @@ pub fn destroy(self: *ToolRun) void {
         allocator.free(call.arguments);
     }
     allocator.free(self.calls);
+    self.hook_arena.deinit();
     for (self.results) |result| {
         if (result.content.len > 0) allocator.free(result.content);
         var hook_result = result.hook_result;
@@ -340,28 +347,19 @@ fn runOne(self: *ToolRun, index: usize) void {
         return;
     }
 
-    const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| {
-        result.* = .{
-            .index = call.index,
-            .content = std.fmt.allocPrint(
-                self.allocator,
-                "{s} failed: {s}",
-                .{ call.name, @errorName(err) },
-            ) catch self.allocator.dupe(u8, "tool failed") catch "",
-            .is_error = true,
-        };
-        return;
-    };
+    const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| tool.Output.err(
+        std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ call.name, @errorName(err) }) catch self.allocator.dupe(u8, "tool failed") catch "",
+    );
     result.* = .{ .index = call.index, .content = output.content, .is_error = output.is_error };
     if (self.hooks) |configured| {
         var runner = configured.*;
         runner.stop = &self.stop;
-        result.hook_result = runner.evaluate(self.allocator, .{
-            .event = .post_tool_use,
-            .tool_name = call.name,
-            .tool_input = call.arguments,
-            .tool_response = output.content,
-        }) catch |err| {
+        var input = call.hook_input;
+        input.event = .post_tool_use;
+        input.tool_name = call.name;
+        input.tool_input = call.arguments;
+        input.tool_response = output.content;
+        result.hook_result = runner.evaluate(self.allocator, input) catch |err| {
             result.hook_error = err;
             return;
         };

@@ -56,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
         .skills => try commands.skills(init),
         .session => |sub| try commands.session(init, sub),
         .mcp => |sub| try commands.mcp_command(init, sub),
+        .hooks => |sub| try commands.hooks(init, sub.action, sub.id),
         .db => |sub| try commands.database(init, sub),
         .remote => |sub| try remote.run(init, sub),
     }

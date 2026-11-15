@@ -109,32 +109,197 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "SessionStart": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "SessionEnd": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
                 "UserPromptSubmit": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/$defs/hook"
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
                     }
                 },
                 "PreToolUse": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/$defs/hook"
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PermissionRequest": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
                     }
                 },
                 "PostToolUse": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/$defs/hook"
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PreCompact": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PostCompact": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "SubagentStart": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "SubagentStop": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "Stop": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "Interrupt": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PreModelRequest": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PostModelRequest": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
                     }
                 }
             },
-            "description": "Commands run at selected agent lifecycle events."
+            "description": "Additive lifecycle hooks. Every definition needs explicit trust after upgrade or changes."
         },
         "hook_timeout_ms": {
             "type": "integer",
             "minimum": 1,
             "default": 30000,
-            "description": "How long a hook command may run before it is killed."
+            "description": "How long a hook command may run before it is killed.",
+            "maximum": 86400000
         },
         "mcp": {
             "type": "object",
@@ -211,6 +376,15 @@
                     "type": "string",
                     "minLength": 1,
                     "description": "Shell command run from the project root."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 86400000
+                },
+                "transcript": {
+                    "type": "boolean",
+                    "default": false
                 }
             }
         },
@@ -253,6 +427,93 @@
                         "type": "string"
                     },
                     "description": "Extra headers for the remote server."
+                }
+            }
+        },
+        "hookHandler": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "type": {
+                    "enum": [
+                        "command",
+                        "mcp_tool"
+                    ],
+                    "default": "command"
+                },
+                "command": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 86400000
+                },
+                "async": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "transcript": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "tool": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "arguments": {}
+            },
+            "oneOf": [
+                {
+                    "required": [
+                        "command"
+                    ],
+                    "properties": {
+                        "type": {
+                            "const": "command"
+                        }
+                    }
+                },
+                {
+                    "required": [
+                        "type",
+                        "server",
+                        "tool",
+                        "arguments"
+                    ],
+                    "properties": {
+                        "type": {
+                            "const": "mcp_tool"
+                        },
+                        "async": {
+                            "const": false
+                        }
+                    }
+                }
+            ]
+        },
+        "hookGroup": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "hooks"
+            ],
+            "properties": {
+                "matcher": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Regex or * for tool events; ignored for other events."
+                },
+                "hooks": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/hookHandler"
+                    }
                 }
             }
         }

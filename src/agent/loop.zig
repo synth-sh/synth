@@ -135,12 +135,23 @@ hook_purpose: HookPurpose = .prompt,
 hook_call_index: usize = 0,
 hook_pre_seq: ?u64 = null,
 hook_pre_index: usize = 0,
-hook_permission_seq: ?u64 = null,
+hook_asks: std.ArrayList([]const u8) = .empty,
 hook_permission_index: usize = 0,
 hook_context: ?[]u8 = null,
+hook_session_started: bool = false,
+interrupted: bool = false,
+hook_session_source: []const u8 = "startup",
+hook_resume: HookResume = .finish_turn,
+hook_resume_turn: bool = false,
+stop_hook_active: bool = false,
+hook_parent_call_id: []const u8 = "",
+hook_identity: [32]u8 = @splat(0),
+hook_turn: [32]u8 = @splat(0),
 approved_ask_index: ?usize = null,
 pending_submit: ?Submission = null,
 hook_notice: ?[]u8 = null,
+hook_failure: ?[]u8 = null,
+hook_export_path: ?[]u8 = null,
 /// Root every tool resolves against. Borrowed.
 project_root: []const u8,
 
@@ -324,6 +335,8 @@ pub fn init(
     reads: *tool.ReadLog,
     project_root: []const u8,
 ) Loop {
+    var identity: [16]u8 = undefined;
+    io.random(&identity);
     conversation.preserve_context = true;
     return .{
         .allocator = allocator,
@@ -334,6 +347,7 @@ pub fn init(
         .reads = reads,
         .project_root = project_root,
         .todos = .init(allocator),
+        .hook_identity = std.fmt.bytesToHex(identity, .lower),
     };
 }
 
@@ -422,6 +436,8 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     try self.conversation.adopt(loaded, total - @min(total, loaded.len));
 
     self.session_id = session_id;
+    self.hook_session_started = false;
+    self.hook_session_source = "resume";
     if (self.session_title) |old| self.allocator.free(old);
     self.session_title = null;
     const name = try db.sessionTitle(session_id, self.allocator);
@@ -438,6 +454,11 @@ pub fn resetForNewSession(self: *Loop) bool {
     if (self.isBusy()) return false;
 
     self.conversation.clear();
+    self.hook_session_started = false;
+    self.hook_session_source = "clear";
+    self.hook_pre_seq = null;
+    if (self.hook_context) |context| self.allocator.free(context);
+    self.hook_context = null;
     self.session_id = null;
     if (self.session_title) |old| self.allocator.free(old);
     self.session_title = null;
@@ -521,6 +542,8 @@ fn turn(self: *Loop, instruction: []const u8) Provider.Turn {
     return .{
         .system = self.systemPrompt(),
         .tools_json = self.tools_json orelse "",
+        .hooks = self.hooks,
+        .hook_input = self.hookInput(.{ .event = .pre_model_request }),
         .instruction = if (continuing_summary) "Continue the user's task from the conversation summary." else instruction,
     };
 }
@@ -595,6 +618,7 @@ pub fn requestStop(self: *Loop) void {
 pub fn deinit(self: *Loop) void {
     if (self.session_title) |t| self.allocator.free(t);
     if (self.hook_context) |context| self.allocator.free(context);
+    if (self.hook_failure) |failure| self.allocator.free(failure);
     self.session_title = null;
     if (self.session_model_owned) |m| self.allocator.free(m);
     self.session_model_owned = null;
@@ -640,6 +664,9 @@ pub fn deinit(self: *Loop) void {
     self.allowed.deinit(self.allocator);
     for (self.checkpointed.items) |path| self.allocator.free(path);
     self.checkpointed.deinit(self.allocator);
+    if (self.hook_export_path) |path| self.allocator.free(path);
+    self.hook_export_path = null;
+    self.hook_asks.deinit(self.allocator);
     self.message_ids.deinit(self.allocator);
 }
 
@@ -772,10 +799,18 @@ pub fn compact(self: *Loop) !void {
 }
 
 fn startCompaction(self: *Loop, resume_turn: bool) !void {
+    self.hook_resume_turn = resume_turn;
+    if (try self.lifecycle(.pre_compact, .compact)) return;
+    try self.startCompactionRequest(resume_turn);
+}
+
+fn startCompactionRequest(self: *Loop, resume_turn: bool) !void {
     const request_turn: Provider.Turn = .{
         .system = self.systemPrompt(),
         .instruction = compaction_prompt,
         .compacting = true,
+        .hooks = self.hooks,
+        .hook_input = try self.exportHookInput(.{ .event = .pre_model_request }),
     };
     if (!try self.contextFits(request_turn)) return self.stop("Stopped: history is too large to compact safely with this model. Nothing was discarded. Switch to a model with a larger context window, or use /clear to start a new session.");
     self.request = try Request.start(
@@ -828,6 +863,10 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
     self.usage.context_tokens = 0;
+    self.hook_resume_turn = resume_turn;
+    if (try self.lifecycle(.post_compact, .compact_session)) return;
+    self.hook_session_source = "compact";
+    if (try self.lifecycle(.session_start, .after_compact)) return;
     if (resume_turn) return self.ask();
     self.outcome = .done;
 }
@@ -841,6 +880,23 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     self.hook_notice = null;
 
     if (self.hooks) |runner| {
+        inline for (std.meta.fields(Hooks.Set)) |field| {
+            for (@field(runner.set, field.name)) |hook| {
+                if (hook.enabled and !hook.trusted) {
+                    self.hook_notice = try self.allocator.dupe(u8, "Hooks need review. Use /hooks review or synth hooks review, then trust each reviewed id explicitly.");
+                    return;
+                }
+            }
+        }
+    }
+    if (!self.hook_session_started) {
+        self.hook_session_started = true;
+        if (try self.lifecycle(if (self.parent == null) .session_start else .subagent_start, .begin_prompt)) {
+            self.pending_submit = try Submission.init(self.allocator, prompt, extras);
+            return;
+        }
+    }
+    if (self.hooks) |runner| {
         if (runner.set.forEvent(.user_prompt_submit).len == 0) return self.finishSubmit(prompt, extras);
 
         self.pending_submit = try Submission.init(self.allocator, prompt, extras);
@@ -848,7 +904,7 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
             self.pending_submit.?.deinit(self.allocator);
             self.pending_submit = null;
         }
-        self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, runner.*, .{
+        self.hook_dispatch = try self.dispatchHook(.{
             .event = .user_prompt_submit,
             .prompt = self.pending_submit.?.prompt,
         });
@@ -885,13 +941,141 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     self.turn_start_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
     self.turn_started_ms = tool.monotonicMilliseconds(self.io);
     self.turn_tokens = 0;
+    self.stop_hook_active = false;
+    if (self.hook_failure) |failure| self.allocator.free(failure);
+    self.hook_failure = null;
     if (self.last_calls) |calls| self.allocator.free(calls);
     self.last_calls = null;
     self.last_error = null;
     try self.ask();
 }
 
-const HookPurpose = enum { prompt, steering, owner_pre, owner_post, tool_policy, permission };
+const HookPurpose = enum { prompt, steering, owner_post, tool_policy, permission, lifecycle };
+
+const HookResume = enum { begin_prompt, ask_model, compact, compact_session, after_compact, finish_turn };
+
+pub fn hookInput(self: *Loop, invocation: Hooks.Invocation) Hooks.Invocation {
+    var input = invocation;
+    input.session_id = self.session_public_id orelse &self.hook_identity;
+    const owner = self.parent orelse self;
+    const turn_number = owner.turn_start_seq orelse owner.conversation.next_seq;
+    const turn_id = std.fmt.bufPrint(&self.hook_turn, "{d}", .{turn_number}) catch "";
+    input.turn_id = turn_id;
+    input.agent_id = &self.hook_identity;
+    input.agent_type = self.agent.id;
+    input.model = self.provider.model;
+    input.permission_mode = @tagName(self.approvals);
+    input.stop_hook_active = self.stop_hook_active;
+    input.request_id = self.requests_started + 1;
+    if (invocation.event == .session_end) input.reason = "shutdown";
+    if (self.parent) |parent| {
+        input.parent_session_id = parent.session_public_id orelse &parent.hook_identity;
+        if (invocation.event == .subagent_start or invocation.event == .subagent_stop) input.tool_call_id = self.hook_parent_call_id;
+    }
+    if (invocation.event == .stop or invocation.event == .subagent_stop) {
+        if (self.conversation.last()) |message| input.last_assistant_message = message.text;
+    }
+    return input;
+}
+
+pub fn exportHookInput(self: *Loop, invocation: Hooks.Invocation) !Hooks.Invocation {
+    var input = self.hookInput(invocation);
+    const runner = self.hooks orelse return input;
+    const events = [_]Hooks.Event{ invocation.event, if (invocation.event == .pre_model_request) .post_model_request else invocation.event };
+    var needed = false;
+    for (events) |event| {
+        for (runner.set.forEvent(event)) |hook| {
+            if (hook.enabled and hook.trusted and hook.transcript) needed = true;
+        }
+    }
+    if (!needed) return input;
+    const runtime = runner.runtime orelse return input;
+    const path = try runtime.privatePath(self.allocator, "jsonl");
+    errdefer self.allocator.free(path);
+    const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(self.io);
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(self.io, &buffer);
+    for (self.conversation.messages.items) |message| {
+        try std.json.Stringify.value(.{ .seq = message.seq, .role = message.role, .text = message.text, .tool_calls = message.tool_calls }, .{}, &writer.interface);
+        try writer.interface.writeByte('\n');
+    }
+    try writer.interface.flush();
+    if (self.hook_export_path) |old| self.allocator.free(old);
+    self.hook_export_path = path;
+    input.transcript_path = path;
+    return input;
+}
+
+fn dispatchHook(self: *Loop, invocation: Hooks.Invocation) !*Hooks.Dispatch {
+    return Hooks.Dispatch.start(self.allocator, self.hooks.?.*, try self.exportHookInput(invocation));
+}
+
+fn lifecycle(self: *Loop, event: Hooks.Event, continuation: HookResume) !bool {
+    const runner = self.hooks orelse return false;
+    if (runner.set.forEvent(event).len == 0) return false;
+    self.hook_dispatch = try self.dispatchHook(.{
+        .event = event,
+        .source = self.hook_session_source,
+        .trigger = if (self.hook_resume_turn) "auto" else "manual",
+    });
+    self.hook_purpose = .lifecycle;
+    self.hook_resume = continuation;
+    self.state = .running_hooks;
+    return true;
+}
+
+fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
+    try self.acceptHookResult(&dispatch.result);
+    if (self.hook_resume == .finish_turn) {
+        if (dispatch.failed) |err| self.say("Completion hook failed: {s}", .{@errorName(err)});
+        if (dispatch.takeBlocked()) |reason| {
+            defer self.allocator.free(reason);
+            if (!dispatch.result.stop) {
+                self.stop_hook_active = true;
+                const continuation = try std.fmt.allocPrint(self.allocator, "[Completion hook continuation] {s}", .{reason});
+                defer self.allocator.free(continuation);
+                try self.conversation.add(.user, continuation);
+                try self.persistMessage(self.conversation.messages.items.len - 1);
+                try self.ask();
+                return true;
+            }
+        }
+        self.finish(.done);
+        return true;
+    }
+    if (dispatch.invocation.event != .subagent_start and (dispatch.failed != null or dispatch.blocked != null or dispatch.result.stop)) {
+        if (self.hook_notice) |old| self.allocator.free(old);
+        self.hook_notice = if (dispatch.failed) |err|
+            try std.fmt.allocPrint(self.allocator, "Lifecycle hook failed: {s}", .{@errorName(err)})
+        else
+            dispatch.takeBlocked();
+        if (self.pending_submit) |*pending| pending.deinit(self.allocator);
+        self.pending_submit = null;
+        if (dispatch.invocation.event == .session_start) self.hook_session_started = false;
+        self.state = .idle;
+        return true;
+    }
+    self.state = .idle;
+    switch (self.hook_resume) {
+        .begin_prompt => {
+            var pending = self.pending_submit orelse return false;
+            self.pending_submit = null;
+            defer pending.deinit(self.allocator);
+            try self.submit(pending.prompt, pending.asExtras());
+        },
+        .ask_model => try self.ask(),
+        .compact => try self.startCompactionRequest(self.hook_resume_turn),
+        .compact_session => {
+            self.hook_session_source = "compact";
+            if (try self.lifecycle(.session_start, .after_compact)) return true;
+            if (self.hook_resume_turn) try self.ask();
+        },
+        .after_compact => if (self.hook_resume_turn) try self.ask(),
+        .finish_turn => unreachable,
+    }
+    return true;
+}
 
 fn pollPromptHooks(self: *Loop) !bool {
     if (self.hook_purpose != .prompt) return self.pollOtherHooks();
@@ -934,6 +1118,7 @@ fn pollOtherHooks(self: *Loop) !bool {
     self.hook_dispatch = null;
     defer dispatch.destroy();
 
+    if (self.hook_purpose == .lifecycle) return self.pollLifecycle(dispatch);
     if (self.hook_purpose == .steering) {
         var pending = self.steering.orderedRemove(0);
         defer pending.deinit(self.allocator);
@@ -957,6 +1142,9 @@ fn pollOtherHooks(self: *Loop) !bool {
         else
             dispatch.takeBlocked();
         if (reason) |blocked| {
+            const copy = try self.allocator.dupe(u8, blocked);
+            if (self.hook_failure) |old| self.allocator.free(old);
+            self.hook_failure = copy;
             call.status = .rejected;
             call.result = blocked;
             call.result_bytes = blocked.len;
@@ -981,6 +1169,7 @@ fn pollOtherHooks(self: *Loop) !bool {
                 call.arguments = effective;
             }
             try self.acceptHookResult(&dispatch.result);
+            if (self.hook_purpose == .tool_policy and dispatch.result.permission == .ask) try self.hook_asks.append(self.allocator, call.id);
             if (self.hook_purpose == .permission and dispatch.result.permission == .allow) call.begin(tool.monotonicMilliseconds(self.io));
         }
         try self.persistToolCall(message_index, index);
@@ -993,7 +1182,7 @@ fn pollOtherHooks(self: *Loop) !bool {
 fn startPolicyHook(self: *Loop, purpose: HookPurpose, index: usize) !void {
     const message_index = self.pendingIndex() orelse return;
     const call = self.conversation.messages.items[message_index].tool_calls[index];
-    self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, self.hooks.?.*, .{
+    self.hook_dispatch = try self.dispatchHook(.{
         .event = if (purpose == .tool_policy) .pre_tool_use else .permission_request,
         .tool_name = call.name,
         .tool_input = call.arguments,
@@ -1008,8 +1197,9 @@ fn startPolicyHook(self: *Loop, purpose: HookPurpose, index: usize) !void {
 
 fn acceptHookResult(self: *Loop, result: *const Hooks.Result) !void {
     if (result.message) |message| {
+        const copy = try self.allocator.dupe(u8, message);
         if (self.hook_notice) |old| self.allocator.free(old);
-        self.hook_notice = try self.allocator.dupe(u8, message);
+        self.hook_notice = copy;
     }
     if (result.context) |context| {
         const combined = if (self.hook_context) |old|
@@ -1018,14 +1208,21 @@ fn acceptHookResult(self: *Loop, result: *const Hooks.Result) !void {
             try self.allocator.dupe(u8, context);
         if (self.hook_context) |old| self.allocator.free(old);
         self.hook_context = combined;
+        if (self.hooks) |runner| {
+            if (runner.runtime) |runtime| {
+                var bounded: Hooks.Result = .{ .context = self.hook_context };
+                try runtime.bound(self.allocator, &bounded);
+                self.hook_context = bounded.context;
+            }
+        }
     }
 }
 
 fn startOwnerHook(self: *Loop, purpose: HookPurpose, index: usize, response: []const u8) !void {
     const message_index = self.pendingIndex() orelse return;
     const call = self.conversation.messages.items[message_index].tool_calls[index];
-    self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, self.hooks.?.*, .{
-        .event = if (purpose == .owner_pre) .pre_tool_use else .post_tool_use,
+    self.hook_dispatch = try self.dispatchHook(.{
+        .event = .post_tool_use,
         .tool_name = call.name,
         .tool_input = call.arguments,
         .tool_response = response,
@@ -1038,11 +1235,12 @@ fn startOwnerHook(self: *Loop, purpose: HookPurpose, index: usize, response: []c
 fn pollOwnerHooks(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
     const message_index = self.pendingIndex() orelse return false;
     const index = self.hook_call_index;
-    const call = &self.conversation.messages.items[message_index].tool_calls[index];
     if (self.hook_purpose == .owner_post) {
         try self.acceptHookResult(&dispatch.result);
         if (dispatch.takeBlocked()) |feedback| {
             defer self.allocator.free(feedback);
+            try self.applyPostFeedback(message_index, index, feedback);
+        } else if (dispatch.result.feedback) |feedback| {
             try self.applyPostFeedback(message_index, index, feedback);
         }
         if (dispatch.failed) |err| self.say("PostToolUse hook failed: {s}", .{@errorName(err)});
@@ -1050,33 +1248,7 @@ fn pollOwnerHooks(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
         try self.runApproved();
         return true;
     }
-    const failure: ?[]u8 = if (dispatch.failed) |err|
-        try std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)})
-    else
-        dispatch.takeBlocked();
-    if (failure) |reason| {
-        call.status = .rejected;
-        call.result = reason;
-        call.result_bytes = reason.len;
-        try self.persistToolCall(message_index, index);
-        self.state = .idle;
-        try self.runApproved();
-        return true;
-    }
-    if (std.mem.eql(u8, call.name, todo_tool.name)) {
-        try self.applyTodo(message_index, index);
-        if (self.hooks.?.set.forEvent(.post_tool_use).len > 0) {
-            try self.startOwnerHook(.owner_post, index, call.result.?);
-            return true;
-        }
-    } else {
-        self.approved_ask_index = index;
-        self.state = .awaiting_answer;
-        return true;
-    }
-    self.state = .idle;
-    try self.runApproved();
-    return true;
+    unreachable;
 }
 
 fn askThenChanged(self: *Loop) !bool {
@@ -1174,7 +1346,7 @@ fn ask(self: *Loop) !void {
     if (self.steering.items.len > 0) {
         if (self.hooks) |runner| {
             if (runner.set.forEvent(.user_prompt_submit).len > 0) {
-                self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, runner.*, .{
+                self.hook_dispatch = try self.dispatchHook(.{
                     .event = .user_prompt_submit,
                     .prompt = self.steering.items[0].prompt,
                 });
@@ -1210,12 +1382,14 @@ fn ask(self: *Loop) !void {
     if (self.steps > self.agent.steps and !self.isRunningWithoutLimit()) {
         return self.stop("Stopped: too many tool calls in one turn.");
     }
+    var request_turn = self.turn("");
+    request_turn.hook_input = try self.exportHookInput(.{ .event = .pre_model_request });
     self.request = try Request.start(
         self.allocator,
         self.io,
         self.provider,
         self.conversation,
-        self.turn(""),
+        request_turn,
     );
     self.requests_started += 1;
     self.state = .thinking;
@@ -1314,6 +1488,7 @@ pub fn cancel(self: *Loop) !void {
     if (self.state == .cancelling) return;
 
     // `Io.Future.cancel` waits on the calling thread, so `canceller` takes it.
+    self.interrupted = true;
     self.requestStop();
     self.startReaping();
 
@@ -1341,6 +1516,16 @@ fn reap(self: *Loop) void {
     if (self.judging) |judging| judging.request.cancel();
     if (self.tools) |tools| tools.cancel();
     if (self.hook_dispatch) |dispatch| dispatch.cancel();
+    if (self.interrupted and self.parent == null) {
+        self.interrupted = false;
+        if (self.hooks) |configured| {
+            var runner = configured.*;
+            runner.stop = null;
+            runner.deadline_ms = std.Io.Clock.now(.awake, self.io).toMilliseconds() + 3000;
+            var result = runner.evaluate(self.allocator, self.hookInput(.{ .event = .interrupt })) catch null;
+            if (result) |*value| value.deinit(self.allocator);
+        }
+    }
     self.reaped.store(true, .release);
 }
 
@@ -1362,6 +1547,7 @@ fn pollCancelled(self: *Loop) !bool {
 
     if (self.hook_dispatch) |dispatch| {
         dispatch.join();
+        if (dispatch.invocation.event == .session_start) self.hook_session_started = false;
         dispatch.destroy();
         self.hook_dispatch = null;
     }
@@ -1424,7 +1610,16 @@ fn abandonPending(self: *Loop, reason: []const u8) !void {
 /// Advance the loop. Called from the UI's tick; returns true if anything
 /// changed and the screen needs redrawing.
 pub fn poll(self: *Loop) !bool {
-    return switch (self.state) {
+    var background_changed = false;
+    if (self.hooks) |runner| {
+        if (runner.runtime) |runtime| {
+            var background = try runtime.drain(self.allocator);
+            defer background.deinit(self.allocator);
+            background_changed = background.message != null or background.context != null;
+            try self.acceptHookResult(&background);
+        }
+    }
+    const changed = try switch (self.state) {
         .idle, .awaiting_approval, .awaiting_answer => false,
         .running_hooks => self.pollPromptHooks(),
         .thinking, .compacting => self.pollRequest(),
@@ -1432,6 +1627,7 @@ pub fn poll(self: *Loop) !bool {
         .classifying => self.pollJudging(),
         .cancelling => self.pollCancelled(),
     };
+    return changed or background_changed;
 }
 
 fn pollRequest(self: *Loop) !bool {
@@ -1511,6 +1707,7 @@ fn pollRequest(self: *Loop) !bool {
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
     if (reply.tool_calls.len == 0) {
+        if (try self.lifecycle(if (self.parent == null) .stop else .subagent_stop, .finish_turn)) return true;
         self.finish(.done);
         return true;
     }
@@ -1627,6 +1824,7 @@ fn autoApprove(self: *Loop) !void {
                 self.hook_pre_seq = self.pending_seq;
                 self.hook_pre_index = 0;
                 self.hook_permission_index = 0;
+                self.hook_asks.clearRetainingCapacity();
             }
             if (i >= self.hook_pre_index) {
                 self.hook_pre_index = i + 1;
@@ -1725,8 +1923,11 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
 
     const request = try Request.start(self.allocator, self.io, self.provider, convo, .{
         .system = classifier.system_prompt,
+        .hooks = self.hooks,
+        .hook_input = try self.exportHookInput(.{ .event = .pre_model_request }),
         .instruction = classifier.instruction(stage),
     });
+    self.requests_started += 1;
     self.judging = .{ .request = request, .convo = convo, .call = call_index, .stage = stage };
     self.state = .classifying;
 }
@@ -1979,6 +2180,7 @@ fn refuse(self: *Loop, message_index: usize, call_index: usize) !void {
 /// has already said always to allow.
 fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (!self.agent.allows(call.name)) return false;
+    for (self.hook_asks.items) |id| if (std.mem.eql(u8, call.id, id)) return false;
     if (self.approvals == .all) return true;
 
     if (self.outsidePath(self.allocator, call) catch null) |path| {
@@ -2416,6 +2618,7 @@ fn persistToolCall(self: *Loop, message_index: usize, call_index: usize) !void {
         message_id,
         @intCast(call_index),
         @tagName(call.status),
+        call.arguments,
         call.result,
         @intCast(call.result_bytes),
         if (call.elapsed_ms) |ms| @intCast(ms) else null,
@@ -2605,6 +2808,7 @@ fn runApproved(self: *Loop) !void {
         }
     }
 
+    const post_input = try self.exportHookInput(.{ .event = .post_tool_use });
     var batch: std.ArrayList(ToolRun.Call) = .empty;
     defer batch.deinit(self.allocator);
 
@@ -2613,6 +2817,11 @@ fn runApproved(self: *Loop) !void {
         if (std.mem.eql(u8, call.name, todo_tool.name)) continue;
         try batch.append(self.allocator, .{
             .prechecked = true,
+            .hook_input = blk: {
+                var input = post_input;
+                input.tool_call_id = call.id;
+                break :blk input;
+            },
             .seq = self.conversation.messages.items[message_index].seq,
             .index = i,
             .name = call.name,
@@ -2719,7 +2928,7 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
         try self.persistToolCall(message_index, result.index);
         try self.acceptHookResult(&result.hook_result);
         if (result.hook_error) |err| self.say("PostToolUse hook failed: {s}", .{@errorName(err)});
-        if (result.hook_result.blocked) |feedback| try self.applyPostFeedback(message_index, result.index, feedback);
+        if (result.hook_result.blocked orelse result.hook_result.feedback) |feedback| try self.applyPostFeedback(message_index, result.index, feedback);
     }
 }
 
@@ -5282,4 +5491,197 @@ test "permission hooks grant one invocation without creating an allowance" {
     try settle(&loop);
     try testing.expectEqual(State.idle, loop.state);
     try testing.expectEqual(Conversation.ToolCall.Status.ok, fixture.convo.messages.items[1].tool_calls[0].status);
+}
+
+test "lifecycle trace pairs model attempts and orders session and tool events" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const logger: Hooks.Hook = .{ .command = "cat >> hook-events" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{
+        .session_start = &.{logger},
+        .pre_model_request = &.{logger},
+        .post_model_request = &.{logger},
+        .pre_tool_use = &.{logger},
+        .post_tool_use = &.{logger},
+        .stop = &.{logger},
+    } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "hook-events", testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(trace);
+    const expected = [_][]const u8{ "SessionStart", "PreModelRequest", "PostModelRequest", "PreToolUse", "PostToolUse", "PreModelRequest", "PostModelRequest", "Stop" };
+    var lines = std.mem.tokenizeScalar(u8, trace, '\n');
+    for (expected) |name| {
+        const line = lines.next() orelse return error.MissingHookEvent;
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(name, parsed.value.object.get("hook_event_name").?.string);
+        try testing.expect(parsed.value.object.get("session_id").?.string.len > 0);
+    }
+    try testing.expect(lines.next() == null);
+}
+
+test "session-start denial cannot be bypassed by resubmitting a prompt" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .session_start = &.{.{ .command = "exit 2" }} } };
+    loop.hooks = &runner;
+    for (0..2) |_| {
+        try loop.submit("never persist", .{});
+        try settle(&loop);
+        try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
+        try testing.expectEqual(@as(usize, 0), loop.requests_started);
+    }
+}
+
+test "completion continuation keeps the existing turn budget" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"continue checking\"}'" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .stop = &.{hook} } };
+    loop.hooks = &runner;
+    loop.max_turn_tokens = 250;
+    fixture.fake.prompt_tokens = 100;
+    fixture.fake.completion_tokens = 20;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expect(loop.stop_hook_active);
+    try testing.expect(loop.turn_tokens >= 250);
+}
+
+test "rewritten file arguments drive checkpoints execution and persistence" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const path = try std.fs.path.join(testing.allocator, &.{ fixture.root, "session.db" });
+    defer testing.allocator.free(path);
+    var db = try Database.init(testing.allocator, testing.io, path);
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "fake");
+    loop.approvals = .all;
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"original.txt\",\"content\":\"original\"}";
+    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"path\":\"effective.txt\",\"content\":\"effective\"}}}'" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    const content = try fixture.tmp.dir.readFileAlloc(testing.io, "effective.txt", testing.allocator, .limited(1024));
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings("effective", content);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(testing.io, "original.txt", .{}));
+    const stored = try db.loadMessages(testing.allocator, loop.session_id.?, std.math.maxInt(i64), 100);
+    defer {
+        for (stored) |*message| message.deinit(testing.allocator);
+        testing.allocator.free(stored);
+    }
+    var checked = false;
+    for (stored) |message| for (message.tool_calls) |call| {
+        checked = true;
+        try testing.expect(std.mem.indexOf(u8, call.arguments, "effective.txt") != null);
+    };
+    try testing.expect(checked);
+    const checkpoint = (try db.conn.row("SELECT path FROM checkpoint WHERE session_id = ?", .{loop.session_id.?})).?;
+    defer checkpoint.deinit();
+    try testing.expect(std.mem.endsWith(u8, checkpoint.text(0), "effective.txt"));
+}
+
+test "post-tool feedback preserves side effects and the original stored result" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const path = try std.fs.path.join(testing.allocator, &.{ fixture.root, "session.db" });
+    defer testing.allocator.free(path);
+    var db = try Database.init(testing.allocator, testing.io, path);
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "fake");
+    loop.approvals = .all;
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"note.txt\",\"content\":\"kept\"}";
+    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"verify the file\"}'" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .post_tool_use = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    const content = try fixture.tmp.dir.readFileAlloc(testing.io, "note.txt", testing.allocator, .limited(1024));
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings("kept", content);
+    const call = fixture.convo.messages.items[1].tool_calls[0];
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, call.status);
+    try testing.expect(std.mem.indexOf(u8, call.result.?, "verify the file") != null);
+    const original = (try db.conn.row("SELECT body FROM blob WHERE kind = 'hook_original_tool_result'", .{})).?;
+    defer original.deinit();
+    try testing.expect(std.mem.indexOf(u8, original.text(0), "verify the file") == null);
+}
+
+test "pre-compaction stop leaves history intact and starts no model attempt" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try fixture.convo.add(.user, "keep history");
+    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"continue\":false,\"stopReason\":\"keep history\"}'" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_compact = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.compact();
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 1), fixture.convo.messages.items.len);
+    try testing.expectEqualStrings("keep history", fixture.convo.messages.items[0].text);
+    try testing.expectEqual(@as(u64, 0), loop.requests_started);
+}
+
+test "successful manual compaction emits post and a new session context" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try fixture.convo.add(.user, "summarize history");
+    const logger: Hooks.Hook = .{ .command = "cat >> compact-events" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_compact = &.{logger}, .post_compact = &.{logger}, .session_start = &.{logger} } };
+    loop.hooks = &runner;
+    try loop.compact();
+    try settle(&loop);
+    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "compact-events", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(trace);
+    var lines = std.mem.tokenizeScalar(u8, trace, '\n');
+    for ([_][]const u8{ "PreCompact", "PostCompact", "SessionStart" }) |expected| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(expected, parsed.value.object.get("hook_event_name").?.string);
+        if (std.mem.eql(u8, expected, "SessionStart")) {
+            try testing.expectEqualStrings("compact", parsed.value.object.get("source").?.string);
+        } else try testing.expectEqualStrings("manual", parsed.value.object.get("trigger").?.string);
+    }
+    try testing.expect(lines.next() == null);
+}
+
+test "an explicit interruption emits one bounded cleanup event" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.latency = .fromSeconds(5);
+    const logger: Hooks.Hook = .{ .command = "cat >> interrupt-events" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .interrupt = &.{logger} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try loop.cancel();
+    try loop.cancel();
+    try settle(&loop);
+    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "interrupt-events", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(trace);
+    var lines = std.mem.tokenizeScalar(u8, trace, '\n');
+    try testing.expect(lines.next() != null);
+    try testing.expect(lines.next() == null);
+    try testing.expectEqual(Outcome.cancelled, loop.outcome.?);
 }

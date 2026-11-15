@@ -235,6 +235,9 @@ pub const Runner = struct {
         // Its calls are not the session's, so they have no card for a terminal to show in.
         child.loop.handoff = .{ .files = parent.handoff.files };
         child.loop.parent = parent.parent orelse parent;
+        for (parent.conversation.messages.items) |message| {
+            if (message.seq == parent.pending_seq and child.index < message.tool_calls.len) child.loop.hook_parent_call_id = message.tool_calls[child.index].id;
+        }
         child.loop.approvals = parent.approvals;
         // A standing allowance is the person's, not something to inherit.
         child.loop.auto_approve_safe = false;
@@ -421,7 +424,7 @@ fn report(child: *Loop, allocator: std.mem.Allocator, outcome: Outcome) ![]const
         .halted => haltNote(&buffer, halt.reason),
     };
 
-    if (child.hook_notice) |notice| {
+    if (child.hook_failure orelse child.hook_notice) |notice| {
         return std.fmt.allocPrint(allocator, "{s}{s}\n\n<note>Subagent hook: {s}</note>", .{ answer, note, notice });
     }
     if (answer.len == 0 and note.len == 0) return allocator.dupe(u8, "");
@@ -827,3 +830,19 @@ const Fake = struct {
         };
     }
 };
+
+test "child tools inherit pre-tool denial and return its reason to the parent" {
+    const harness = try Harness.init();
+    defer harness.deinit();
+    const Hooks = @import("../core/hooks.zig");
+    const hooks: Hooks.Runner = .{ .io = testing.io, .root = ".", .set = .{ .pre_tool_use = &.{.{ .matcher = "read", .command = "echo child read denied >&2; exit 2" }} } };
+    harness.parent.hooks = &hooks;
+    harness.fake.script = &.{
+        .{ .call = .{ .name = "read", .arguments = "{\"path\":\"README.md\"}" } },
+        .{ .text = "checked" },
+    };
+    const answer = try runTask(harness, .{ .agent = "task", .prompt = "read a file" });
+    defer testing.allocator.free(answer);
+    try testing.expect(std.mem.indexOf(u8, answer, "child read denied") != null);
+    try testing.expect(std.mem.indexOf(u8, answer, "Subagent hook") != null);
+}

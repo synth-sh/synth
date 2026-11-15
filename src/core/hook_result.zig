@@ -7,11 +7,12 @@ pub const Result = struct {
     context: ?[]u8 = null,
     message: ?[]u8 = null,
     replacement: ?[]u8 = null,
+    feedback: ?[]u8 = null,
     permission: ?Permission = null,
     stop: bool = false,
 
     pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
-        inline for (.{ "blocked", "context", "message", "replacement" }) |field| {
+        inline for (.{ "blocked", "context", "message", "replacement", "feedback" }) |field| {
             if (@field(self, field)) |value| allocator.free(value);
         }
         self.* = .{};
@@ -31,10 +32,12 @@ pub const Result = struct {
                 @field(self, field) = combined;
             }
         }
-        if (other.replacement) |value| {
-            const copy = try allocator.dupe(u8, value);
-            if (self.replacement) |old| allocator.free(old);
-            self.replacement = copy;
+        inline for (.{ "replacement", "feedback" }) |field| {
+            if (@field(other, field)) |value| {
+                const copy = try allocator.dupe(u8, value);
+                if (@field(self, field)) |old| allocator.free(old);
+                @field(self, field) = copy;
+            }
         }
         if (other.permission) |value| {
             if (self.permission != .deny) self.permission = value;
@@ -68,6 +71,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: []const u8
             const decision = try text(value);
             if (!oneOf(event, &.{ "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop" })) return error.UnsupportedHookEffect;
             if (std.mem.eql(u8, decision, "block")) {
+                if (result.blocked) |old| allocator.free(old);
                 result.blocked = try reason(allocator, root, "reason");
             } else if (std.mem.eql(u8, event, "PreToolUse") and std.mem.eql(u8, decision, "approve")) {
                 result.permission = .allow;
@@ -79,6 +83,8 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: []const u8
             try specific(allocator, &result, value, event);
         } else return error.UnsupportedHookEffect;
     }
+    if (oneOf(event, &.{ "PreModelRequest", "PostModelRequest", "SessionEnd", "Interrupt", "SubagentStart" }) and (result.stop or result.blocked != null or result.replacement != null or result.permission != null)) return error.UnsupportedHookEffect;
+    if (std.mem.eql(u8, event, "PostToolUse") and result.stop) return error.UnsupportedHookEffect;
     if (result.stop and result.blocked == null) result.blocked = try reason(allocator, root, "stopReason");
     return result;
 }
@@ -100,7 +106,11 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
             if (!std.mem.eql(u8, event, "PreToolUse")) return error.UnsupportedHookEffect;
             result.permission = std.meta.stringToEnum(Permission, try text(field)) orelse return error.InvalidHookOutput;
             if (result.permission == .deny and result.blocked == null) result.blocked = try reason(allocator, value, "permissionDecisionReason");
+        } else if (std.mem.eql(u8, key, "updatedMCPToolOutput")) {
+            if (!std.mem.eql(u8, event, "PostToolUse")) return error.UnsupportedHookEffect;
+            result.feedback = try std.json.Stringify.valueAlloc(allocator, field, .{});
         } else if (std.mem.eql(u8, key, "permissionDecisionReason")) {
+            if (!std.mem.eql(u8, event, "PreToolUse")) return error.UnsupportedHookEffect;
             _ = try text(field);
         } else if (std.mem.eql(u8, key, "decision")) {
             if (!std.mem.eql(u8, event, "PermissionRequest")) return error.UnsupportedHookEffect;
@@ -142,4 +152,24 @@ test "structured policy validates events types and effects" {
     try std.testing.expectError(error.InvalidHookOutput, parse(a, "{\"continue\":1}", "Stop"));
     try std.testing.expectError(error.InvalidHookEvent, parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"Stop\"}}", "PreToolUse"));
     try std.testing.expectError(error.UnsupportedHookEffect, parse(a, "{\"unknown\":true}", "Stop"));
+}
+
+test "pinned event result compatibility fixtures" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixtures = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/results.json"), .{});
+    for (fixtures.array.items) |fixture| {
+        const event = fixture.object.get("event").?.string;
+        const encoded = try std.json.Stringify.valueAlloc(a, fixture.object.get("output").?, .{});
+        if (fixture.object.contains("invalid")) {
+            if (parse(a, encoded, event)) |_| return error.InvalidFixtureAccepted else |_| {}
+            continue;
+        }
+        var result = try parse(std.testing.allocator, encoded, event);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(fixture.object.contains("blocked"), result.blocked != null);
+        try std.testing.expectEqual(fixture.object.contains("context"), result.context != null);
+        try std.testing.expectEqual(fixture.object.contains("replacement"), result.replacement != null);
+    }
 }

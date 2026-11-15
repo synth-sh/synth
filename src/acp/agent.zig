@@ -409,6 +409,9 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         for (files) |*file| file.path = projectRelative(session.stack.loop.project_root, file.path);
         if (asked.apply and files.len > 0) self.noticeFmt(.info, "Put back {d} file{s} as before that prompt", .{ files.len, if (files.len == 1) "" else "s" });
         return connection.reply(id, files);
+    } else if (eql(u8, method, m.hooks)) {
+        const asked = try rpc.parse(synth.Hooks, arena, params);
+        return connection.reply(id, try session.stack.manageHooks(arena, asked.action, asked.id));
     } else if (eql(u8, method, m.approvals)) {
         return connection.reply(id, try session.allowances(arena));
     } else if (eql(u8, method, m.set_approvals)) {
@@ -1684,6 +1687,14 @@ const Session = struct {
                 });
                 return loop.submit(text.items, .{ .attachments = attachments.items, .images = images.items });
             }
+            if (std.mem.eql(u8, text.items, "/hooks") or std.mem.startsWith(u8, text.items, "/hooks ")) {
+                var words = std.mem.tokenizeAny(u8, text.items, " \t\n");
+                _ = words.next();
+                const action = std.meta.stringToEnum(@import("../core/hook_store.zig").Action, words.next() orelse "list") orelse return error.InvalidParams;
+                const report = try self.stack.manageHooks(arena, action, words.next() orelse "");
+                self.agent.noticeFmt(.info, "{s}", .{report});
+                return;
+            }
             if (std.mem.eql(u8, std.mem.trimEnd(u8, text.items, " \t\n"), "/compact")) {
                 if (loop.isBusy()) return error.Busy;
                 return loop.compact();
@@ -1951,9 +1962,10 @@ const Session = struct {
     /// skills, and compacting.
     fn tellCommands(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
         const skills = self.stack.skills.skills;
-        const commands = try arena.alloc(protocol.Command, skills.len + 1);
+        const commands = try arena.alloc(protocol.Command, skills.len + 2);
         commands[0] = .{ .name = "compact", .description = "Summarise the conversation so far to free up context" };
-        for (skills, commands[1..]) |found, *command| command.* = .{
+        commands[1] = .{ .name = "hooks", .description = "Review, trust and control lifecycle hooks", .input = .{ .hint = "[list|review|trust|revoke|enable|disable] [id]" } };
+        for (skills, commands[2..]) |found, *command| command.* = .{
             .name = found.id,
             .description = if (found.description.len > 0) found.description else found.name,
             .input = .{ .hint = "what to do, if anything" },
@@ -2550,6 +2562,7 @@ fn signature(msg: *const Conversation.Message) u64 {
     std.hash.autoHash(&hasher, msg.thinking_ms);
     for (msg.tool_calls) |call| {
         std.hash.autoHash(&hasher, call.status);
+        hasher.update(call.arguments);
         std.hash.autoHash(&hasher, if (call.result) |result| result.len else 0);
         std.hash.autoHash(&hasher, call.result_bytes);
         std.hash.autoHash(&hasher, call.elapsed_ms);

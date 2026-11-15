@@ -281,6 +281,7 @@ pub fn provider(self: *OllamaProvider) Provider {
         .context_limit = self.effectiveLimit(),
         .vision = self.supports_vision,
         .userdata = self,
+        .observes_attempts = true,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
@@ -685,7 +686,7 @@ fn respond(
     turn: Provider.Turn,
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
-) !Provider.Reply {
+) anyerror!Provider.Reply {
     const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
 
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
@@ -710,9 +711,16 @@ fn respond(
     self.clearRejection();
     self.armSocket();
 
+    var hook_attempt: ?Provider.Attempt = null;
+    defer if (hook_attempt) |*attempt| attempt.finish();
+    errdefer |err| if (hook_attempt) |*attempt| {
+        attempt.error_message = @errorName(err);
+    };
     var messages: []Ollama.Message = undefined;
     var sends: usize = 1;
     var stream = while (true) {
+        if (hook_attempt) |*attempt| attempt.finish();
+        hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
         messages = try self.buildMessages(convo, arena, system, turn.instruction, budget);
         const request: Ollama.ChatRequest = .{
             .model = self.model,
@@ -732,7 +740,7 @@ fn respond(
                 continue;
             }
             if (isOverflow(why)) return error.ContextTooLarge;
-            return err;
+            return @as(anyerror!Provider.Reply, err);
         };
     };
     defer {
@@ -788,6 +796,7 @@ fn respond(
         .usage = usage,
     };
     self.log(arena, messages, reply) catch {};
+    hook_attempt.?.complete(reply.usage);
     return reply;
 }
 

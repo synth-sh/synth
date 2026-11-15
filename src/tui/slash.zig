@@ -63,6 +63,7 @@ pub const commands: []const Command = &.{
     .{ .name = "approvals", .description = "who decides calls: ask you, auto (a model judges), or all", .argument = .{ .optional = "ask|auto|all" } },
     .{ .name = "rewind", .description = "put back files as they were before an earlier prompt" },
     .{ .name = "permissions", .description = "see, edit and remove what is always allowed here" },
+    .{ .name = "hooks", .description = "list, review, trust, enable or disable lifecycle hooks", .argument = .{ .optional = "action [id]" } },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
     .{ .name = "theme", .description = "change the color theme", .argument = optional_name },
     .{ .name = "rename", .description = "name this session", .argument = optional_name },

@@ -111,6 +111,16 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         try self.mirror.listCheckpoints();
         return true;
     }
+    if (std.mem.eql(u8, line, "/hooks") or std.mem.startsWith(u8, line, "/hooks ")) {
+        var words = std.mem.tokenizeAny(u8, line, " \t");
+        _ = words.next();
+        const action = std.meta.stringToEnum(@import("../core/hook_store.zig").Action, words.next() orelse "list") orelse {
+            try self.notification.show(ctx, .warn, "Use /hooks list, review, trust, revoke, enable or disable");
+            return true;
+        };
+        try self.mirror.hooks(action, words.next() orelse "");
+        return true;
+    }
     if (std.mem.eql(u8, line, "/permissions")) {
         self.permission_picker.requested = true;
         try self.mirror.listApprovals();
@@ -263,6 +273,12 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             } else {
                 try self.rewind_picker.preview(rewound.seq, rewound.files);
             }
+            ctx.redraw = true;
+        },
+        .hooks => |text| {
+            defer answer.deinit(self.allocator);
+            _ = try self.conversation.append(.{ .role = .assistant, .text = text });
+            self.scroll = 0;
             ctx.redraw = true;
         },
         .approvals => |standing| {

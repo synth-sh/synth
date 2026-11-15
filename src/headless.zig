@@ -156,7 +156,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     }
     if (loop.takeHookNotice()) |notice| {
         defer allocator.free(notice);
-        try out.print("{s}hook blocked prompt{s} {s}\n", .{ red, reset, notice });
+        try out.print("{s}hook notice{s} {s}\n", .{ red, reset, notice });
         try out.flush();
         return;
     }

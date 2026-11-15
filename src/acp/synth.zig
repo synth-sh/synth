@@ -27,6 +27,7 @@ pub const Hello = struct {
 };
 
 pub const method = struct {
+    pub const hooks = "_synth/hooks";
     /// Agent to client: everything about the session, after it is set up.
     pub const snapshot = "_synth/snapshot";
     pub const appended = "_synth/appended";
@@ -417,3 +418,9 @@ test "a message survives the wire and comes back owned" {
     try testing.expectEqual(@as(u64, 9000), owned.tool_calls[0].result_bytes);
     try testing.expectEqualStrings("const a = 1;", owned.attachments[0].content);
 }
+
+pub const Hooks = struct {
+    sessionId: []const u8,
+    action: @import("../core/hook_store.zig").Action = .list,
+    id: []const u8 = "",
+};

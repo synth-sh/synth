@@ -41,6 +41,9 @@ reads: tool.ReadLog,
 convo: Conversation,
 hooks: Hooks.Runner,
 hook_runtime: Hooks.Runtime,
+hook_inline: Hooks.Set,
+hook_home: ?[]const u8,
+hook_state_path: ?[]const u8,
 runner: subagent.Runner,
 loop: Loop,
 
@@ -115,9 +118,12 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         self.runner.deinit();
     }
 
+    self.hook_inline = config.hooks;
+    self.hook_home = options.home;
+    self.hook_state_path = config.hook_state_path;
     var hook_store = try HookStore.Store.init(allocator, io, config.hook_state_path);
     defer hook_store.deinit();
-    const discovered_hooks = try HookStore.discover(self.arena.allocator(), io, config.hooks, self.project.root, options.home, hook_store);
+    const discovered_hooks = try HookStore.discover(self.arena.allocator(), io, config.hooks, self.project.root, options.home, config.hook_timeout_ms, hook_store);
     self.hook_runtime = .{ .allocator = allocator, .io = io };
     errdefer self.hook_runtime.deinit();
     self.hooks = .{
@@ -129,6 +135,11 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         .timeout_ms = config.hook_timeout_ms,
     };
     self.loop.hooks = &self.hooks;
+    inline for (std.meta.fields(Hooks.Set)) |field| {
+        for (@field(discovered_hooks, field.name)) |hook| {
+            if (hook.enabled and !hook.trusted and self.loop.hook_notice == null) self.loop.hook_notice = try allocator.dupe(u8, "Hooks need review. Use /hooks review or synth hooks review, then trust reviewed ids explicitly.");
+        }
+    }
     self.loop.auto_approve_safe = config.auto_approve_safe_commands;
     self.loop.approvals = config.approvals;
     if (config.max_turn_ms) |ms| self.loop.max_turn_ms = ms;
@@ -146,13 +157,24 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     return self;
 }
 
+pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore.Action, id: []const u8) ![]u8 {
+    if (self.loop.isBusy() and action != .list and action != .review) return error.Busy;
+    if (!self.loop.isBusy()) {
+        var store = try HookStore.Store.init(allocator, self.hooks.io, self.hook_state_path);
+        defer store.deinit();
+        self.hooks.set = try HookStore.discover(self.arena.allocator(), self.hooks.io, self.hook_inline, self.project.root, self.hook_home, self.hooks.timeout_ms, store);
+    }
+    try HookStore.change(self.arena.allocator(), self.hooks.io, &self.hooks.set, self.hook_state_path, action, id);
+    return HookStore.report(allocator, self.hooks.set, self.hooks.timeout_ms, action == .review, &self.hook_runtime);
+}
+
 fn callHookMcp(raw: *anyopaque, allocator: std.mem.Allocator, hook: Hooks.Hook, arguments: []const u8, timeout_ms: u64, stop: ?*const std.atomic.Value(bool)) ![]const u8 {
     const self: *Stack = @ptrCast(@alignCast(raw));
-    const name = try std.fmt.allocPrint(allocator, "mcp__{s}__{s}", .{ hook.server, hook.tool });
+    const name = try mcp_tools.localName(allocator, hook.server, hook.tool);
     defer allocator.free(name);
     const definition = self.registry.get(name) orelse return error.HookMcpToolUnavailable;
     if (!std.mem.startsWith(u8, definition.name, mcp_tools.prefix)) return error.HookMcpToolUnavailable;
-    const deadline = @import("../tools/tool.zig").monotonicMilliseconds(self.hooks.io) + @as(i64, @intCast(@min(timeout_ms, definition.timeout_ms orelse timeout_ms)));
+    const deadline = @import("../tools/tool.zig").monotonicMilliseconds(self.hooks.io) + @as(i64, @intCast(@min(timeout_ms, definition.timeout_ms orelse tool.default_timeout_ms)));
     const result = try self.registry.executeJson(.{
         .allocator = allocator,
         .io = self.hooks.io,
@@ -189,8 +211,14 @@ fn named(servers: []const mcp_tools.Server, name: []const u8) bool {
 
 pub fn destroy(self: *Stack) void {
     // Ordered: the loop joins workers writing to the runner; MCP tools point into the host.
+    const end_input = (self.loop.exportHookInput(.{ .event = .session_end }) catch self.loop.hookInput(.{ .event = .session_end })).dupe(self.arena.allocator()) catch self.loop.hookInput(.{ .event = .session_end });
     self.loop.deinit();
     self.runner.deinit();
+    self.hook_runtime.cancelBackground();
+    var end_runner = self.hooks;
+    end_runner.deadline_ms = std.Io.Clock.now(.awake, self.hooks.io).toMilliseconds() + 3000;
+    var end_result = end_runner.evaluate(self.allocator, end_input) catch null;
+    if (end_result) |*result| result.deinit(self.allocator);
     self.hook_runtime.deinit();
     self.convo.deinit();
     self.reads.deinit();
