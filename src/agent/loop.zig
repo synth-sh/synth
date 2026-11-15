@@ -131,6 +131,9 @@ conversation: *Conversation,
 reads: *tool.ReadLog,
 hooks: ?*const Hooks.Runner = null,
 hook_dispatch: ?*Hooks.Dispatch = null,
+hook_purpose: HookPurpose = .prompt,
+hook_call_index: usize = 0,
+approved_ask_index: ?usize = null,
 pending_submit: ?Submission = null,
 hook_notice: ?[]u8 = null,
 /// Root every tool resolves against. Borrowed.
@@ -843,6 +846,7 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
             .event = .user_prompt_submit,
             .prompt = self.pending_submit.?.prompt,
         });
+        self.hook_purpose = .prompt;
         self.state = .running_hooks;
         return;
     }
@@ -881,7 +885,10 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.ask();
 }
 
+const HookPurpose = enum { prompt, steering, owner_pre, owner_post };
+
 fn pollPromptHooks(self: *Loop) !bool {
+    if (self.hook_purpose != .prompt) return self.pollOtherHooks();
     const dispatch = self.hook_dispatch orelse return false;
     if (!dispatch.isFinished()) return false;
 
@@ -910,6 +917,86 @@ fn pollPromptHooks(self: *Loop) !bool {
 
     self.state = .idle;
     try self.finishSubmit(pending.prompt, pending.asExtras());
+    return true;
+}
+
+fn pollOtherHooks(self: *Loop) !bool {
+    const dispatch = self.hook_dispatch orelse return false;
+    if (!dispatch.isFinished()) return false;
+    dispatch.join();
+    self.hook_dispatch = null;
+    defer dispatch.destroy();
+
+    if (self.hook_purpose == .steering) {
+        var pending = self.steering.orderedRemove(0);
+        defer pending.deinit(self.allocator);
+        if (dispatch.failed) |err| {
+            self.hook_notice = try std.fmt.allocPrint(self.allocator, "UserPromptSubmit hook failed: {s}", .{@errorName(err)});
+        } else if (dispatch.takeBlocked()) |reason| {
+            self.hook_notice = reason;
+        } else {
+            _ = try self.conversation.addUser(pending.prompt, pending.attachments, pending.images);
+            try self.persistMessage(self.conversation.messages.items.len - 1);
+        }
+        return self.askThenChanged();
+    }
+    return self.pollOwnerHooks(dispatch);
+}
+
+fn startOwnerHook(self: *Loop, purpose: HookPurpose, index: usize, response: []const u8) !void {
+    const message_index = self.pendingIndex() orelse return;
+    const call = self.conversation.messages.items[message_index].tool_calls[index];
+    self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, self.hooks.?.*, .{
+        .event = if (purpose == .owner_pre) .pre_tool_use else .post_tool_use,
+        .tool_name = call.name,
+        .tool_input = call.arguments,
+        .tool_response = response,
+    });
+    self.hook_purpose = purpose;
+    self.hook_call_index = index;
+    self.state = .running_hooks;
+}
+
+fn pollOwnerHooks(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
+    const message_index = self.pendingIndex() orelse return false;
+    const index = self.hook_call_index;
+    const call = &self.conversation.messages.items[message_index].tool_calls[index];
+    if (self.hook_purpose == .owner_post) {
+        self.state = .idle;
+        try self.runApproved();
+        return true;
+    }
+    const failure: ?[]u8 = if (dispatch.failed) |err|
+        try std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)})
+    else
+        dispatch.takeBlocked();
+    if (failure) |reason| {
+        call.status = .rejected;
+        call.result = reason;
+        call.result_bytes = reason.len;
+        try self.persistToolCall(message_index, index);
+        self.state = .idle;
+        try self.runApproved();
+        return true;
+    }
+    if (std.mem.eql(u8, call.name, todo_tool.name)) {
+        try self.applyTodo(message_index, index);
+        if (self.hooks.?.set.forEvent(.post_tool_use).len > 0) {
+            try self.startOwnerHook(.owner_post, index, call.result.?);
+            return true;
+        }
+    } else {
+        self.approved_ask_index = index;
+        self.state = .awaiting_answer;
+        return true;
+    }
+    self.state = .idle;
+    try self.runApproved();
+    return true;
+}
+
+fn askThenChanged(self: *Loop) !bool {
+    try self.ask();
     return true;
 }
 
@@ -1000,6 +1087,19 @@ pub fn loadToolResult(self: *Loop, msg: *Conversation.Message, call_index: usize
 }
 
 fn ask(self: *Loop) !void {
+    if (self.steering.items.len > 0) {
+        if (self.hooks) |runner| {
+            if (runner.set.forEvent(.user_prompt_submit).len > 0) {
+                self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, runner.*, .{
+                    .event = .user_prompt_submit,
+                    .prompt = self.steering.items[0].prompt,
+                });
+                self.hook_purpose = .steering;
+                self.state = .running_hooks;
+                return;
+            }
+        }
+    }
     try self.applySteering();
     if (self.overBudget()) |reason| return self.stop(reason);
     if (self.shouldCompact()) return self.startCompaction(true);
@@ -1613,14 +1713,20 @@ pub fn answer(self: *Loop, text: []const u8) !void {
         if (call.status != .running) continue;
         if (!std.mem.eql(u8, call.name, ask_user.name)) continue;
 
+        self.approved_ask_index = null;
         call.settle(.ok, tool.monotonicMilliseconds(self.io));
         call.result = try self.allocator.dupe(u8, text);
         call.result_bytes = text.len;
         try self.persistToolCall(message_index, i);
+        if (self.hooks) |runner| {
+            if (runner.set.forEvent(.post_tool_use).len > 0) {
+                try self.startOwnerHook(.owner_post, i, call.result.?);
+                return;
+            }
+        }
         break;
     }
 
-    if (self.firstAsk() != null) return;
     try self.runApproved();
 }
 
@@ -1638,26 +1744,20 @@ fn persistTodos(self: *Loop) !void {
 /// The list is what the sidebar reads every frame, so a tool worker writing it
 /// would be a race - and there is nothing in it worth a worker: no file is
 /// touched and no process runs.
-fn applyTodos(self: *Loop, message_index: usize) !void {
-    const calls = self.conversation.messages.items[message_index].tool_calls;
+fn applyTodo(self: *Loop, message_index: usize, i: usize) !void {
+    const call = &self.conversation.messages.items[message_index].tool_calls[i];
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
 
-    for (calls, 0..) |*call, i| {
-        if (call.status != .running) continue;
-        if (!std.mem.eql(u8, call.name, todo_tool.name)) continue;
+    try self.todos.replace(todo_tool.parse(arena_state.allocator(), call.arguments));
+    try self.persistTodos();
 
-        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
-        defer arena_state.deinit();
-
-        try self.todos.replace(todo_tool.parse(arena_state.allocator(), call.arguments));
-        try self.persistTodos();
-
-        const text = try todo_tool.summary(self.allocator, &self.todos);
-        call.settle(.ok, tool.monotonicMilliseconds(self.io));
-        if (call.result) |old| self.allocator.free(old);
-        call.result = text;
-        call.result_bytes = text.len;
-        try self.persistToolCall(message_index, i);
-    }
+    const text = try todo_tool.summary(self.allocator, &self.todos);
+    call.settle(.ok, tool.monotonicMilliseconds(self.io));
+    if (call.result) |old| self.allocator.free(old);
+    call.result = text;
+    call.result_bytes = text.len;
+    try self.persistToolCall(message_index, i);
 }
 
 /// Where the message being decided currently sits, or null when there is no
@@ -2356,7 +2456,36 @@ fn runApproved(self: *Loop) !void {
     const message_index = self.pendingIndex() orelse return;
     const calls = self.conversation.messages.items[message_index].tool_calls;
 
-    try self.applyTodos(message_index);
+    if (self.hooks) |runner| {
+        const calls_for_hooks = self.conversation.messages.items[message_index].tool_calls;
+        for (calls_for_hooks, 0..) |call, i| {
+            if (call.status != .running) continue;
+            const is_todo = std.mem.eql(u8, call.name, todo_tool.name);
+            const is_ask = std.mem.eql(u8, call.name, ask_user.name);
+            if (!is_todo and !is_ask) continue;
+            if (is_ask and self.approved_ask_index == i) continue;
+            if (runner.set.forEvent(.pre_tool_use).len > 0) {
+                try self.startOwnerHook(.owner_pre, i, "");
+                return;
+            }
+            if (is_todo) {
+                try self.applyTodo(message_index, i);
+                if (runner.set.forEvent(.post_tool_use).len > 0) {
+                    try self.startOwnerHook(.owner_post, i, calls_for_hooks[i].result.?);
+                    return;
+                }
+            } else {
+                self.approved_ask_index = i;
+                self.state = .awaiting_answer;
+                return;
+            }
+        }
+    } else {
+        const calls_for_todos = self.conversation.messages.items[message_index].tool_calls;
+        for (calls_for_todos, 0..) |call, i| {
+            if (call.status == .running and std.mem.eql(u8, call.name, todo_tool.name)) try self.applyTodo(message_index, i);
+        }
+    }
 
     var batch: std.ArrayList(ToolRun.Call) = .empty;
     defer batch.deinit(self.allocator);
@@ -2730,6 +2859,29 @@ test "a blocked prompt never enters the model transcript" {
     const notice = loop.takeHookNotice().?;
     defer testing.allocator.free(notice);
     try testing.expectEqualStrings("prompt rejected", notice);
+}
+
+test "a rejected steering prompt never enters the transcript" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const hook = Hooks.Hook{ .command = "read payload; case \"$payload\" in *rejected*) echo steering denied >&2; exit 2;; esac" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_submit = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    fixture.fake.latency = .fromMilliseconds(80);
+    try loop.submit("again", .{});
+    try testing.expect(try loop.steer("rejected", .{}));
+    try settle(&loop);
+    for (fixture.convo.messages.items) |msg| {
+        try testing.expect(!std.mem.eql(u8, msg.text, "rejected"));
+    }
+    const notice = loop.takeHookNotice() orelse return error.TestExpectedNotice;
+    defer testing.allocator.free(notice);
+    try testing.expectEqualStrings("steering denied", notice);
 }
 
 test "a read-only tool call runs without asking" {
@@ -4181,6 +4333,22 @@ test "a question stops the turn and its answer becomes the result" {
     try testing.expectEqualStrings("the left one", call.result.?);
 }
 
+test "pre-tool hook denies owner-thread question before it is shown" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.tool_name = "ask_user";
+    fixture.fake.tool_arguments = "{\"question\":\"Which one?\"}";
+    const hook = Hooks.Hook{ .matcher = "ask_user", .command = "echo no questions >&2; exit 2" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expect(loop.pendingQuestion() == null);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, fixture.convo.messages.items[1].tool_calls[0].status);
+}
+
 test "an answer offered when nothing was asked is ignored" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -4360,6 +4528,38 @@ test "a plan is applied without a worker, and reads back as progress" {
     const call = &loop.conversation.messages.items[1].tool_calls[0];
     try testing.expectEqual(Conversation.ToolCall.Status.ok, call.status);
     try testing.expectEqualStrings("1/3 done, now: write the test", call.result.?);
+}
+
+test "pre-tool hook denies owner-thread todo without changing the list" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.tool_name = "todo";
+    fixture.fake.tool_arguments = "{\"items\":[{\"text\":\"should not appear\"}]}";
+    const hook = Hooks.Hook{ .matcher = "todo", .command = "echo no todos >&2; exit 2" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 0), loop.todos.items.items.len);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, fixture.convo.messages.items[1].tool_calls[0].status);
+}
+
+test "post-tool hook runs after an owner-thread todo settles" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.tool_name = "todo";
+    fixture.fake.tool_arguments = "{\"items\":[{\"text\":\"kept\"}]}";
+    const hook = Hooks.Hook{ .matcher = "todo", .command = "read payload; case \"$payload\" in *tool_response*) exit 0;; *) exit 2;; esac" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .post_tool_use = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 1), loop.todos.items.items.len);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, fixture.convo.messages.items[1].tool_calls[0].status);
 }
 
 test "a plan survives the session being resumed" {
