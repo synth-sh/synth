@@ -137,6 +137,7 @@ skill_paths: []const []const u8 = &.{},
 /// be repeating its shape. Borrowed from this config's arena.
 mcp: ?std.json.Value = null,
 hooks: Hooks.Set = .{},
+hook_state_path: ?[]const u8 = null,
 hook_timeout_ms: u64 = Hooks.default_timeout_ms,
 /// What a startup prune is allowed to throw away.
 prune: Database.Policy = .{ .shed_after_days = 30 },
@@ -176,7 +177,7 @@ const File = struct {
     web: ?struct {
         search_api_key: ?[]const u8 = null,
     } = null,
-    hooks: ?Hooks.File = null,
+    hooks: ?std.json.Value = null,
     hook_timeout_ms: ?u64 = null,
     prune: ?struct {
         delete_after_days: ?u32 = null,
@@ -268,6 +269,7 @@ pub fn load(
     self.path = try self.arena.allocator().dupe(u8, path);
     try self.applyFile(io, path);
     try self.applyEnv(env);
+    self.hook_state_path = privateDataPath(self.arena.allocator(), env, "hook-trust.json") catch null;
 
     return self;
 }
@@ -295,8 +297,11 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.max_stall_ms) |value| self.max_stall_ms = value;
     if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
-    if (parsed.hooks) |value| self.hooks = value.set();
-    if (parsed.hook_timeout_ms) |value| self.hook_timeout_ms = value;
+    if (parsed.hooks) |value| self.hooks = try Hooks.parse(arena, value, path);
+    if (parsed.hook_timeout_ms) |value| {
+        try Hooks.validTimeout(value);
+        self.hook_timeout_ms = value;
+    }
 
     if (parsed.web) |web| {
         if (web.search_api_key) |value| self.search_api_key = value;

@@ -18,6 +18,8 @@ pub const Result = struct {
     index: usize,
     content: []const u8,
     is_error: bool,
+    hook_result: Hooks.Result = .{},
+    hook_error: ?anyerror = null,
 };
 
 allocator: std.mem.Allocator,
@@ -79,6 +81,7 @@ const Reporter = struct {
 };
 
 pub const Call = struct {
+    prechecked: bool = false,
     /// The message that asked for it, by seq.
     seq: u64 = 0,
     index: usize,
@@ -120,6 +123,7 @@ pub fn start(
             .name = try allocator.dupe(u8, src.name),
             .arguments = try allocator.dupe(u8, src.arguments),
             .allow_outside = src.allow_outside,
+            .prechecked = src.prechecked,
         };
         built += 1;
     }
@@ -219,6 +223,8 @@ pub fn destroy(self: *ToolRun) void {
     allocator.free(self.calls);
     for (self.results) |result| {
         if (result.content.len > 0) allocator.free(result.content);
+        var hook_result = result.hook_result;
+        hook_result.deinit(allocator);
     }
     allocator.free(self.results);
     allocator.free(self.notes);
@@ -307,27 +313,28 @@ fn runOne(self: *ToolRun, index: usize) void {
     };
 
     if (self.hooks) |configured_runner| {
-        var runner = configured_runner.*;
-        runner.stop = &self.stop;
-        const blocked = runner.dispatch(self.allocator, .{
-            .event = .pre_tool_use,
-            .tool_name = call.name,
-            .tool_input = call.arguments,
-        }) catch |err| {
-            result.* = .{
-                .index = call.index,
-                .content = std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)}) catch
-                    self.allocator.dupe(u8, "pre-tool hook failed") catch "",
-                .is_error = true,
+        if (!call.prechecked) {
+            var runner = configured_runner.*;
+            runner.stop = &self.stop;
+            const blocked = runner.dispatch(self.allocator, .{
+                .event = .pre_tool_use,
+                .tool_name = call.name,
+                .tool_input = call.arguments,
+            }) catch |err| {
+                result.* = .{
+                    .index = call.index,
+                    .content = std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)}) catch
+                        self.allocator.dupe(u8, "pre-tool hook failed") catch "",
+                    .is_error = true,
+                };
+                return;
             };
-            return;
-        };
-        if (blocked) |reason| {
-            result.* = .{ .index = call.index, .content = reason, .is_error = true };
-            return;
+            if (blocked) |reason| {
+                result.* = .{ .index = call.index, .content = reason, .is_error = true };
+                return;
+            }
         }
     }
-
     if (self.stop.load(.acquire)) {
         result.* = .{ .index = call.index, .content = self.allocator.dupe(u8, "cancelled") catch "", .is_error = true };
         return;
@@ -346,13 +353,18 @@ fn runOne(self: *ToolRun, index: usize) void {
         return;
     };
     result.* = .{ .index = call.index, .content = output.content, .is_error = output.is_error };
-    if (self.hooks) |runner| {
-        _ = runner.dispatch(self.allocator, .{
+    if (self.hooks) |configured| {
+        var runner = configured.*;
+        runner.stop = &self.stop;
+        result.hook_result = runner.evaluate(self.allocator, .{
             .event = .post_tool_use,
             .tool_name = call.name,
             .tool_input = call.arguments,
             .tool_response = output.content,
-        }) catch {};
+        }) catch |err| {
+            result.hook_error = err;
+            return;
+        };
     }
 }
 

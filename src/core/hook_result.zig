@@ -1,0 +1,145 @@
+const std = @import("std");
+
+pub const Permission = enum { allow, deny, ask };
+
+pub const Result = struct {
+    blocked: ?[]u8 = null,
+    context: ?[]u8 = null,
+    message: ?[]u8 = null,
+    replacement: ?[]u8 = null,
+    permission: ?Permission = null,
+    stop: bool = false,
+
+    pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
+        inline for (.{ "blocked", "context", "message", "replacement" }) |field| {
+            if (@field(self, field)) |value| allocator.free(value);
+        }
+        self.* = .{};
+    }
+
+    pub fn merge(self: *Result, allocator: std.mem.Allocator, other: Result) !void {
+        if (other.blocked) |value| {
+            if (self.blocked == null) self.blocked = try allocator.dupe(u8, value);
+        }
+        inline for (.{ "context", "message" }) |field| {
+            if (@field(other, field)) |value| {
+                const combined = if (@field(self, field)) |old|
+                    try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ old, value })
+                else
+                    try allocator.dupe(u8, value);
+                if (@field(self, field)) |old| allocator.free(old);
+                @field(self, field) = combined;
+            }
+        }
+        if (other.replacement) |value| {
+            const copy = try allocator.dupe(u8, value);
+            if (self.replacement) |old| allocator.free(old);
+            self.replacement = copy;
+        }
+        if (other.permission) |value| {
+            if (self.permission != .deny) self.permission = value;
+        }
+        self.stop = self.stop or other.stop;
+    }
+};
+
+pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: []const u8) !Result {
+    if (std.mem.trim(u8, source, " \r\n\t").len == 0) return .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, source, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return error.InvalidHookOutput;
+    var result: Result = .{};
+    errdefer result.deinit(allocator);
+    var fields = root.object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "continue")) {
+            if (value != .bool) return error.InvalidHookOutput;
+            result.stop = !value.bool;
+        } else if (std.mem.eql(u8, key, "suppressOutput")) {
+            if (value != .bool) return error.InvalidHookOutput;
+        } else if (std.mem.eql(u8, key, "systemMessage")) {
+            result.message = try string(allocator, value);
+        } else if (std.mem.eql(u8, key, "reason") or std.mem.eql(u8, key, "stopReason")) {
+            _ = try text(value);
+        } else if (std.mem.eql(u8, key, "decision")) {
+            const decision = try text(value);
+            if (!oneOf(event, &.{ "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop" })) return error.UnsupportedHookEffect;
+            if (std.mem.eql(u8, decision, "block")) {
+                result.blocked = try reason(allocator, root, "reason");
+            } else if (std.mem.eql(u8, event, "PreToolUse") and std.mem.eql(u8, decision, "approve")) {
+                result.permission = .allow;
+            } else return error.InvalidHookOutput;
+        } else if (std.mem.eql(u8, key, "hookSpecificOutput")) {
+            if (value != .object) return error.InvalidHookOutput;
+            const named = value.object.get("hookEventName") orelse return error.InvalidHookOutput;
+            if (!std.mem.eql(u8, try text(named), event)) return error.InvalidHookEvent;
+            try specific(allocator, &result, value, event);
+        } else return error.UnsupportedHookEffect;
+    }
+    if (result.stop and result.blocked == null) result.blocked = try reason(allocator, root, "stopReason");
+    return result;
+}
+
+fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value, event: []const u8) !void {
+    var fields = value.object.iterator();
+    while (fields.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const field = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "hookEventName")) continue;
+        if (std.mem.eql(u8, key, "additionalContext")) {
+            if (!oneOf(event, &.{ "PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart", "SubagentStart" })) return error.UnsupportedHookEffect;
+            result.context = try string(allocator, field);
+        } else if (std.mem.eql(u8, key, "updatedInput")) {
+            if (!std.mem.eql(u8, event, "PreToolUse")) return error.UnsupportedHookEffect;
+            if (field != .object) return error.InvalidHookOutput;
+            result.replacement = try std.json.Stringify.valueAlloc(allocator, field, .{});
+        } else if (std.mem.eql(u8, key, "permissionDecision")) {
+            if (!std.mem.eql(u8, event, "PreToolUse")) return error.UnsupportedHookEffect;
+            result.permission = std.meta.stringToEnum(Permission, try text(field)) orelse return error.InvalidHookOutput;
+            if (result.permission == .deny and result.blocked == null) result.blocked = try reason(allocator, value, "permissionDecisionReason");
+        } else if (std.mem.eql(u8, key, "permissionDecisionReason")) {
+            _ = try text(field);
+        } else if (std.mem.eql(u8, key, "decision")) {
+            if (!std.mem.eql(u8, event, "PermissionRequest")) return error.UnsupportedHookEffect;
+            if (field != .object) return error.InvalidHookOutput;
+            var entries = field.object.iterator();
+            while (entries.next()) |item| {
+                if (!oneOf(item.key_ptr.*, &.{ "behavior", "message" })) return error.UnsupportedHookEffect;
+                _ = try text(item.value_ptr.*);
+            }
+            result.permission = std.meta.stringToEnum(Permission, try text(field.object.get("behavior") orelse return error.InvalidHookOutput)) orelse return error.InvalidHookOutput;
+            if (result.permission == .ask) return error.InvalidHookOutput;
+            if (result.permission == .deny) result.blocked = try reason(allocator, field, "message");
+        } else return error.UnsupportedHookEffect;
+    }
+}
+
+fn text(value: std.json.Value) ![]const u8 {
+    if (value != .string) return error.InvalidHookOutput;
+    return value.string;
+}
+fn string(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return allocator.dupe(u8, try text(value));
+}
+fn reason(allocator: std.mem.Allocator, object: std.json.Value, key: []const u8) ![]u8 {
+    const value = if (object.object.get(key)) |v| try text(v) else "blocked by hook";
+    return allocator.dupe(u8, if (value.len == 0) "blocked by hook" else value);
+}
+fn oneOf(value: []const u8, choices: []const []const u8) bool {
+    for (choices) |choice| if (std.mem.eql(u8, value, choice)) return true;
+    return false;
+}
+
+test "structured policy validates events types and effects" {
+    const a = std.testing.allocator;
+    var result = try parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"updatedInput\":{\"command\":\"echo ok\"},\"additionalContext\":\"context\"}}", "PreToolUse");
+    defer result.deinit(a);
+    try std.testing.expect(result.blocked != null);
+    try std.testing.expectEqualStrings("{\"command\":\"echo ok\"}", result.replacement.?);
+    try std.testing.expectError(error.InvalidHookOutput, parse(a, "{\"continue\":1}", "Stop"));
+    try std.testing.expectError(error.InvalidHookEvent, parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"Stop\"}}", "PreToolUse"));
+    try std.testing.expectError(error.UnsupportedHookEffect, parse(a, "{\"unknown\":true}", "Stop"));
+}

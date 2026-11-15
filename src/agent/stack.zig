@@ -15,6 +15,7 @@ const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const Hooks = @import("../core/hooks.zig");
+const HookStore = @import("../core/hook_store.zig");
 const Project = @import("../core/project.zig");
 const skill = @import("../core/skill.zig");
 const mcp_tools = @import("../tools/mcp.zig");
@@ -39,6 +40,7 @@ mcp_host: mcp_tools.Host,
 reads: tool.ReadLog,
 convo: Conversation,
 hooks: Hooks.Runner,
+hook_runtime: Hooks.Runtime,
 runner: subagent.Runner,
 loop: Loop,
 
@@ -113,10 +115,17 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         self.runner.deinit();
     }
 
+    var hook_store = try HookStore.Store.init(allocator, io, config.hook_state_path);
+    defer hook_store.deinit();
+    const discovered_hooks = try HookStore.discover(self.arena.allocator(), io, config.hooks, self.project.root, options.home, hook_store);
+    self.hook_runtime = .{ .allocator = allocator, .io = io };
+    errdefer self.hook_runtime.deinit();
     self.hooks = .{
         .io = io,
         .root = self.project.root,
-        .set = config.hooks,
+        .set = discovered_hooks,
+        .runtime = &self.hook_runtime,
+        .mcp_executor = .{ .userdata = self, .call = callHookMcp },
         .timeout_ms = config.hook_timeout_ms,
     };
     self.loop.hooks = &self.hooks;
@@ -135,6 +144,28 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         try self.loop.attachDatabase(db, self.project.name(), self.project.cwd, options.provider.model);
     }
     return self;
+}
+
+fn callHookMcp(raw: *anyopaque, allocator: std.mem.Allocator, hook: Hooks.Hook, arguments: []const u8, timeout_ms: u64, stop: ?*const std.atomic.Value(bool)) ![]const u8 {
+    const self: *Stack = @ptrCast(@alignCast(raw));
+    const name = try std.fmt.allocPrint(allocator, "mcp__{s}__{s}", .{ hook.server, hook.tool });
+    defer allocator.free(name);
+    const definition = self.registry.get(name) orelse return error.HookMcpToolUnavailable;
+    if (!std.mem.startsWith(u8, definition.name, mcp_tools.prefix)) return error.HookMcpToolUnavailable;
+    const deadline = @import("../tools/tool.zig").monotonicMilliseconds(self.hooks.io) + @as(i64, @intCast(@min(timeout_ms, definition.timeout_ms orelse timeout_ms)));
+    const result = try self.registry.executeJson(.{
+        .allocator = allocator,
+        .io = self.hooks.io,
+        .project_root = self.project.root,
+        .reads = &self.reads,
+        .cancelled = stop,
+        .deadline_ms = deadline,
+    }, name, arguments);
+    if (result.is_error) {
+        allocator.free(result.content);
+        return error.HookMcpCallFailed;
+    }
+    return result.content;
 }
 
 fn mcpServers(arena: std.mem.Allocator, config: *const Config, extra: []const mcp_tools.Server) ![]const mcp_tools.Server {
@@ -160,6 +191,7 @@ pub fn destroy(self: *Stack) void {
     // Ordered: the loop joins workers writing to the runner; MCP tools point into the host.
     self.loop.deinit();
     self.runner.deinit();
+    self.hook_runtime.deinit();
     self.convo.deinit();
     self.reads.deinit();
     self.registry.deinit();

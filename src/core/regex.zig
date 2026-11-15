@@ -54,6 +54,7 @@ pub const Regex = struct {
     /// call: a grep runs one of these over every line in the project.
     stack: []Frame,
     ignore_case: bool,
+    exhausted: bool = false,
 
     const Frame = struct { pc: usize, sp: usize };
 
@@ -65,6 +66,7 @@ pub const Regex = struct {
     /// start over the longest overall match is what every line-oriented search
     /// tool does.
     pub fn find(self: *Regex, input: []const u8, from: usize) ?Match {
+        self.exhausted = false;
         var budget: usize = max_steps;
         var start = from;
         while (start <= input.len) : (start += 1) {
@@ -74,6 +76,12 @@ pub const Regex = struct {
             if (budget == 0) return null;
         }
         return null;
+    }
+
+    pub fn checkedMatches(self: *Regex, input: []const u8) !bool {
+        const found = self.find(input, 0) != null;
+        if (self.exhausted) return error.RegexResourceLimit;
+        return found;
     }
 
     pub fn matches(self: *Regex, input: []const u8) bool {
@@ -91,7 +99,10 @@ pub const Regex = struct {
         var sp: usize = start;
 
         while (true) {
-            if (budget.* == 0) return null;
+            if (budget.* == 0) {
+                self.exhausted = true;
+                return null;
+            }
             budget.* -= 1;
 
             const advance: bool = switch (self.program[pc]) {
@@ -101,7 +112,10 @@ pub const Regex = struct {
                     continue;
                 },
                 .split => |branch| {
-                    if (depth == self.stack.len) return null;
+                    if (depth == self.stack.len) {
+                        self.exhausted = true;
+                        return null;
+                    }
                     self.stack[depth] = .{ .pc = branch.second, .sp = sp };
                     depth += 1;
                     pc = branch.first;

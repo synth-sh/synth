@@ -133,6 +133,11 @@ hooks: ?*const Hooks.Runner = null,
 hook_dispatch: ?*Hooks.Dispatch = null,
 hook_purpose: HookPurpose = .prompt,
 hook_call_index: usize = 0,
+hook_pre_seq: ?u64 = null,
+hook_pre_index: usize = 0,
+hook_permission_seq: ?u64 = null,
+hook_permission_index: usize = 0,
+hook_context: ?[]u8 = null,
 approved_ask_index: ?usize = null,
 pending_submit: ?Submission = null,
 hook_notice: ?[]u8 = null,
@@ -589,6 +594,7 @@ pub fn requestStop(self: *Loop) void {
 
 pub fn deinit(self: *Loop) void {
     if (self.session_title) |t| self.allocator.free(t);
+    if (self.hook_context) |context| self.allocator.free(context);
     self.session_title = null;
     if (self.session_model_owned) |m| self.allocator.free(m);
     self.session_model_owned = null;
@@ -885,7 +891,7 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.ask();
 }
 
-const HookPurpose = enum { prompt, steering, owner_pre, owner_post };
+const HookPurpose = enum { prompt, steering, owner_pre, owner_post, tool_policy, permission };
 
 fn pollPromptHooks(self: *Loop) !bool {
     if (self.hook_purpose != .prompt) return self.pollOtherHooks();
@@ -916,6 +922,7 @@ fn pollPromptHooks(self: *Loop) !bool {
     }
 
     self.state = .idle;
+    try self.acceptHookResult(&dispatch.result);
     try self.finishSubmit(pending.prompt, pending.asExtras());
     return true;
 }
@@ -935,12 +942,83 @@ fn pollOtherHooks(self: *Loop) !bool {
         } else if (dispatch.takeBlocked()) |reason| {
             self.hook_notice = reason;
         } else {
+            try self.acceptHookResult(&dispatch.result);
             _ = try self.conversation.addUser(pending.prompt, pending.attachments, pending.images);
             try self.persistMessage(self.conversation.messages.items.len - 1);
         }
         return self.askThenChanged();
     }
+    if (self.hook_purpose == .tool_policy or self.hook_purpose == .permission) {
+        const message_index = self.pendingIndex() orelse return false;
+        const index = self.hook_call_index;
+        const call = &self.conversation.messages.items[message_index].tool_calls[index];
+        const reason = if (dispatch.failed) |err|
+            try std.fmt.allocPrint(self.allocator, "hook failed: {s}", .{@errorName(err)})
+        else
+            dispatch.takeBlocked();
+        if (reason) |blocked| {
+            call.status = .rejected;
+            call.result = blocked;
+            call.result_bytes = blocked.len;
+        } else {
+            if (dispatch.result.replacement) |replacement| {
+                var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, replacement, .{}) catch return error.InvalidHookOutput;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidHookOutput;
+                const definition = self.registry.get(call.name) orelse return error.UnknownTool;
+                const schema = try std.json.parseFromSlice(std.json.Value, self.allocator, definition.schema, .{});
+                defer schema.deinit();
+                @import("../core/hook_schema.zig").validate(schema.value, parsed.value) catch {
+                    call.status = .rejected;
+                    call.result = try self.allocator.dupe(u8, "hook replacement does not satisfy the tool input schema");
+                    call.result_bytes = call.result.?.len;
+                    try self.persistToolCall(message_index, index);
+                    try self.autoApprove();
+                    return true;
+                };
+                const effective = try self.allocator.dupe(u8, replacement);
+                self.allocator.free(call.arguments);
+                call.arguments = effective;
+            }
+            try self.acceptHookResult(&dispatch.result);
+            if (self.hook_purpose == .permission and dispatch.result.permission == .allow) call.begin(tool.monotonicMilliseconds(self.io));
+        }
+        try self.persistToolCall(message_index, index);
+        try self.autoApprove();
+        return true;
+    }
     return self.pollOwnerHooks(dispatch);
+}
+
+fn startPolicyHook(self: *Loop, purpose: HookPurpose, index: usize) !void {
+    const message_index = self.pendingIndex() orelse return;
+    const call = self.conversation.messages.items[message_index].tool_calls[index];
+    self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, self.hooks.?.*, .{
+        .event = if (purpose == .tool_policy) .pre_tool_use else .permission_request,
+        .tool_name = call.name,
+        .tool_input = call.arguments,
+        .tool_call_id = call.id,
+        .model = self.provider.model,
+        .permission_mode = @tagName(self.approvals),
+    });
+    self.hook_purpose = purpose;
+    self.hook_call_index = index;
+    self.state = .running_hooks;
+}
+
+fn acceptHookResult(self: *Loop, result: *const Hooks.Result) !void {
+    if (result.message) |message| {
+        if (self.hook_notice) |old| self.allocator.free(old);
+        self.hook_notice = try self.allocator.dupe(u8, message);
+    }
+    if (result.context) |context| {
+        const combined = if (self.hook_context) |old|
+            try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ old, context })
+        else
+            try self.allocator.dupe(u8, context);
+        if (self.hook_context) |old| self.allocator.free(old);
+        self.hook_context = combined;
+    }
 }
 
 fn startOwnerHook(self: *Loop, purpose: HookPurpose, index: usize, response: []const u8) !void {
@@ -962,6 +1040,12 @@ fn pollOwnerHooks(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
     const index = self.hook_call_index;
     const call = &self.conversation.messages.items[message_index].tool_calls[index];
     if (self.hook_purpose == .owner_post) {
+        try self.acceptHookResult(&dispatch.result);
+        if (dispatch.takeBlocked()) |feedback| {
+            defer self.allocator.free(feedback);
+            try self.applyPostFeedback(message_index, index, feedback);
+        }
+        if (dispatch.failed) |err| self.say("PostToolUse hook failed: {s}", .{@errorName(err)});
         self.state = .idle;
         try self.runApproved();
         return true;
@@ -1101,6 +1185,19 @@ fn ask(self: *Loop) !void {
         }
     }
     try self.applySteering();
+    if (self.hooks) |runner| {
+        if (runner.runtime) |runtime| {
+            var background = try runtime.drain(self.allocator);
+            defer background.deinit(self.allocator);
+            try self.acceptHookResult(&background);
+        }
+    }
+    if (self.hook_context) |context| {
+        defer self.allocator.free(context);
+        self.hook_context = null;
+        try self.conversation.add(.user, context);
+        try self.persistMessage(self.conversation.messages.items.len - 1);
+    }
     if (self.overBudget()) |reason| return self.stop(reason);
     if (self.shouldCompact()) return self.startCompaction(true);
     if (!try self.contextFits(self.turn(""))) {
@@ -1520,6 +1617,31 @@ fn autoApprove(self: *Loop) !void {
         if (!self.agent.allows(call.name)) {
             try self.refuse(message_index, i);
             continue;
+        }
+        if (self.registry.get(call.name) == null) {
+            try self.refuse(message_index, i);
+            continue;
+        }
+        if (self.hooks) |runner| {
+            if (self.hook_pre_seq != self.pending_seq) {
+                self.hook_pre_seq = self.pending_seq;
+                self.hook_pre_index = 0;
+                self.hook_permission_index = 0;
+            }
+            if (i >= self.hook_pre_index) {
+                self.hook_pre_index = i + 1;
+                if (runner.set.forEvent(.pre_tool_use).len > 0) {
+                    try self.startPolicyHook(.tool_policy, i);
+                    return;
+                }
+            }
+            if (!self.needsNoDecision(call) and i >= self.hook_permission_index) {
+                self.hook_permission_index = i + 1;
+                if (runner.set.forEvent(.permission_request).len > 0) {
+                    try self.startPolicyHook(.permission, i);
+                    return;
+                }
+            }
         }
         if (self.needsNoDecision(call)) call.begin(tool.monotonicMilliseconds(self.io));
     }
@@ -2464,10 +2586,6 @@ fn runApproved(self: *Loop) !void {
             const is_ask = std.mem.eql(u8, call.name, ask_user.name);
             if (!is_todo and !is_ask) continue;
             if (is_ask and self.approved_ask_index == i) continue;
-            if (runner.set.forEvent(.pre_tool_use).len > 0) {
-                try self.startOwnerHook(.owner_pre, i, "");
-                return;
-            }
             if (is_todo) {
                 try self.applyTodo(message_index, i);
                 if (runner.set.forEvent(.post_tool_use).len > 0) {
@@ -2494,6 +2612,7 @@ fn runApproved(self: *Loop) !void {
         if (call.status != .running) continue;
         if (std.mem.eql(u8, call.name, todo_tool.name)) continue;
         try batch.append(self.allocator, .{
+            .prechecked = true,
             .seq = self.conversation.messages.items[message_index].seq,
             .index = i,
             .name = call.name,
@@ -2598,7 +2717,25 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
         call.result = try redact.scrub(self.allocator, result.content);
         call.result_bytes = result.content.len;
         try self.persistToolCall(message_index, result.index);
+        try self.acceptHookResult(&result.hook_result);
+        if (result.hook_error) |err| self.say("PostToolUse hook failed: {s}", .{@errorName(err)});
+        if (result.hook_result.blocked) |feedback| try self.applyPostFeedback(message_index, result.index, feedback);
     }
+}
+
+fn applyPostFeedback(self: *Loop, message_index: usize, index: usize, feedback: []const u8) !void {
+    const msg = &self.conversation.messages.items[message_index];
+    const call = &msg.tool_calls[index];
+    if (self.db) |db| {
+        if (self.message_ids.get(msg.seq)) |message_id| {
+            if (call.result) |original| try db.appendBlob(message_id, @intCast(index), "hook_original_tool_result", original);
+        }
+    }
+    const replacement = try std.fmt.allocPrint(self.allocator, "Tool {s} executed. Hook feedback: {s}", .{ call.name, feedback });
+    if (call.result) |old| self.allocator.free(old);
+    call.result = replacement;
+    call.result_bytes = replacement.len;
+    try self.persistToolCall(message_index, index);
 }
 
 fn pollTools(self: *Loop) !bool {
@@ -5096,4 +5233,53 @@ test "a call that runs comes out of the turn with a duration on it" {
     }
     try testing.expect(stored.len > 0);
     try testing.expect(stored[0].elapsed_ms != null);
+}
+
+test "a hook rewrite is approved using effective arguments and runs once" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"pwd\"}";
+    const hook: Hooks.Hook = .{ .legacy = false, .matcher = "bash", .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"rm -rf dangerous\"}}}'" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectEqualStrings("{\"command\":\"rm -rf dangerous\"}", loop.pendingCall().?.arguments);
+    try loop.decide(.deny);
+    try settle(&loop);
+}
+
+test "pre-tool policy denies before an approval can be shown" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch should-not-exist\"}";
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "exit 2" }} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, fixture.convo.messages.items[1].tool_calls[0].status);
+}
+
+test "permission hooks grant one invocation without creating an allowance" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"printf permitted\"}";
+    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_request = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, fixture.convo.messages.items[1].tool_calls[0].status);
 }
