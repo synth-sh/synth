@@ -228,6 +228,7 @@ pub const Runner = struct {
         );
         child.loop.project = parent.project;
         child.loop.skills = parent.skills;
+        child.loop.hooks = parent.hooks;
         child.loop.system_prompt = parent.system_prompt;
         child.loop.commit_trailer = parent.commit_trailer;
         child.loop.delegate = null;
@@ -420,6 +421,9 @@ fn report(child: *Loop, allocator: std.mem.Allocator, outcome: Outcome) ![]const
         .halted => haltNote(&buffer, halt.reason),
     };
 
+    if (child.hook_notice) |notice| {
+        return std.fmt.allocPrint(allocator, "{s}{s}\n\n<note>Subagent hook: {s}</note>", .{ answer, note, notice });
+    }
     if (answer.len == 0 and note.len == 0) return allocator.dupe(u8, "");
     if (answer.len == 0) {
         return std.fmt.allocPrint(allocator, "The subagent produced no answer.{s}", .{note});

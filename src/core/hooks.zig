@@ -174,8 +174,26 @@ pub const Runner = struct {
         input_future.await(self.io);
         try readers.checkAnyError();
 
-        const term = try child.wait(self.io);
+        const pid = child.id.?;
+        var waiter: ChildWait = .{ .io = self.io, .child = &child };
+        var wait_future = try self.io.concurrent(ChildWait.run, .{&waiter});
+        while (!waiter.done.load(.acquire)) {
+            const expired = deadline - std.Io.Clock.now(.awake, self.io).toMilliseconds() <= 0;
+            if (self.givenUp() or expired) {
+                if (posix_signals) {
+                    std.posix.kill(-pid, .TERM) catch {};
+                    std.posix.kill(-pid, .KILL) catch {};
+                }
+                wait_future.await(self.io);
+                reaped = true;
+                if (expired) return error.Timeout;
+                return error.Cancelled;
+            }
+            std.Io.sleep(self.io, .fromMilliseconds(poll_slice_ms), .awake) catch {};
+        }
+        wait_future.await(self.io);
         reaped = true;
+        const term = try waiter.term;
         const stderr = try stderr_writer.toOwnedSlice();
         errdefer allocator.free(stderr);
         const code: u8 = switch (term) {
@@ -183,6 +201,18 @@ pub const Runner = struct {
             else => 1,
         };
         return .{ .code = code, .stderr = stderr };
+    }
+};
+
+const ChildWait = struct {
+    io: std.Io,
+    child: *std.process.Child,
+    term: std.process.Child.WaitError!std.process.Child.Term = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ChildWait) void {
+        self.term = self.child.wait(self.io);
+        self.done.store(true, .release);
     }
 };
 
@@ -339,6 +369,20 @@ test "a matching pre-tool hook can block" {
     });
     defer if (reason) |text| testing.allocator.free(text);
     try testing.expectEqualStrings("blocked by policy", reason.?);
+}
+
+test "a hook with closed pipes still times out" {
+    const testing = std.testing;
+    if (!posix_signals) return error.SkipZigTest;
+    const runner: Runner = .{
+        .io = testing.io,
+        .root = ".",
+        .set = .{ .user_prompt_submit = &.{.{ .command = "exec 0<&- 2>&-; sleep 2" }} },
+        .timeout_ms = 50,
+    };
+    const started: std.Io.Timestamp = .now(testing.io, .awake);
+    try testing.expectError(error.Timeout, runner.dispatch(testing.allocator, .{ .event = .user_prompt_submit }));
+    try testing.expect(started.durationTo(.now(testing.io, .awake)).nanoseconds < std.time.ns_per_s);
 }
 
 test "raising the stop flag ends a hook that would otherwise run on" {

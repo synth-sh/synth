@@ -24,7 +24,18 @@ deny() {
   exit 2
 }
 
-case "$path" in
+command -v python3 >/dev/null || deny "path normalization requires python3"
+root=$(pwd -P)
+normalized=$(python3 - "$root" "$path" <<'PY'
+import os
+import sys
+root, path = sys.argv[1:]
+resolved = os.path.realpath(os.path.join(root, path))
+print(os.path.relpath(resolved, root) if os.path.commonpath((root, resolved)) == root else resolved)
+PY
+) || deny "path normalization failed"
+
+case "$normalized" in
   .env|.env.*|*/.env|*/.env.*)
     deny "it holds credentials" ;;
   *.lock|*.lockb|package-lock.json|build.zig.zon.lock)

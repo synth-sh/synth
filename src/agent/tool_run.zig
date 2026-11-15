@@ -306,7 +306,9 @@ fn runOne(self: *ToolRun, index: usize) void {
         .call_index = call.index,
     };
 
-    if (self.hooks) |runner| {
+    if (self.hooks) |configured_runner| {
+        var runner = configured_runner.*;
+        runner.stop = &self.stop;
         const blocked = runner.dispatch(self.allocator, .{
             .event = .pre_tool_use,
             .tool_name = call.name,
@@ -324,6 +326,11 @@ fn runOne(self: *ToolRun, index: usize) void {
             result.* = .{ .index = call.index, .content = reason, .is_error = true };
             return;
         }
+    }
+
+    if (self.stop.load(.acquire)) {
+        result.* = .{ .index = call.index, .content = self.allocator.dupe(u8, "cancelled") catch "", .is_error = true };
+        return;
     }
 
     const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| {
@@ -460,6 +467,29 @@ fn drain(
     const run_state = try ToolRun.start(allocator, io, registry, ".", reads, null, .{}, null, calls);
     run_state.join();
     return run_state;
+}
+
+test "cancellation during a pre-tool hook prevents tool execution" {
+    const allocator = testing.allocator;
+    var probe: Probe = .{};
+    var registry = try probeRegistry(allocator, &probe);
+    defer registry.deinit();
+    var reads: tool.ReadLog = .init(allocator);
+    defer reads.deinit();
+    const runner: Hooks.Runner = .{
+        .io = testing.io,
+        .root = ".",
+        .set = .{ .pre_tool_use = &.{.{ .command = "read payload; sleep 5" }} },
+    };
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, .{}, &runner, &.{
+        .{ .index = 0, .name = "alone", .arguments = "{}" },
+    });
+    defer run_state.destroy();
+    std.Io.sleep(testing.io, .fromMilliseconds(150), .awake) catch {};
+    run_state.requestStop();
+    run_state.join();
+    try testing.expectEqual(@as(usize, 0), probe.arrived.load(.acquire));
+    try testing.expect(run_state.results[0].is_error);
 }
 
 test "calls that may run together do" {
