@@ -160,6 +160,7 @@ pub const Host = struct {
     client: mcp.Implementation = .{ .name = "", .version = "" },
 
     pub const Connection = struct {
+        call_mutex: std.Io.Mutex = .init,
         name: []const u8,
         client: *mcp.Client,
         /// How many tools this server contributed.
@@ -364,6 +365,23 @@ pub const Host = struct {
             if (std.mem.eql(u8, connection.name, name)) return connection;
         }
         return null;
+    }
+
+    pub fn callConnected(self: *Host, ctx: tool.Context, server: []const u8, remote: []const u8, arguments: []const u8) !tool.Output {
+        if (self.connecting()) return error.HookMcpServerUnavailable;
+        const connection = self.find(server) orelse return error.HookMcpServerUnavailable;
+        if (!connection.installed) return error.HookMcpToolUnavailable;
+        var offered = false;
+        for (connection.offered) |definition| {
+            if (std.mem.eql(u8, definition.name, remote)) offered = true;
+        }
+        if (!offered) return error.HookMcpToolUnavailable;
+        var binding: Binding = .{ .connection = connection, .remote = remote };
+        var scoped = ctx;
+        scoped.userdata = &binding;
+        const parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, arguments, .{});
+        defer parsed.deinit();
+        return call(scoped, .{ .arguments = parsed.value });
     }
 
     /// Close a server and take its tools back out of the registry. False when
@@ -716,6 +734,12 @@ fn call(ctx: tool.Context, input: tool.Input) !tool.Output {
         try ctx.allocator.dupe(u8, "this tool is not connected to a server"),
     );
     const binding: *Host.Binding = @ptrCast(@alignCast(raw));
+    while (!binding.connection.call_mutex.tryLock()) {
+        if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) "cancelled before MCP call" else "timed out before MCP call"));
+        try std.Io.sleep(ctx.io, .fromMilliseconds(5), .awake);
+    }
+    defer binding.connection.call_mutex.unlock(ctx.io);
+    if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) "cancelled before MCP call" else "timed out before MCP call"));
 
     var arena_state: std.heap.ArenaAllocator = .init(ctx.allocator);
     defer arena_state.deinit();
@@ -1375,4 +1399,59 @@ test "a later attempt replaces what was said about an earlier one" {
 
     try testing.expectEqual(@as(usize, 2), host.failures.items.len);
     try testing.expectEqualStrings("could not be reached", host.failures.items[0].reason);
+}
+
+test "hook MCP execution reuses a connected server without recursive scheduling" {
+    const Hooks = @import("../core/hooks.zig");
+    const a = testing.allocator;
+    const argv = comptime scriptedServer(&.{
+        &.{"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"]}}"},
+        &.{"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"gate\",\"description\":\"Policy\",\"inputSchema\":{\"type\":\"object\"}}]}}"},
+        &.{"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"elicitation/create\",\"params\":{\"message\":\"Confirm\",\"requestedSchema\":{\"type\":\"object\"}}}"},
+        &.{"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"decision\\\":\\\"block\\\",\\\"reason\\\":\\\"remote policy\\\"}\"}]}}"},
+        &.{"{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"invalid-json\"}]}}"},
+    });
+    var registry = try Registry.init(a);
+    defer registry.deinit();
+    var host: Host = .init(a, testing.io);
+    defer host.deinit();
+    try host.connectAll(&registry, &.{.{ .name = "policy", .transport = .{ .stdio = .{ .command = argv[0], .args = argv[1..] } } }}, .{ .name = "synth", .version = "test" });
+    try testing.expect(host.any());
+    var reads: tool.ReadLog = .init(a);
+    defer reads.deinit();
+    const Executor = struct {
+        host: *Host,
+        reads: *tool.ReadLog,
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, hook: Hooks.Hook, arguments: []const u8, timeout: u64, stop: ?*const std.atomic.Value(bool)) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = try self.host.callConnected(.{
+                .allocator = allocator,
+                .io = testing.io,
+                .project_root = ".",
+                .reads = self.reads,
+                .cancelled = stop,
+                .deadline_ms = tool.monotonicMilliseconds(testing.io) + @as(i64, @intCast(timeout)),
+            }, hook.server, hook.tool, arguments);
+            if (result.is_error) {
+                allocator.free(result.content);
+                return error.HookMcpCallFailed;
+            }
+            return result.content;
+        }
+    };
+    var executor: Executor = .{ .host = &host, .reads = &reads };
+    var runtime: Hooks.Runtime = .{ .allocator = a, .io = testing.io };
+    defer runtime.deinit();
+    const hook: Hooks.Hook = .{ .legacy = false, .type = .mcp_tool, .arguments = .{ .object = .empty }, .server = "policy", .tool = "gate", .source = "test server", .timeout_ms = 50 };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = ".", .runtime = &runtime, .mcp_executor = .{ .userdata = &executor, .call = Executor.execute }, .set = .{ .pre_tool_use = &.{hook} } };
+    var result = try runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash" });
+    defer result.deinit(a);
+    try testing.expect(std.mem.indexOf(u8, result.blocked.?, "remote policy") != null);
+    try testing.expect(std.mem.indexOf(u8, result.blocked.?, "external MCP tool") != null);
+    try testing.expectEqual(@as(usize, 2), runtime.records_len);
+    try testing.expectError(error.HookMcpServerUnavailable, host.callConnected(.{ .allocator = a, .io = testing.io, .project_root = ".", .reads = &reads }, "missing", "gate", "{}"));
+    try testing.expectError(error.SyntaxError, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash" }));
+    const started = tool.monotonicMilliseconds(testing.io);
+    try testing.expectError(error.HookMcpCallFailed, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash" }));
+    try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 1000);
 }

@@ -2054,3 +2054,55 @@ test "a session another process hosts is attached to on its socket, opening or s
 pub fn hooks(self: *Mirror, action: @import("../core/hook_store.zig").Action, id: []const u8) !void {
     try self.send(synth.method.hooks, synth.Hooks{ .sessionId = self.status.handle, .action = action, .id = id }, .hooks);
 }
+
+test "hook review and trust flow through the same ACP interface as the TUI" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    fixture.config.hook_state_path = try std.fs.path.join(fixture.arena.allocator(), &.{ fixture.project, "..", "hook-trust.json" });
+    fixture.config.hooks.pre_tool_use = &.{.{ .matcher = "bash", .command = "echo policy denied >&2; exit 2", .source = "inline fixture" }};
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+    try mirror.hooks(.review, "");
+    const review = try pollForAnswer(mirror);
+    defer review.deinit(testing.allocator);
+    try testing.expect(review == .hooks);
+    try testing.expect(std.mem.indexOf(u8, review.hooks, "NEEDS REVIEW") != null);
+    const id = review.hooks[0..64];
+    try mirror.hooks(.trust, id);
+    const trusted = try pollForAnswer(mirror);
+    defer trusted.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, trusted.hooks, "trusted") != null);
+    try testing.expect(std.mem.indexOf(u8, trusted.hooks, "NEEDS REVIEW") == null);
+    try mirror.submit("run: touch must-not-run", .{});
+    try pollUntil(mirror, finishedAndAnswered);
+    var rejected = false;
+    for (convo.messages.items) |message| {
+        for (message.tool_calls) |call| {
+            if (std.mem.eql(u8, call.name, "bash")) {
+                rejected = true;
+                try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
+                try testing.expect(std.mem.indexOf(u8, call.result.?, "policy denied") != null);
+            }
+        }
+    }
+    try testing.expect(rejected);
+    try mirror.hooks(.disable, id);
+    const disabled = try pollForAnswer(mirror);
+    defer disabled.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, disabled.hooks, "disabled") != null);
+    try testing.expect(std.mem.indexOf(u8, disabled.hooks, "trusted") != null);
+    try mirror.hooks(.enable, id);
+    const enabled = try pollForAnswer(mirror);
+    defer enabled.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, enabled.hooks, "NEEDS REVIEW") == null);
+    try mirror.hooks(.revoke, id);
+    const revoked = try pollForAnswer(mirror);
+    defer revoked.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, revoked.hooks, "NEEDS REVIEW") != null);
+    const messages_before = convo.messages.items.len;
+    try mirror.submit("blocked before persistence", .{});
+    try pollUntil(mirror, finishedAndAnswered);
+    try testing.expectEqual(messages_before, convo.messages.items.len);
+}

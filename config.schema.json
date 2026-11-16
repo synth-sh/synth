@@ -130,7 +130,7 @@
                                 "$ref": "#/$defs/hook"
                             },
                             {
-                                "$ref": "#/$defs/hookGroup"
+                                "$ref": "#/$defs/sessionEndHookGroup"
                             }
                         ]
                     }
@@ -431,69 +431,12 @@
             }
         },
         "hookHandler": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "type": {
-                    "enum": [
-                        "command",
-                        "mcp_tool"
-                    ],
-                    "default": "command"
-                },
-                "command": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 86400000
-                },
-                "async": {
-                    "type": "boolean",
-                    "default": false
-                },
-                "transcript": {
-                    "type": "boolean",
-                    "default": false
-                },
-                "server": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "tool": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "arguments": {}
-            },
             "oneOf": [
                 {
-                    "required": [
-                        "command"
-                    ],
-                    "properties": {
-                        "type": {
-                            "const": "command"
-                        }
-                    }
+                    "$ref": "#/$defs/commandHookHandler"
                 },
                 {
-                    "required": [
-                        "type",
-                        "server",
-                        "tool",
-                        "arguments"
-                    ],
-                    "properties": {
-                        "type": {
-                            "const": "mcp_tool"
-                        },
-                        "async": {
-                            "const": false
-                        }
-                    }
+                    "$ref": "#/$defs/mcpHookHandler"
                 }
             ]
         },
@@ -513,6 +456,107 @@
                     "type": "array",
                     "items": {
                         "$ref": "#/$defs/hookHandler"
+                    }
+                }
+            }
+        },
+        "commandHookHandler": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "command"
+            ],
+            "properties": {
+                "type": {
+                    "const": "command"
+                },
+                "command": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 86400000
+                },
+                "async": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "transcript": {
+                    "type": "boolean",
+                    "default": false
+                }
+            }
+        },
+        "mcpHookHandler": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "type",
+                "server",
+                "tool",
+                "arguments"
+            ],
+            "properties": {
+                "type": {
+                    "const": "mcp_tool"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 86400000
+                },
+                "async": {
+                    "const": false
+                },
+                "transcript": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "tool": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "arguments": {
+                    "type": [
+                        "object",
+                        "string"
+                    ]
+                }
+            }
+        },
+        "sessionEndHookGroup": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "hooks"
+            ],
+            "properties": {
+                "matcher": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Regex or * for tool events; ignored for other events."
+                },
+                "hooks": {
+                    "type": "array",
+                    "items": {
+                        "allOf": [
+                            {
+                                "$ref": "#/$defs/commandHookHandler"
+                            },
+                            {
+                                "properties": {
+                                    "async": {
+                                        "const": false
+                                    }
+                                }
+                            }
+                        ]
                     }
                 }
             }

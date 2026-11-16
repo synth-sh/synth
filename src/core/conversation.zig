@@ -33,7 +33,6 @@ pub const ToolCall = struct {
     /// Provider-assigned id, or "" when the provider does not supply one.
     id: []const u8,
     name: []const u8,
-    /// Raw JSON object of arguments, as the model produced it.
     arguments: []const u8,
     status: Status = .pending,
     /// Tool output once it has run, or the failure message. May be truncated to

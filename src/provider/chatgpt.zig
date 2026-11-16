@@ -450,6 +450,7 @@ fn respond(
         var hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
         defer hook_attempt.finish();
         errdefer |err| hook_attempt.error_message = @errorName(err);
+        if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
         var arena_state: std.heap.ArenaAllocator = .init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -489,6 +490,8 @@ fn respond(
             const why = reader.allocRemaining(arena, .limited(max_body_bytes)) catch "";
             self.captureRejection(response.head.status, why);
             const refusal = Refusal.parse(arena, why);
+            hook_attempt.error_message = @errorName(refusal.toError(response.head.status));
+            hook_attempt.finish();
 
             if (response.head.status == .unauthorized and !refreshed) {
                 try store.forceRefresh();
@@ -510,6 +513,8 @@ fn respond(
                 self.rememberFailure(failure);
                 return @as(anyerror!Provider.Reply, failure.toError());
             }
+            hook_attempt.error_message = @errorName(err);
+            hook_attempt.finish();
             const nothing_shown = !stream.delivered_anything;
             if (nothing_shown and self.waitAndRetry(.service_unavailable, attempt, null, sink)) {
                 attempt += 1;

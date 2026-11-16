@@ -1,0 +1,203 @@
+[
+  {
+    "event": "SessionStart",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "source"
+    ]
+  },
+  {
+    "event": "SessionEnd",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "reason"
+    ]
+  },
+  {
+    "event": "UserPromptSubmit",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "prompt"
+    ]
+  },
+  {
+    "event": "PreToolUse",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "tool_name",
+      "tool_input",
+      "tool_call_id",
+      "tool_use_id"
+    ]
+  },
+  {
+    "event": "PermissionRequest",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "tool_name",
+      "tool_input"
+    ]
+  },
+  {
+    "event": "PostToolUse",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "tool_name",
+      "tool_input",
+      "tool_response",
+      "tool_use_id"
+    ]
+  },
+  {
+    "event": "PreCompact",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "trigger"
+    ]
+  },
+  {
+    "event": "PostCompact",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "trigger"
+    ]
+  },
+  {
+    "event": "SubagentStart",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "agent_id",
+      "agent_type",
+      "parent_session_id"
+    ]
+  },
+  {
+    "event": "SubagentStop",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "agent_id",
+      "agent_type",
+      "agent_transcript_path",
+      "last_assistant_message",
+      "stop_hook_active"
+    ]
+  },
+  {
+    "event": "Stop",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "last_assistant_message",
+      "stop_hook_active"
+    ]
+  },
+  {
+    "event": "Interrupt",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path"
+    ]
+  },
+  {
+    "event": "PreModelRequest",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "request_id",
+      "attempt"
+    ]
+  },
+  {
+    "event": "PostModelRequest",
+    "required": [
+      "hook_event_name",
+      "cwd",
+      "session_id",
+      "turn_id",
+      "model",
+      "permission_mode",
+      "transcript_path",
+      "request_id",
+      "attempt",
+      "status",
+      "error_message",
+      "input_tokens",
+      "output_tokens"
+    ]
+  }
+]

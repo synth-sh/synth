@@ -78,6 +78,7 @@ pub const Attempt = struct {
     turn: Turn,
     sink: ?Sink,
     status: []const u8 = "failed",
+    finished: bool = false,
     error_message: []const u8 = "",
     usage: Usage = .{},
 
@@ -92,6 +93,8 @@ pub const Attempt = struct {
         self.usage = usage;
     }
     pub fn finish(self: *Attempt) void {
+        if (self.finished) return;
+        self.finished = true;
         if (self.sink) |sink| {
             if (sink.stopped(sink.userdata)) self.status = "cancelled";
         }
@@ -101,6 +104,15 @@ pub const Attempt = struct {
         const configured = self.turn.hooks orelse return;
         var runner = configured.*;
         runner.stop = null;
+        const cleaning_up = event == .post_model_request and std.mem.eql(u8, self.status, "cancelled");
+        const protection = if (cleaning_up) runner.io.swapCancelProtection(.blocked) else null;
+        defer if (protection) |previous| {
+            _ = runner.io.swapCancelProtection(previous);
+        };
+        if (cleaning_up) {
+            runner.timeout_ms = @min(runner.timeout_ms, 1000);
+            runner.deadline_ms = std.Io.Clock.now(.awake, runner.io).toMilliseconds() + 3000;
+        }
         var invocation = self.turn.hook_input;
         invocation.event = event;
         invocation.status = if (event == .post_model_request) self.status else "";

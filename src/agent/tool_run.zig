@@ -83,7 +83,6 @@ const Reporter = struct {
 
 pub const Call = struct {
     hook_input: Hooks.Invocation = .{ .event = .post_tool_use },
-    prechecked: bool = false,
     /// The message that asked for it, by seq.
     seq: u64 = 0,
     index: usize,
@@ -128,7 +127,6 @@ pub fn start(
             .name = try allocator.dupe(u8, src.name),
             .arguments = try allocator.dupe(u8, src.arguments),
             .allow_outside = src.allow_outside,
-            .prechecked = src.prechecked,
         };
         built += 1;
     }
@@ -319,34 +317,6 @@ fn runOne(self: *ToolRun, index: usize) void {
         .call_index = call.index,
     };
 
-    if (self.hooks) |configured_runner| {
-        if (!call.prechecked) {
-            var runner = configured_runner.*;
-            runner.stop = &self.stop;
-            const blocked = runner.dispatch(self.allocator, .{
-                .event = .pre_tool_use,
-                .tool_name = call.name,
-                .tool_input = call.arguments,
-            }) catch |err| {
-                result.* = .{
-                    .index = call.index,
-                    .content = std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)}) catch
-                        self.allocator.dupe(u8, "pre-tool hook failed") catch "",
-                    .is_error = true,
-                };
-                return;
-            };
-            if (blocked) |reason| {
-                result.* = .{ .index = call.index, .content = reason, .is_error = true };
-                return;
-            }
-        }
-    }
-    if (self.stop.load(.acquire)) {
-        result.* = .{ .index = call.index, .content = self.allocator.dupe(u8, "cancelled") catch "", .is_error = true };
-        return;
-    }
-
     const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| tool.Output.err(
         std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ call.name, @errorName(err) }) catch self.allocator.dupe(u8, "tool failed") catch "",
     );
@@ -477,29 +447,6 @@ fn drain(
     const run_state = try ToolRun.start(allocator, io, registry, ".", reads, null, .{}, null, calls);
     run_state.join();
     return run_state;
-}
-
-test "cancellation during a pre-tool hook prevents tool execution" {
-    const allocator = testing.allocator;
-    var probe: Probe = .{};
-    var registry = try probeRegistry(allocator, &probe);
-    defer registry.deinit();
-    var reads: tool.ReadLog = .init(allocator);
-    defer reads.deinit();
-    const runner: Hooks.Runner = .{
-        .io = testing.io,
-        .root = ".",
-        .set = .{ .pre_tool_use = &.{.{ .command = "read payload; sleep 5" }} },
-    };
-    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, .{}, &runner, &.{
-        .{ .index = 0, .name = "alone", .arguments = "{}" },
-    });
-    defer run_state.destroy();
-    std.Io.sleep(testing.io, .fromMilliseconds(150), .awake) catch {};
-    run_state.requestStop();
-    run_state.join();
-    try testing.expectEqual(@as(usize, 0), probe.arrived.load(.acquire));
-    try testing.expect(run_state.results[0].is_error);
 }
 
 test "calls that may run together do" {

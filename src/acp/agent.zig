@@ -2330,6 +2330,7 @@ const Session = struct {
     }
 
     fn toggleMcp(self: *Session, name: []const u8) !void {
+        if (self.stack.loop.isBusy()) return error.Busy;
         const mcp_host = &self.stack.mcp_host;
         const server = for (mcp_host.servers) |server| {
             if (std.mem.eql(u8, server.name, name)) break server;
@@ -2350,6 +2351,7 @@ const Session = struct {
     /// Once servers turned on have been reached: offer their tools, and say
     /// which would not come up.
     fn settleMcp(self: *Session) void {
+        if (self.stack.loop.tools != null) return;
         const mcp_host = &self.stack.mcp_host;
         if (!mcp_host.settled()) return;
         const added = mcp_host.install(&self.stack.registry) catch 0;

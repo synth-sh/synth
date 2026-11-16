@@ -170,19 +170,15 @@ pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore
 
 fn callHookMcp(raw: *anyopaque, allocator: std.mem.Allocator, hook: Hooks.Hook, arguments: []const u8, timeout_ms: u64, stop: ?*const std.atomic.Value(bool)) ![]const u8 {
     const self: *Stack = @ptrCast(@alignCast(raw));
-    const name = try mcp_tools.localName(allocator, hook.server, hook.tool);
-    defer allocator.free(name);
-    const definition = self.registry.get(name) orelse return error.HookMcpToolUnavailable;
-    if (!std.mem.startsWith(u8, definition.name, mcp_tools.prefix)) return error.HookMcpToolUnavailable;
-    const deadline = @import("../tools/tool.zig").monotonicMilliseconds(self.hooks.io) + @as(i64, @intCast(@min(timeout_ms, definition.timeout_ms orelse tool.default_timeout_ms)));
-    const result = try self.registry.executeJson(.{
+    const deadline = tool.monotonicMilliseconds(self.hooks.io) + @as(i64, @intCast(@min(timeout_ms, tool.default_timeout_ms)));
+    const result = try self.mcp_host.callConnected(.{
         .allocator = allocator,
         .io = self.hooks.io,
         .project_root = self.project.root,
         .reads = &self.reads,
         .cancelled = stop,
         .deadline_ms = deadline,
-    }, name, arguments);
+    }, hook.server, hook.tool, arguments);
     if (result.is_error) {
         allocator.free(result.content);
         return error.HookMcpCallFailed;
@@ -211,7 +207,7 @@ fn named(servers: []const mcp_tools.Server, name: []const u8) bool {
 
 pub fn destroy(self: *Stack) void {
     // Ordered: the loop joins workers writing to the runner; MCP tools point into the host.
-    const end_input = (self.loop.exportHookInput(.{ .event = .session_end }) catch self.loop.hookInput(.{ .event = .session_end })).dupe(self.arena.allocator()) catch self.loop.hookInput(.{ .event = .session_end });
+    const end_input = (self.loop.exportHookInput(.{ .event = .session_end }) catch self.loop.hookInput(.{ .event = .session_end })).dupe(self.arena.allocator()) catch Hooks.Invocation{ .event = .session_end };
     self.loop.deinit();
     self.runner.deinit();
     self.hook_runtime.cancelBackground();
@@ -257,4 +253,30 @@ test "a stack assembles a loop ready for its first turn" {
     try testing.expectEqualStrings(agents.default_id, stack.loop.agent.id);
     try testing.expect(stack.registry.get("read") != null);
     try testing.expect(stack.loop.delegate != null);
+}
+
+test "main-session shutdown emits one bounded command cleanup" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, ".git");
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = buffer[0..try tmp.dir.realPath(testing.io, &buffer)];
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.arena.deinit();
+    var backend: Backend = .init(.ollama, .{ .allocator = testing.allocator, .io = testing.io, .host = "http://127.0.0.1:9", .label = "test" });
+    defer backend.deinit();
+    const stack = try create(testing.allocator, testing.io, .{ .config = &config, .provider = backend.provider(), .cwd = cwd });
+    stack.hooks.set.session_end = &.{.{ .command = "cat >> shutdown-events; exec 0<&- 1>&- 2>&-; sleep 30", .timeout_ms = 50 }};
+    const started = tool.monotonicMilliseconds(testing.io);
+    stack.destroy();
+    try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 1000);
+    const trace = try tmp.dir.readFileAlloc(testing.io, "shutdown-events", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(trace);
+    var lines = std.mem.tokenizeScalar(u8, trace, '\n');
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("SessionEnd", parsed.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("shutdown", parsed.value.object.get("reason").?.string);
+    try testing.expect(lines.next() == null);
 }

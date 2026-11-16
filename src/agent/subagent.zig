@@ -846,3 +846,38 @@ test "child tools inherit pre-tool denial and return its reason to the parent" {
     try testing.expect(std.mem.indexOf(u8, answer, "child read denied") != null);
     try testing.expect(std.mem.indexOf(u8, answer, "Subagent hook") != null);
 }
+
+test "subagent lifecycle context and continuation retain child identity" {
+    const Hooks = @import("../core/hooks.zig");
+    const harness = try Harness.init();
+    defer harness.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
+    harness.parent.project_root = root;
+    const start_hook: Hooks.Hook = .{ .legacy = false, .command = "read -r payload; printf '%s\\n' \"$payload\" >> child-events; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\",\"additionalContext\":\"child context\"}}'" };
+    const stop_hook: Hooks.Hook = .{ .legacy = false, .command = "read -r payload; printf '%s\\n' \"$payload\" >> child-events; if [ ! -e continued ]; then : > continued; printf '%s' '{\"decision\":\"block\",\"reason\":\"check once more\"}'; fi" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .subagent_start = &.{start_hook}, .subagent_stop = &.{stop_hook} } };
+    harness.parent.hooks = &runner;
+    harness.fake.script = &.{.{ .text = "done" }};
+    const answer = try runTask(harness, .{ .agent = "task", .prompt = "check" });
+    defer testing.allocator.free(answer);
+    try testing.expectEqualStrings("done", answer);
+    try testing.expectEqual(@as(usize, 2), harness.fake.at);
+    const trace = try tmp.dir.readFileAlloc(testing.io, "child-events", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(trace);
+    var lines = std.mem.tokenizeScalar(u8, trace, '\n');
+    var identity: [32]u8 = undefined;
+    for ([_][]const u8{ "SubagentStart", "SubagentStop", "SubagentStop" }, 0..) |event, index| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
+        defer parsed.deinit();
+        const fields = parsed.value.object;
+        try testing.expectEqualStrings(event, fields.get("hook_event_name").?.string);
+        const agent_id = fields.get("agent_id").?.string;
+        if (index == 0) @memcpy(&identity, agent_id) else try testing.expectEqualStrings(&identity, agent_id);
+        try testing.expectEqual(index == 2, fields.get("stop_hook_active").?.bool);
+        try testing.expectEqualStrings(&harness.parent.hook_identity, fields.get("session_id").?.string);
+    }
+    try testing.expect(lines.next() == null);
+}

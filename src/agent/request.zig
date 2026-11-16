@@ -151,6 +151,10 @@ fn run(self: *Request) void {
         if (self.failed) |err| value.error_message = @errorName(err);
         value.finish();
     };
+    if (self.stop.load(.acquire)) {
+        self.failed = error.Canceled;
+        return;
+    }
     self.reply = self.provider.respond(
         self.provider.userdata,
         self.conversation,

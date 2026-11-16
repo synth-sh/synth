@@ -721,6 +721,7 @@ fn respond(
     var stream = while (true) {
         if (hook_attempt) |*attempt| attempt.finish();
         hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
+        if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
         messages = try self.buildMessages(convo, arena, system, turn.instruction, budget);
         const request: Ollama.ChatRequest = .{
             .model = self.model,
@@ -734,6 +735,8 @@ fn respond(
         break self.client.chat(request) catch |err| {
             self.captureRejection(request);
             const why = self.rejection orelse "";
+            hook_attempt.?.error_message = @errorName(err);
+            hook_attempt.?.finish();
 
             if (self.waitAndRetry(sends, why, sink)) {
                 sends += 1;

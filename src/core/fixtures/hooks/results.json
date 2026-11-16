@@ -1,20 +1,190 @@
 [
-  {"event":"SessionStart","output":{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Project context"}},"context":true},
-  {"event":"SessionEnd","output":{}},
-  {"event":"UserPromptSubmit","output":{"decision":"block","reason":"private input"},"blocked":true},
-  {"event":"PreToolUse","output":{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","updatedInput":{"command":"echo safe"}}},"replacement":true},
-  {"event":"PermissionRequest","output":{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"policy"}}},"blocked":true},
-  {"event":"PostToolUse","output":{"decision":"block","reason":"Run verification"},"blocked":true},
-  {"event":"PreCompact","output":{"continue":false,"stopReason":"Preserve history"},"blocked":true},
-  {"event":"PostCompact","output":{"continue":false,"stopReason":"Inspect summary"},"blocked":true},
-  {"event":"SubagentStart","output":{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"Read only"}},"context":true},
-  {"event":"SubagentStop","output":{"decision":"block","reason":"Keep checking"},"blocked":true},
-  {"event":"Stop","output":{"decision":"block","reason":"Keep checking"},"blocked":true},
-  {"event":"Interrupt","output":{}},
-  {"event":"PreModelRequest","output":{"systemMessage":"Request starting"}},
-  {"event":"PostModelRequest","output":{"systemMessage":"Request ended"}},
-  {"event":"PreToolUse","output":{"hookSpecificOutput":{"hookEventName":"PostToolUse"}},"invalid":true},
-  {"event":"Stop","output":{"continue":"false"},"invalid":true},
-  {"event":"Interrupt","output":{"continue":false},"invalid":true},
-  {"event":"PermissionRequest","output":{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedInput":{}}}},"invalid":true}
+  {
+    "event": "SessionStart",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "Project context"
+      }
+    },
+    "context": true
+  },
+  {
+    "event": "SessionEnd",
+    "output": {}
+  },
+  {
+    "event": "UserPromptSubmit",
+    "output": {
+      "decision": "block",
+      "reason": "private input"
+    },
+    "blocked": true
+  },
+  {
+    "event": "PreToolUse",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "updatedInput": {
+          "command": "echo safe"
+        }
+      }
+    },
+    "replacement": true
+  },
+  {
+    "event": "PermissionRequest",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PermissionRequest",
+        "decision": {
+          "behavior": "deny",
+          "message": "policy"
+        }
+      }
+    },
+    "blocked": true
+  },
+  {
+    "event": "PostToolUse",
+    "output": {
+      "decision": "block",
+      "reason": "Run verification"
+    },
+    "blocked": true
+  },
+  {
+    "event": "PreCompact",
+    "output": {
+      "continue": false,
+      "stopReason": "Preserve history"
+    },
+    "blocked": true
+  },
+  {
+    "event": "PostCompact",
+    "output": {
+      "continue": false,
+      "stopReason": "Inspect summary"
+    },
+    "blocked": true
+  },
+  {
+    "event": "SubagentStart",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "SubagentStart",
+        "additionalContext": "Read only"
+      }
+    },
+    "context": true
+  },
+  {
+    "event": "SubagentStop",
+    "output": {
+      "decision": "block",
+      "reason": "Keep checking"
+    },
+    "blocked": true
+  },
+  {
+    "event": "Stop",
+    "output": {
+      "decision": "block",
+      "reason": "Keep checking"
+    },
+    "blocked": true
+  },
+  {
+    "event": "Interrupt",
+    "output": {}
+  },
+  {
+    "event": "PreModelRequest",
+    "output": {
+      "systemMessage": "Request starting"
+    }
+  },
+  {
+    "event": "PostModelRequest",
+    "output": {
+      "systemMessage": "Request ended"
+    }
+  },
+  {
+    "event": "PreToolUse",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PostToolUse"
+      }
+    },
+    "invalid": true
+  },
+  {
+    "event": "Stop",
+    "output": {
+      "continue": "false"
+    },
+    "invalid": true
+  },
+  {
+    "event": "Interrupt",
+    "output": {
+      "continue": false
+    },
+    "invalid": true
+  },
+  {
+    "event": "PermissionRequest",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PermissionRequest",
+        "decision": {
+          "behavior": "allow",
+          "updatedInput": {}
+        }
+      }
+    },
+    "invalid": true
+  },
+  {
+    "event": "PreToolUse",
+    "output": {
+      "systemMessage": null,
+      "stopReason": null,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "updatedInput": null,
+        "additionalContext": null,
+        "permissionDecision": null
+      }
+    }
+  },
+  {
+    "event": "PostToolUse",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "updatedMCPToolOutput": {
+          "content": "replacement"
+        }
+      }
+    },
+    "feedback": true
+  },
+  {
+    "event": "PermissionRequest",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PermissionRequest",
+        "decision": {
+          "behavior": "allow",
+          "message": null,
+          "interrupt": false
+        }
+      }
+    }
+  }
 ]

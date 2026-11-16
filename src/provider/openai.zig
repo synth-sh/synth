@@ -545,6 +545,7 @@ fn respond(
         var hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
         defer hook_attempt.finish();
         errdefer |err| hook_attempt.error_message = @errorName(err);
+        if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
         const body = try self.buildRequest(arena, convo, turn);
         // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
@@ -576,6 +577,8 @@ fn respond(
         if (response.head.status.class() != .success) {
             const why = reader.allocRemaining(arena, .limited(max_listing_bytes)) catch "";
             self.captureRejection(response.head.status, why);
+            hook_attempt.error_message = if (Provider.mentionsOverflow(why)) "ContextTooLarge" else "HttpError";
+            hook_attempt.finish();
             if (self.retryWithout(why)) continue;
 
             if (self.waitAndRetry(response.head.status, attempt, asked_for, sink)) {
@@ -1926,4 +1929,78 @@ test "a turn the user gave up on is not retried" {
     };
 
     try testing.expect(!backend.waitAndRetry(.too_many_requests, 1, null, stoppedSink()));
+}
+
+test "actual retries emit one paired hook trace per model attempt" {
+    const Hooks = @import("../core/hooks.zig");
+    const Server = struct {
+        server: std.Io.net.Server,
+        fn serve(self: *@This()) !void {
+            const replies = [_][]const u8{
+                "{\"error\":{\"message\":\"temporarily unavailable\"}}",
+                "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"done\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}",
+            };
+            for (replies, 0..) |body, index| {
+                const stream = try self.server.accept(testing.io);
+                defer stream.close(testing.io);
+                var input_buffer: [4096]u8 = undefined;
+                var input = stream.reader(testing.io, &input_buffer);
+                var content_length: usize = 0;
+                while (try input.interface.takeDelimiter('\n')) |line| {
+                    const trimmed = std.mem.trim(u8, line, "\r\n");
+                    if (trimmed.len == 0) break;
+                    if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[15..], " "), 10);
+                }
+                try input.interface.discardAll(content_length);
+                var output_buffer: [4096]u8 = undefined;
+                var output = stream.writer(testing.io, &output_buffer);
+                try output.interface.print("HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ if (index == 0) "503 Service Unavailable" else "200 OK", body.len, body });
+                try output.interface.flush();
+            }
+        }
+    };
+    const address: std.Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server: Server = .{ .server = try address.listen(testing.io, .{}) };
+    defer server.server.deinit(testing.io);
+    var future = try testing.io.concurrent(Server.serve, .{&server});
+    defer future.cancel(testing.io) catch {};
+    var host_buffer: [64]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buffer, "http://127.0.0.1:{d}", .{server.server.socket.address.getPort()});
+    var backend: OpenAIProvider = .{ .allocator = testing.allocator, .io = testing.io, .host = host, .model = "fake", .retries = .{ .attempts = 2, .base_ms = 1 } };
+    try backend.startWithoutProbe();
+    defer backend.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
+    const logger: Hooks.Hook = .{ .command = "cat >> requests" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .pre_model_request = &.{logger}, .post_model_request = &.{logger} } };
+    var attempts: std.atomic.Value(u32) = .init(0);
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "go");
+    var reply = try respond(&backend, &convo, .{ .system = "test", .hooks = &runner, .attempts = &attempts }, testing.allocator, null);
+    defer reply.deinit(testing.allocator);
+    try future.await(testing.io);
+    try testing.expectEqualStrings("done", reply.text);
+    try testing.expectEqual(@as(u32, 2), attempts.load(.acquire));
+    const trace = try tmp.dir.readFileAlloc(testing.io, "requests", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(trace);
+    var lines = std.mem.tokenizeScalar(u8, trace, '\n');
+    for ([_][]const u8{ "PreModelRequest", "PostModelRequest", "PreModelRequest", "PostModelRequest" }, 0..) |event, index| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
+        defer parsed.deinit();
+        const fields = parsed.value.object;
+        try testing.expectEqualStrings(event, fields.get("hook_event_name").?.string);
+        try testing.expectEqual(@as(i64, @intCast(index / 2 + 1)), fields.get("attempt").?.integer);
+        if (index == 1) {
+            try testing.expectEqualStrings("failed", fields.get("status").?.string);
+            try testing.expectEqualStrings("HttpError", fields.get("error_message").?.string);
+        }
+        if (index == 3) {
+            try testing.expectEqualStrings("completed", fields.get("status").?.string);
+            try testing.expectEqual(@as(i64, 12), fields.get("input_tokens").?.integer);
+        }
+    }
+    try testing.expect(lines.next() == null);
 }

@@ -69,7 +69,11 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
         const definitions = try arena.dupe(Hooks.Hook, @field(set, field.name));
         for (definitions, 0..) |*hook, index| {
             const event = @field(Hooks.Event, field.name);
-            const encoded = try std.json.Stringify.valueAlloc(arena, .{ root, event.name(), index, hook.timeout_ms orelse timeout_ms, hook.* }, .{});
+            var source_index: usize = 0;
+            for (definitions[0..index]) |earlier| {
+                if (std.mem.eql(u8, earlier.source, hook.source)) source_index += 1;
+            }
+            const encoded = try std.json.Stringify.valueAlloc(arena, .{ root, event.name(), source_index, Hooks.effectiveTimeout(event, timeout_ms, hook.*), hook.* }, .{});
             var hash: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
             hook.id = try arena.dupe(u8, &std.fmt.bytesToHex(hash, .lower));
@@ -109,6 +113,10 @@ test "trust is invalidated by definition changes and project identity" {
     try std.testing.expect(trusted.pre_tool_use[0].trusted);
     const changed = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "false" }} }, root, null, Hooks.default_timeout_ms, store);
     try std.testing.expect(!changed.pre_tool_use[0].trusted);
+    const moved = try discover(a, std.testing.io, set, try std.fs.path.join(a, &.{ root, "elsewhere" }), null, Hooks.default_timeout_ms, store);
+    try std.testing.expect(!moved.pre_tool_use[0].trusted);
+    const timeout_changed = try discover(a, std.testing.io, set, root, null, Hooks.default_timeout_ms + 1, store);
+    try std.testing.expect(!timeout_changed.pre_tool_use[0].trusted);
     try store.put(initial.pre_tool_use[0].id, .{ .trusted = true, .disabled = true });
     const disabled = try discover(a, std.testing.io, set, root, null, Hooks.default_timeout_ms, store);
     try std.testing.expect(!disabled.pre_tool_use[0].enabled);
@@ -156,7 +164,7 @@ pub fn report(allocator: std.mem.Allocator, set: Hooks.Set, timeout_ms: u64, rev
             count += 1;
             const event = @field(Hooks.Event, field.name);
             try writer.writer.print("{s}\n  {s}  {s}  {s}  {s}  {s} timeout={d}ms\n  source: {s}\n  matcher: {s}\n", .{
-                hook.id, event.name(), if (hook.legacy) "legacy serial" else if (hook.async) "background" else "grouped sync", if (hook.trusted) "trusted" else "NEEDS REVIEW", if (hook.enabled) "enabled" else "disabled", @tagName(hook.type), hook.timeout_ms orelse timeout_ms, hook.source, hook.matcher,
+                hook.id, event.name(), if (hook.legacy) "legacy serial" else if (hook.async) "background" else "grouped sync", if (hook.trusted) "trusted" else "NEEDS REVIEW", if (hook.enabled) "enabled" else "disabled", @tagName(hook.type), Hooks.effectiveTimeout(event, timeout_ms, hook), hook.source, hook.matcher,
             });
             if (review) {
                 try writer.writer.writeAll("  definition: ");
@@ -174,6 +182,7 @@ pub fn report(allocator: std.mem.Allocator, set: Hooks.Set, timeout_ms: u64, rev
             const record = active.records[index];
             try writer.writer.print("  recent: {s} {s} {s} {d}ms\n", .{ &record.id, record.event.name(), record.status, record.duration_ms });
             try writer.writer.print("    session={s} turn={s} call={s}\n", .{ std.mem.trimEnd(u8, &record.session_id, "\x00"), std.mem.trimEnd(u8, &record.turn_id, "\x00"), std.mem.trimEnd(u8, &record.call_id, "\x00") });
+            try writer.writer.print("    agent={s} request={d} attempt={d}\n", .{ std.mem.trimEnd(u8, &record.agent_id, "\x00"), record.request_id, record.attempt });
             if (record.error_name.len > 0) try writer.writer.print("    error: {s}\n", .{record.error_name});
             if (record.exit_code) |code| try writer.writer.print("    exit: {d}\n", .{code});
         }
@@ -182,4 +191,28 @@ pub fn report(allocator: std.mem.Allocator, set: Hooks.Set, timeout_ms: u64, rev
     if (!@import("ansi.zig").hasControls(raw)) return raw;
     defer allocator.free(raw);
     return @import("ansi.zig").clean(allocator, raw);
+}
+
+test "discovery is additive and unrelated sources keep stable ids" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.synth");
+    try tmp.dir.createDirPath(std.testing.io, "project/.synth");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"user\"}]}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/.synth/hooks.json", .data = "{\"hooks\":{\"PreToolUse\":[{\"command\":\"project\"},{\"command\":\"project\"}]}}" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "project", a);
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", a);
+    var store = try Store.init(std.testing.allocator, std.testing.io, null);
+    defer store.deinit();
+    const set = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "inline" }} }, root, home, 30000, store);
+    try std.testing.expectEqual(@as(usize, 4), set.pre_tool_use.len);
+    try std.testing.expectEqualStrings("inline", set.pre_tool_use[0].command);
+    try std.testing.expectEqualStrings("user", set.pre_tool_use[1].command);
+    try std.testing.expectEqualStrings("project", set.pre_tool_use[2].command);
+    try std.testing.expect(!std.mem.eql(u8, set.pre_tool_use[2].id, set.pre_tool_use[3].id));
+    const more = try discover(a, std.testing.io, .{ .pre_tool_use = &.{ .{ .command = "inline" }, .{ .command = "another" } } }, root, home, 30000, store);
+    try std.testing.expectEqualStrings(set.pre_tool_use[2].id, more.pre_tool_use[3].id);
 }
