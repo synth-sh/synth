@@ -33,3 +33,4 @@ outcomes, and blocked endpoint/model/reviewer overrides. It does not measure liv
 provider compatibility or reviewer accuracy.
 
 See [Hooks](hooks.md) for configuration, payloads, composition rules, and limits.
+See [Validation and review](hooks-validation.md) for results and review fixes.
