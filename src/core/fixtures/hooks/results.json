@@ -495,5 +495,120 @@
         }
       }
     }
+  },
+  {
+    "event": "PermissionEvaluate",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PermissionEvaluate"
+      }
+    }
+  },
+  {
+    "event": "HttpRequest",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "HttpRequest"
+      }
+    }
+  },
+  {
+    "event": "HttpResponse",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "HttpResponse"
+      }
+    }
+  },
+  {
+    "event": "PermissionEvaluate",
+    "blocked": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PermissionEvaluate",
+        "effect": "deny",
+        "reason": "policy"
+      }
+    }
+  },
+  {
+    "event": "ModelContext",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelContext",
+        "requestContext": {
+          "tools": [
+            "read"
+          ],
+          "system": "prepared"
+        }
+      }
+    }
+  },
+  {
+    "event": "ModelSettings",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelSettings",
+        "settings": {
+          "top_p": 0.5,
+          "seed": 7,
+          "stop": [
+            "END"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "event": "ModelSettings",
+    "invalid": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelSettings",
+        "settings": {
+          "top_p": 2
+        }
+      }
+    }
+  },
+  {
+    "event": "PermissionEvaluate",
+    "invalid": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PermissionEvaluate",
+        "effect": "always"
+      }
+    }
+  },
+  {
+    "event": "ModelContext",
+    "invalid": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelContext",
+        "requestContext": {
+          "messages": [
+            {
+              "seq": 1,
+              "role": "user"
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "event": "HttpRequest",
+    "invalid": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "HttpRequest",
+        "http": {
+          "url": "http://evil"
+        }
+      }
+    }
   }
 ]

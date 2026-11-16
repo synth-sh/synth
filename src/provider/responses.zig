@@ -1,6 +1,7 @@
 const std = @import("std");
 const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
+const HttpHooks = @import("http_hooks.zig");
 const OpenAI = @import("openai.zig");
 const window = @import("window.zig");
 
@@ -35,6 +36,7 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     try w.writeAll("{\"model\":");
     try writeString(w, options.model);
     if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
+    if (turn.settings.top_p) |v| try w.print(",\"top_p\":{d}", .{v});
     try w.writeAll(",\"input\":[");
     var input: InputWriter = .{ .writer = w, .supports_vision = options.supports_vision, .provider_tag = options.provider_tag };
     try input.text("developer", Item.input_text, instructions);
@@ -334,6 +336,7 @@ pub const Failure = struct {
 /// Everything one streamed response produces: the reply, plus each completed
 /// output item kept verbatim for replay.
 pub const ResponseStream = struct {
+    http: ?*HttpHooks.Exchange = null,
     allocator: std.mem.Allocator,
     provider_tag: []const u8 = "chatgpt",
     sink: ?Provider.Sink,
@@ -401,7 +404,8 @@ pub const ResponseStream = struct {
                 const payload = std.mem.trimStart(u8, trimmed["data:".len..], " ");
                 const is_event = payload.len > 0 and !std.mem.eql(u8, payload, "[DONE]");
                 if (is_event) {
-                    const event = std.json.parseFromSliceLeaky(std.json.Value, scratch, payload, .{}) catch null;
+                    const prepared = if (self.http) |http| (try http.payload(scratch, payload, true)) orelse continue else payload;
+                    const event = std.json.parseFromSliceLeaky(std.json.Value, scratch, prepared, .{}) catch null;
                     if (event) |parsed| try self.apply(parsed);
                 }
             }

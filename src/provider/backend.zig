@@ -162,6 +162,11 @@ pub const Spawned = struct {
         }, options);
         switch (self.backend.client) {
             .openai => |*client| {
+                client.wire = switch (route.protocol) {
+                    .chat => .chat,
+                    .responses => .responses,
+                    .messages => .messages,
+                };
                 try client.startWithoutProbe();
                 if (route.context_limit > 0) client.context_limit = route.context_limit;
             },
@@ -176,7 +181,7 @@ pub const Spawned = struct {
     pub fn settings(self: *Spawned, value: @import("../core/model_policy.zig").Settings) !void {
         try value.validate();
         switch (self.backend.client) {
-            .chatgpt, .copilot => if (value.temperature != null or value.max_output_tokens != null) return error.UnsupportedModelSettings,
+            .chatgpt, .copilot => if (value.temperature != null or value.max_output_tokens != null or value.top_p != null or value.top_k != null or value.seed != null or value.frequency_penalty != null or value.presence_penalty != null or value.stop != null) return error.UnsupportedModelSettings,
             else => {},
         }
         if (value.reasoning_effort) |effort| if (self.backend.client != .openai) {

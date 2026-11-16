@@ -630,5 +630,53 @@
       "retry_delay_ms",
       "retry_allowed"
     ]
+  },
+  {
+    "event": "PermissionEvaluate",
+    "required": [
+      "hook_event_name",
+      "agent_id",
+      "agent_scope",
+      "request_purpose",
+      "request_context",
+      "request_tools",
+      "request_system",
+      "request_routes",
+      "permission_effect",
+      "action",
+      "http"
+    ]
+  },
+  {
+    "event": "HttpRequest",
+    "required": [
+      "hook_event_name",
+      "agent_id",
+      "agent_scope",
+      "request_purpose",
+      "request_context",
+      "request_tools",
+      "request_system",
+      "request_routes",
+      "permission_effect",
+      "action",
+      "http"
+    ]
+  },
+  {
+    "event": "HttpResponse",
+    "required": [
+      "hook_event_name",
+      "agent_id",
+      "agent_scope",
+      "request_purpose",
+      "request_context",
+      "request_tools",
+      "request_system",
+      "request_routes",
+      "permission_effect",
+      "action",
+      "http"
+    ]
   }
 ]

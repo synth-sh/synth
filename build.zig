@@ -49,6 +49,11 @@ pub fn build(b: *std.Build) !void {
     const mcp_test_step = b.step("test-mcp", "Run the mcp package's tests on their own");
     mcp_test_step.dependOn(&run_mcp_tests.step);
 
+    const hook_requests = b.addSystemCommand(&.{"python3"});
+    hook_requests.addFileArg(b.path("tests/hook_requests.py"));
+    hook_requests.addArtifactArg(exe);
+    b.step("test-hook-requests", "Prove request hooks against offline HTTP servers (Python 3)").dependOn(&hook_requests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mcp_tests.step);
     test_step.dependOn(&run_exe_tests.step);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
+const HttpHooks = @import("http_hooks.zig");
 const OpenAI = @import("openai.zig");
 const window = @import("window.zig");
 
@@ -76,6 +77,12 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(options.model, .{}, w);
     if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
+    if (turn.settings.top_p) |v| try w.print(",\"top_p\":{d}", .{v});
+    if (turn.settings.top_k) |v| try w.print(",\"top_k\":{d}", .{v});
+    if (turn.settings.stop) |v| {
+        try w.writeAll(",\"stop_sequences\":");
+        try std.json.Stringify.value(v, .{}, w);
+    }
     try w.print(",\"stream\":true,\"max_tokens\":{d},\"system\":", .{@max(@as(u32, 1), options.max_output_tokens)});
     const system = try window.systemText(arena, turn.system, kept, 0);
     if (system.len > 0) {
@@ -111,6 +118,7 @@ const Pending = struct {
 };
 
 pub const Stream = struct {
+    http: ?*HttpHooks.Exchange = null,
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
     arena: std.heap.ArenaAllocator,
@@ -149,7 +157,9 @@ pub const Stream = struct {
             };
             const value = std.mem.trim(u8, line.written(), "\r ");
             if (std.mem.startsWith(u8, value, "data:")) {
-                const event = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), std.mem.trimStart(u8, value[5..], " "), .{});
+                const payload = std.mem.trimStart(u8, value[5..], " ");
+                const prepared = if (self.http) |http| (try http.payload(scratch.allocator(), payload, true)) orelse continue else payload;
+                const event = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), prepared, .{});
                 try self.apply(event);
             }
             if (self.completed) return;
@@ -159,7 +169,8 @@ pub const Stream = struct {
     }
 
     pub fn readWhole(self: *Stream, arena: std.mem.Allocator, body: []const u8) !void {
-        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+        const prepared = if (self.http) |http| (try http.payload(arena, body, false)).? else body;
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, prepared, .{});
         const fields = fieldsOf(value) orelse return error.UnexpectedResponse;
         if (fields.get("error")) |err| {
             self.rejection = try self.arena.allocator().dupe(u8, string(fieldsOf(err) orelse fields, "message") orelse "Messages API error");

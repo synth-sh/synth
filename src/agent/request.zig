@@ -8,6 +8,7 @@ const Thought = @import("thought.zig");
 const tool = @import("../tools/tool.zig");
 
 const Request = @This();
+const ContextPatch = @import("../core/request_context.zig");
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -15,6 +16,7 @@ provider: Provider,
 provider_mutex: std.Io.Mutex = .init,
 owned_backend: ?*@import("../provider/backend.zig").Spawned = null,
 prepared_conversation: ?Conversation = null,
+restricted_tools: bool = false,
 started_ms: i64 = 0,
 conversation: *Conversation,
 /// Owned copy of the turn's strings: the loop is free to rebuild its prompt or
@@ -100,6 +102,7 @@ pub fn start(
     self.turn.hook_input.provider = try self.hook_arena.allocator().dupe(u8, provider.name);
     if (turn.compacting) self.turn.hook_input.request_purpose = .compaction;
     self.turn.attempts = &self.attempt_number;
+    self.turn.stop = &self.stop;
     self.display_id_len = (try std.fmt.bufPrint(&self.display_id, "{s}-{d}", .{ turn.hook_input.agent_id, turn.hook_input.request_id })).len;
     self.future = try io.concurrent(run, .{self});
     return self;
@@ -171,14 +174,17 @@ fn freeTurn(self: *Request) void {
     self.allocator.free(self.turn.instruction);
 }
 
-fn onRetry(ptr: *anyopaque, attempt: usize, delay: u64) ?u64 {
+fn onRetry(ptr: *anyopaque, info: Provider.RetryInfo) ?u64 {
     const self: *Request = @ptrCast(@alignCast(ptr));
-    self.turn.hook_input.attempt = @intCast(attempt);
-    self.turn.hook_input.retry_delay_ms = delay;
-    self.turn.hook_input.retry_allowed = true;
+    self.turn.hook_input.attempt = @intCast(info.attempt);
+    self.turn.hook_input.retry_delay_ms = info.delay_ms;
+    self.turn.hook_input.retry_allowed = info.allowed;
+    self.turn.hook_input.http_status = info.status;
+    self.turn.hook_input.error_type = self.hook_arena.allocator().dupe(u8, info.error_type) catch return null;
+    self.turn.hook_input.error_message = self.hook_arena.allocator().dupe(u8, info.error_message) catch return null;
     const result = self.requestHook(.model_retry) catch return null;
-    if (result.retry_allowed == false) return null;
-    return @min(result.retry_delay_ms orelse delay, 60_000);
+    if (!(result.retry_allowed orelse info.allowed)) return null;
+    return @min(result.retry_delay_ms orelse info.delay_ms, 60_000);
 }
 
 fn requestHook(self: *Request, event: @import("../core/hooks.zig").Event) !@import("../core/hooks.zig").Result {
@@ -197,6 +203,11 @@ fn prepare(self: *Request) !void {
     const a = self.hook_arena.allocator();
     const purpose = self.turn.hook_input.request_purpose;
     self.turn.hook_input.route = self.turn.model_policy.selected(purpose) orelse "";
+    if (self.turn.hooks) |runner| {
+        var input = self.turn.hook_input;
+        input.event = .model_resolve;
+        if (runner.hasMatching(a, input, false)) try self.describeContext();
+    }
     const resolution = try self.requestHook(.model_resolve);
     if (resolution.model_route) |id| {
         if (id.len == 0) return error.ModelRouteDenied;
@@ -228,27 +239,50 @@ fn prepare(self: *Request) !void {
         var input = self.turn.hook_input;
         input.event = .model_context;
         if (!runner.hasMatching(a, input, false)) return;
-        self.turn.hook_input.request_context = try std.json.Stringify.valueAlloc(a, self.conversation.messages.items, .{ .emit_null_optional_fields = false });
+        try self.describeContext();
         const context = try self.requestHook(.model_context);
-        if (context.context_edits) |encoded| {
+        if (context.context_edits != null or context.request_context != null) {
             if (purpose == .approval_judge) return error.ReviewerContextImmutable;
-            const Edit = struct { seq: u64, text: []const u8 };
-            const edits = try std.json.parseFromSliceLeaky([]const Edit, a, encoded, .{});
             self.prepared_conversation = .init(self.allocator);
-            const prepared = &self.prepared_conversation.?;
-            for (self.conversation.messages.items) |msg| try prepared.adoptMessage(try msg.clone(self.allocator));
-            for (edits) |edit| {
-                for (prepared.messages.items) |*msg| {
-                    if (msg.seq != edit.seq) continue;
-                    const copy = try self.allocator.dupe(u8, edit.text);
-                    self.allocator.free(msg.text);
-                    msg.text = copy;
-                    msg.origin = .hook;
-                    break;
-                } else return error.InvalidContextEdit;
+            for (self.conversation.messages.items) |msg| try self.prepared_conversation.?.adoptMessage(try msg.clone(self.allocator));
+            if (context.context_edits) |encoded| {
+                const edits = try std.json.parseFromSliceLeaky([]const ContextPatch.Edit, a, encoded, .{});
+                try ContextPatch.apply(&self.prepared_conversation.?, edits);
             }
+            if (context.request_context) |encoded| {
+                const patch = try std.json.parseFromSliceLeaky(ContextPatch.Patch, a, encoded, .{});
+                if (patch.system) |value| try self.replaceTurnText(&self.turn.system, value);
+                if (patch.instruction) |value| try self.replaceTurnText(&self.turn.instruction, value);
+                if (patch.tools) |names| {
+                    const selected = try ContextPatch.selectTools(a, self.turn.tools_json, names);
+                    try self.replaceTurnText(&self.turn.tools_json, selected);
+                    self.restricted_tools = true;
+                }
+                try ContextPatch.apply(&self.prepared_conversation.?, patch.messages);
+            }
+            try self.describeContext();
         }
     }
+}
+
+fn replaceTurnText(self: *Request, target: *[]const u8, value: []const u8) !void {
+    const copy = try self.allocator.dupe(u8, value);
+    self.allocator.free(target.*);
+    target.* = copy;
+}
+
+fn describeContext(self: *Request) !void {
+    const a = self.hook_arena.allocator();
+    self.turn.hook_input.request_context = try std.json.Stringify.valueAlloc(a, if (self.prepared_conversation) |*prepared| prepared.messages.items else self.conversation.messages.items, .{ .emit_null_optional_fields = false });
+    self.turn.hook_input.request_system = try a.dupe(u8, self.turn.system);
+    self.turn.hook_input.request_instruction = try a.dupe(u8, self.turn.instruction);
+    self.turn.hook_input.request_tools = try a.dupe(u8, self.turn.tools_json);
+    var routes: std.ArrayList(std.json.Value) = .empty;
+    for (self.turn.model_policy.routes) |route| {
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .id = route.id, .provider = route.provider, .protocol = route.protocol, .endpoint = route.endpoint, .model = route.model, .context_limit = route.context_limit, .purposes = route.purposes }, .{});
+        try routes.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
+    }
+    self.turn.hook_input.request_routes = try std.json.Stringify.valueAlloc(a, routes.items, .{});
 }
 
 fn run(self: *Request) void {
@@ -292,6 +326,17 @@ fn run(self: *Request) void {
         self.failed = err;
         return;
     };
+    if (self.restricted_tools) {
+        for (self.reply.?.tool_calls) |*call| {
+            if (ContextPatch.permits(self.hook_arena.allocator(), self.turn.tools_json, call.name) catch false) continue;
+            call.status = .rejected;
+            call.result = self.allocator.dupe(u8, "tool excluded from this model request") catch {
+                self.failed = error.OutOfMemory;
+                return;
+            };
+            call.result_bytes = call.result.?.len;
+        }
+    }
 }
 
 /// Worker thread, via the provider's sink.

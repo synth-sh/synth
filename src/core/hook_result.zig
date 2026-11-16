@@ -1,8 +1,11 @@
 const std = @import("std");
 
 pub const Permission = enum { allow, deny, ask };
+pub const HttpPatch = struct { headers: ?std.json.Value = null, status: ?u16 = null, body: ?std.json.Value = null, drop: bool = false };
 
 pub const Result = struct {
+    request_context: ?[]u8 = null,
+    http: ?[]u8 = null,
     model_route: ?[]u8 = null,
     context_edits: ?[]u8 = null,
     settings: ?[]u8 = null,
@@ -19,7 +22,7 @@ pub const Result = struct {
     display_content: ?[]u8 = null,
 
     pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
-        inline for (.{ "model_route", "context_edits", "settings", "blocked", "context", "message", "replacement", "feedback", "display_content" }) |field| {
+        inline for (.{ "request_context", "http", "model_route", "context_edits", "settings", "blocked", "context", "message", "replacement", "feedback", "display_content" }) |field| {
             if (@field(self, field)) |value| allocator.free(value);
         }
         self.* = .{};
@@ -43,9 +46,12 @@ pub const Result = struct {
                 @field(self, field) = combined;
             }
         }
-        inline for (.{ "model_route", "context_edits", "settings", "replacement", "feedback", "display_content" }) |field| {
+        inline for (.{ "request_context", "http", "model_route", "context_edits", "settings", "replacement", "feedback", "display_content" }) |field| {
             if (@field(other, field)) |value| {
-                const copy = try allocator.dupe(u8, value);
+                const copy = if (@field(self, field)) |old| blk: {
+                    if (comptime std.mem.eql(u8, field, "request_context") or std.mem.eql(u8, field, "settings") or std.mem.eql(u8, field, "http") or std.mem.eql(u8, field, "context_edits")) break :blk try combine(allocator, old, value, field);
+                    break :blk try allocator.dupe(u8, value);
+                } else try allocator.dupe(u8, value);
                 if (@field(self, field)) |old| allocator.free(old);
                 @field(self, field) = copy;
             }
@@ -57,6 +63,51 @@ pub const Result = struct {
         self.retry = self.retry or other.retry;
     }
 };
+
+fn combine(allocator: std.mem.Allocator, before: []const u8, after: []const u8, kind: []const u8) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var lhs = try std.json.parseFromSliceLeaky(std.json.Value, a, before, .{});
+    const rhs = try std.json.parseFromSliceLeaky(std.json.Value, a, after, .{});
+    if (std.mem.eql(u8, kind, "context_edits")) {
+        try lhs.array.appendSlice(rhs.array.items);
+    } else {
+        var it = rhs.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            if (lhs.object.getPtr(key)) |old| {
+                if (std.mem.eql(u8, key, "messages")) {
+                    try old.array.appendSlice(value.array.items);
+                    continue;
+                }
+                if (std.mem.eql(u8, key, "tools")) {
+                    var kept: std.array_list.Managed(std.json.Value) = .init(a);
+                    for (old.array.items) |candidate| {
+                        for (value.array.items) |allowed| if (std.mem.eql(u8, candidate.string, allowed.string)) {
+                            try kept.append(candidate);
+                            break;
+                        };
+                    }
+                    old.* = .{ .array = kept };
+                    continue;
+                }
+                if (std.mem.eql(u8, key, "headers") and old.* == .object and value == .object) {
+                    var headers = value.object.iterator();
+                    while (headers.next()) |header| try old.object.put(a, header.key_ptr.*, header.value_ptr.*);
+                    continue;
+                }
+                if (std.mem.eql(u8, key, "drop") and old.* == .bool and value == .bool) {
+                    old.bool = old.bool or value.bool;
+                    continue;
+                }
+            }
+            try lhs.object.put(a, key, value);
+        }
+    }
+    return std.json.Stringify.valueAlloc(allocator, lhs, .{});
+}
 
 pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: []const u8) !Result {
     if (std.mem.trim(u8, source, " \r\n\t").len == 0) return .{};
@@ -97,7 +148,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: []const u8
         } else return error.UnsupportedHookEffect;
     }
     if (oneOf(event, &.{ "PreModelRequest", "PostModelRequest", "SessionEnd", "Interrupt", "SubagentStart", "PostToolUseFailure", "PermissionDenied", "StopFailure", "Notification", "InstructionsLoaded", "FileChanged", "PostModelSwitch", "MessageDisplay", "CwdChanged", "DirectoryAdded" }) and (result.stop or result.blocked != null or result.replacement != null or result.permission != null)) return error.UnsupportedHookEffect;
-    if (oneOf(event, &.{ "ModelResolve", "ModelContext", "ModelSettings", "ModelRetry" }) and (result.stop or result.context != null or result.blocked != null or result.permission != null)) return error.UnsupportedHookEffect;
+    if (oneOf(event, &.{ "ModelResolve", "ModelContext", "ModelSettings", "ModelRetry", "HttpRequest", "HttpResponse" }) and (result.stop or result.context != null or result.blocked != null or result.permission != null)) return error.UnsupportedHookEffect;
     if (std.mem.eql(u8, event, "PostToolUse") and result.stop) return error.UnsupportedHookEffect;
     if (oneOf(event, &.{ "TaskCreated", "TaskCompleted" })) result.stop = false;
     if (result.stop and result.blocked == null) result.blocked = try reason(allocator, root, "stopReason");
@@ -110,7 +161,27 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
         const key = entry.key_ptr.*;
         const field = entry.value_ptr.*;
         if (std.mem.eql(u8, key, "hookEventName")) continue;
-        if (std.mem.eql(u8, key, "route")) {
+        if (std.mem.eql(u8, key, "requestContext")) {
+            if (!std.mem.eql(u8, event, "ModelContext") or field != .object) return error.UnsupportedHookEffect;
+            const encoded = try std.json.Stringify.valueAlloc(allocator, field, .{});
+            errdefer allocator.free(encoded);
+            const parsed = try std.json.parseFromSlice(@import("request_context.zig").Patch, allocator, encoded, .{});
+            defer parsed.deinit();
+            result.request_context = encoded;
+        } else if (std.mem.eql(u8, key, "http")) {
+            if (!oneOf(event, &.{ "HttpRequest", "HttpResponse" }) or field != .object) return error.UnsupportedHookEffect;
+            const encoded = try std.json.Stringify.valueAlloc(allocator, field, .{});
+            errdefer allocator.free(encoded);
+            const parsed = try std.json.parseFromSlice(HttpPatch, allocator, encoded, .{});
+            defer parsed.deinit();
+            result.http = encoded;
+        } else if (std.mem.eql(u8, key, "effect")) {
+            if (!std.mem.eql(u8, event, "PermissionEvaluate")) return error.UnsupportedHookEffect;
+            result.decide(std.meta.stringToEnum(Permission, try text(field)) orelse return error.InvalidHookOutput);
+            if (result.permission == .deny and result.blocked == null) result.blocked = try reason(allocator, value, "reason");
+        } else if (std.mem.eql(u8, key, "reason") and std.mem.eql(u8, event, "PermissionEvaluate")) {
+            _ = try text(field);
+        } else if (std.mem.eql(u8, key, "route")) {
             if (!std.mem.eql(u8, event, "ModelResolve")) return error.UnsupportedHookEffect;
             result.model_route = try string(allocator, field);
         } else if (std.mem.eql(u8, key, "contextEdits")) {
@@ -244,4 +315,23 @@ test "permission aggregation retains asks and denials over allowances" {
     try result.merge(std.testing.allocator, .{ .permission = .deny });
     try result.merge(std.testing.allocator, .{ .permission = .allow });
     try std.testing.expectEqual(Permission.deny, result.permission.?);
+}
+
+test "request handler outputs compose without losing restrictions or independent settings" {
+    const a = std.testing.allocator;
+    var result: Result = .{};
+    defer result.deinit(a);
+    try result.merge(a, .{ .settings = @constCast("{\"temperature\":0}"), .request_context = @constCast("{\"tools\":[\"read\"],\"messages\":[{\"seq\":1,\"text\":\"filtered\"}]}"), .http = @constCast("{\"headers\":{\"x-one\":\"1\"}}") });
+    try result.merge(a, .{ .settings = @constCast("{\"top_p\":0.5}"), .request_context = @constCast("{\"system\":\"prepared\",\"tools\":[\"read\",\"bash\"]}"), .http = @constCast("{\"headers\":{\"x-two\":\"2\"}}") });
+    const settings = try std.json.parseFromSlice(std.json.Value, a, result.settings.?, .{});
+    defer settings.deinit();
+    try std.testing.expect(settings.value.object.contains("temperature"));
+    try std.testing.expect(settings.value.object.contains("top_p"));
+    const context = try std.json.parseFromSlice(std.json.Value, a, result.request_context.?, .{});
+    defer context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), context.value.object.get("tools").?.array.items.len);
+    try std.testing.expect(context.value.object.contains("messages"));
+    const http = try std.json.parseFromSlice(std.json.Value, a, result.http.?, .{});
+    defer http.deinit();
+    try std.testing.expectEqual(@as(usize, 2), http.value.object.get("headers").?.object.count());
 }

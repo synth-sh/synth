@@ -45,6 +45,9 @@ pub const Event = enum {
     cwd_changed,
     directory_added,
     model_retry,
+    http_response,
+    http_request,
+    permission_evaluate,
     model_settings,
     model_context,
     model_resolve,
@@ -82,6 +85,9 @@ pub const Event = enum {
             .cwd_changed => "CwdChanged",
             .directory_added => "DirectoryAdded",
             .model_retry => "ModelRetry",
+            .http_response => "HttpResponse",
+            .http_request => "HttpRequest",
+            .permission_evaluate => "PermissionEvaluate",
             .model_settings => "ModelSettings",
             .model_context => "ModelContext",
             .model_resolve => "ModelResolve",
@@ -109,6 +115,13 @@ pub const Event = enum {
         };
     }
 
+    pub fn requestStage(self: Event) bool {
+        return switch (self) {
+            .model_resolve, .model_context, .model_settings, .model_retry, .http_request, .http_response => true,
+            else => false,
+        };
+    }
+
     pub fn observational(self: Event) bool {
         return switch (self) {
             .session_end, .interrupt, .subagent_start, .pre_model_request, .post_model_request, .post_tool_use_failure, .permission_denied, .stop_failure, .notification, .instructions_loaded, .file_changed, .post_model_switch, .message_display, .cwd_changed, .directory_added => true,
@@ -117,7 +130,7 @@ pub const Event = enum {
     }
 
     pub fn toolMatcher(self: Event) bool {
-        return self == .pre_tool_use or self == .post_tool_use or self == .post_tool_use_failure or self == .permission_request or self == .permission_denied;
+        return self == .pre_tool_use or self == .post_tool_use or self == .post_tool_use_failure or self == .permission_request or self == .permission_denied or self == .permission_evaluate;
     }
 };
 
@@ -217,6 +230,9 @@ pub const Set = struct {
     cwd_changed: []const Hook = &.{},
     directory_added: []const Hook = &.{},
     model_retry: []const Hook = &.{},
+    http_response: []const Hook = &.{},
+    http_request: []const Hook = &.{},
+    permission_evaluate: []const Hook = &.{},
     model_settings: []const Hook = &.{},
     model_context: []const Hook = &.{},
     model_resolve: []const Hook = &.{},
@@ -254,6 +270,9 @@ pub const Set = struct {
             .cwd_changed => self.cwd_changed,
             .directory_added => self.directory_added,
             .model_retry => self.model_retry,
+            .http_response => self.http_response,
+            .http_request => self.http_request,
+            .permission_evaluate => self.permission_evaluate,
             .model_settings => self.model_settings,
             .model_context => self.model_context,
             .model_resolve => self.model_resolve,
@@ -311,7 +330,7 @@ pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []cons
                         if (hook.async) return error.AsyncMcpHookUnsupported;
                         if (event == .session_end) return error.SessionEndMcpHookUnsupported;
                     } else if (hook.server.len > 0 or hook.tool.len > 0 or hook.arguments != .null) return error.InvalidHookDefinition;
-                    if (hook.async and (event == .model_resolve or event == .model_context or event == .model_settings or event == .model_retry)) return error.InvalidHookAsync;
+                    if (hook.async and (event.requestStage() or event == .permission_evaluate)) return error.InvalidHookAsync;
                     if (hook.async and event == .session_end) return error.AsyncSessionEndHookUnsupported;
                     if (hook.timeout_ms) |ms| try validTimeout(ms);
                     hook.matcher = matcher;
@@ -368,9 +387,17 @@ fn validateDefinition(value: std.json.Value, legacy: bool) !void {
 }
 
 pub const Invocation = struct {
+    request_system: []const u8 = "",
+    request_instruction: []const u8 = "",
+    request_tools: []const u8 = "",
+    request_routes: []const u8 = "",
+    permission_effect: []const u8 = "",
+    action: []const u8 = "",
+    http: []const u8 = "",
     route: []const u8 = "",
     request_context: []const u8 = "",
     request_settings: []const u8 = "",
+    http_status: u16 = 0,
     retry_delay_ms: u64 = 0,
     retry_allowed: bool = false,
     event: Event,
@@ -823,7 +850,7 @@ pub const Runner = struct {
         var legacy_blocked = false;
         while (at < definitions.len) {
             const hook = definitions[at];
-            if (hook.async and (invocation.event == .model_resolve or invocation.event == .model_context or invocation.event == .model_settings or invocation.event == .model_retry)) return error.InvalidHookAsync;
+            if (hook.async and (invocation.event.requestStage() or invocation.event == .permission_evaluate)) return error.InvalidHookAsync;
             if (self.givenUp()) return error.Cancelled;
             if (!hook.enabled) {
                 at += 1;
@@ -911,7 +938,7 @@ pub const Runner = struct {
                         }
                         continue;
                     }
-                    if (grouped.async and (invocation.event == .model_resolve or invocation.event == .model_context or invocation.event == .model_settings or invocation.event == .model_retry)) return error.InvalidHookAsync;
+                    if (grouped.async and (invocation.event.requestStage() or invocation.event == .permission_evaluate)) return error.InvalidHookAsync;
                     if (grouped.async) {
                         const runtime = self.runtime orelse return error.BackgroundHooksUnavailable;
                         try runtime.launch(self, grouped, invocation);
@@ -966,7 +993,7 @@ pub const Runner = struct {
             }
         }
         if (failure) |err| {
-            const strict = switch (invocation.event) {
+            const strict = invocation.event.requestStage() or invocation.event == .permission_evaluate or switch (invocation.event) {
                 .session_start, .user_prompt_submit, .pre_tool_use, .permission_request, .pre_compact, .post_compact, .post_tool_batch, .task_created, .task_completed, .pre_model_switch, .user_prompt_expansion, .config_change => true,
                 else => false,
             };
@@ -1358,7 +1385,7 @@ fn writeJson(
     try std.json.Stringify.value(invocation.agent_scope, .{}, w);
     try w.writeAll(",\"request_purpose\":");
     try std.json.Stringify.value(invocation.request_purpose, .{}, w);
-    inline for (.{ "route", "request_context", "request_settings", "provider", "parent_agent_id", "parent_tool_call_id", "old_cwd", "new_cwd", "directory", "session_id", "turn_id", "tool_call_id", "agent_id", "agent_type", "model", "permission_mode", "source", "trigger", "status", "error_type", "error_message", "parent_session_id", "reason", "notification_type", "message", "title", "file_path", "event_type", "load_reason", "memory_type", "from_model", "to_model", "task_id", "task_subject", "task_description", "command_name", "command_args", "expanded_prompt", "message_id", "delta" }) |field| {
+    inline for (.{ "request_system", "request_instruction", "request_tools", "request_routes", "permission_effect", "action", "http", "route", "request_context", "request_settings", "provider", "parent_agent_id", "parent_tool_call_id", "old_cwd", "new_cwd", "directory", "session_id", "turn_id", "tool_call_id", "agent_id", "agent_type", "model", "permission_mode", "source", "trigger", "status", "error_type", "error_message", "parent_session_id", "reason", "notification_type", "message", "title", "file_path", "event_type", "load_reason", "memory_type", "from_model", "to_model", "task_id", "task_subject", "task_description", "command_name", "command_args", "expanded_prompt", "message_id", "delta" }) |field| {
         try w.writeAll(",\"" ++ field ++ "\":");
         try std.json.Stringify.encodeJsonString(@field(invocation, field), .{}, w);
     }
@@ -1368,7 +1395,7 @@ fn writeJson(
     try std.json.Stringify.value(invocation.requested_model, .{}, w);
     try w.writeAll(",\"last_assistant_message\":");
     try std.json.Stringify.value(invocation.last_assistant_message, .{}, w);
-    try w.print(",\"retry_delay_ms\":{d},\"retry_allowed\":{s}", .{ invocation.retry_delay_ms, if (invocation.retry_allowed) "true" else "false" });
+    try w.print(",\"http_status\":{d},\"retry_delay_ms\":{d},\"retry_allowed\":{s}", .{ invocation.http_status, invocation.retry_delay_ms, if (invocation.retry_allowed) "true" else "false" });
     try w.print(",\"request_id\":{d},\"attempt\":{d}", .{ invocation.request_id, invocation.attempt });
     if (invocation.event == .subagent_stop) {
         try w.writeAll(",\"agent_transcript_path\":");
@@ -1977,4 +2004,18 @@ test "unfiltered declaration encoding retains existing trust identity bytes" {
     try std.testing.expectEqualStrings(
         \\{"matcher":"","command":"true","legacy":true,"id":"","trusted":true,"enabled":true,"transcript":false,"source":"config","timeout_ms":null,"async":false,"type":"command","server":"","tool":"","arguments":null}
     , encoded);
+}
+
+test "request and permission mutation stages fail closed on malformed handler output" {
+    const a = std.testing.allocator;
+    inline for (.{ Event.model_resolve, Event.model_context, Event.model_settings, Event.model_retry, Event.permission_evaluate, Event.http_request, Event.http_response }) |event| {
+        var set: Set = .{};
+        @field(set, @tagName(event)) = &.{.{ .legacy = false, .command = "printf 'invalid json'" }};
+        const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = set };
+        if (runner.evaluate(a, .{ .event = event })) |value| {
+            var result = value;
+            result.deinit(a);
+            return error.MalformedHookWasAccepted;
+        } else |_| {}
+    }
 }

@@ -5,6 +5,12 @@ pub const Fallback = enum { ask, deny };
 
 pub const Settings = struct {
     temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    top_k: ?u32 = null,
+    seed: ?u32 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
+    stop: ?[]const []const u8 = null,
     max_output_tokens: ?u32 = null,
     reasoning_effort: ?[]const u8 = null,
     attempts: ?u8 = null,
@@ -12,6 +18,15 @@ pub const Settings = struct {
 
     pub fn validate(self: Settings) !void {
         if (self.temperature) |v| if (!std.math.isFinite(v) or v < 0 or v > 2) return error.InvalidModelSettings;
+        if (self.top_p) |v| if (!std.math.isFinite(v) or v <= 0 or v > 1) return error.InvalidModelSettings;
+        if (self.top_k) |v| if (v == 0 or v > 1_048_576) return error.InvalidModelSettings;
+        inline for (.{ "frequency_penalty", "presence_penalty" }) |field| if (@field(self, field)) |v| {
+            if (!std.math.isFinite(v) or v < -2 or v > 2) return error.InvalidModelSettings;
+        };
+        if (self.stop) |values| {
+            if (values.len == 0 or values.len > 16) return error.InvalidModelSettings;
+            for (values) |value| if (value.len == 0 or value.len > 4096) return error.InvalidModelSettings;
+        }
         if (self.max_output_tokens) |v| if (v == 0 or v > 1_048_576) return error.InvalidModelSettings;
         if (self.attempts) |v| if (v == 0 or v > 4) return error.InvalidModelSettings;
         if (self.retry_delay_ms) |v| if (v > 60_000) return error.InvalidModelSettings;
@@ -32,6 +47,7 @@ pub const Settings = struct {
 pub const Route = struct {
     id: []const u8,
     provider: enum { openai, ollama },
+    protocol: enum { chat, responses, messages } = .chat,
     endpoint: []const u8,
     model: []const u8,
     context_limit: u32 = 0,
@@ -73,6 +89,7 @@ pub const Policy = struct {
             const uri = std.Uri.parse(value.endpoint) catch return error.InvalidModelRoute;
             if ((!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) or uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidModelRoute;
             for (self.routes[0..i]) |earlier| if (std.mem.eql(u8, earlier.id, value.id)) return error.DuplicateModelRoute;
+            if (value.provider == .ollama and value.protocol != .chat) return error.InvalidModelRoute;
             try value.settings.validate();
         }
         inline for (std.meta.tags(Purpose)) |purpose| {

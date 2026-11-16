@@ -9,6 +9,7 @@ const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
 const log_file = @import("log_file.zig");
 const retry = @import("retry.zig");
+const HttpHooks = @import("http_hooks.zig");
 const window = @import("window.zig");
 
 const OllamaProvider = @This();
@@ -17,6 +18,7 @@ allocator: std.mem.Allocator,
 io: std.Io,
 /// When a refused request is worth sending again.
 retries: retry.Policy = .{},
+last_status: std.http.Status = .ok,
 
 /// Base URL of the server, e.g. `http://localhost:11434`. Borrowed.
 host: []const u8,
@@ -394,60 +396,15 @@ fn describeErrorErased(ptr: *anyopaque, err: anyerror, allocator: std.mem.Alloca
     return self.describeError(err, allocator);
 }
 
-/// Ask the server to reject the request again, this time reading the body.
-fn captureRejection(self: *OllamaProvider, request: Ollama.ChatRequest) void {
+fn captureRejection(self: *OllamaProvider, body: []const u8) void {
     self.clearRejection();
-    self.rejection = self.readRejection(request) catch null;
+    const message = complaint(self.allocator, body);
+    self.rejection = self.allocator.dupe(u8, message[0..@min(message.len, max_rejection_bytes)]) catch null;
 }
 
-/// Drop the last complaint, so a later failure of a different kind is never
-/// explained with a stale one.
 fn clearRejection(self: *OllamaProvider) void {
     if (self.rejection) |old| self.allocator.free(old);
     self.rejection = null;
-}
-
-fn readRejection(self: *OllamaProvider, request: Ollama.ChatRequest) !?[]u8 {
-    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var payload: std.Io.Writer.Allocating = .init(arena);
-    var json: std.json.Stringify = .{
-        .writer = &payload.writer,
-        .options = .{ .emit_null_optional_fields = false },
-    };
-    try json.write(request);
-
-    const target = try std.fmt.allocPrint(arena, "{s}/api/chat", .{self.host});
-    const uri = try std.Uri.parse(target);
-
-    var client: std.http.Client = .{ .io = self.io, .allocator = arena };
-    defer client.deinit();
-
-    var req = try client.request(.POST, uri, .{
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = if (self.auth_value.len > 0) self.auth_header[0..1] else &.{},
-        .keep_alive = false,
-    });
-    defer req.deinit();
-
-    try req.sendBodyComplete(payload.written());
-
-    var redirect_buf: [0]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-
-    if (response.head.status == .ok) return null;
-
-    var transfer: [1024]u8 = undefined;
-    const body = try response.reader(&transfer).allocRemaining(
-        arena,
-        .limited(max_rejection_bytes),
-    );
-
-    const message = complaint(arena, body);
-    if (message.len == 0) return null;
-    return try self.allocator.dupe(u8, message);
 }
 
 /// The sentence out of an error body. Ollama answers `{"error": "..."}`; a proxy
@@ -552,14 +509,14 @@ fn waitAndRetry(
     sink: ?Provider.Sink,
 ) bool {
     if (attempt >= self.retries.attempts) return false;
-    if (!retry.transientText(why)) return false;
+    const eligible = retry.transient(self.last_status) or retry.transientText(why);
 
     if (sink) |s| {
         if (s.stopped(s.userdata)) return false;
     }
 
     const proposed = retry.waitMs(self.retries, attempt, null);
-    const wait = if (sink) |s| s.retryDelay(attempt, proposed) orelse return false else proposed;
+    const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = eligible, .delay_ms = proposed, .status = @intFromEnum(self.last_status), .error_type = "http_error", .error_message = why }) orelse return false else if (eligible) proposed else return false;
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
 
     if (sink) |s| {
@@ -682,6 +639,69 @@ test "a listed tag matches the model it was configured as" {
     try std.testing.expect(!sameModel("llama3:latest", "qwen3"));
 }
 
+const ChatStream = struct {
+    request: *std.http.Client.Request,
+    reader: *std.Io.Reader,
+    http: HttpHooks.Exchange,
+    scratch: std.heap.ArenaAllocator,
+
+    fn deinit(self: *ChatStream) void {
+        self.request.deinit();
+        self.scratch.deinit();
+    }
+
+    fn next(self: *ChatStream) !?Ollama.ChatResponse {
+        while (true) {
+            _ = self.scratch.reset(.retain_capacity);
+            const a = self.scratch.allocator();
+            const raw = try self.reader.takeDelimiter('\n') orelse return null;
+            const line = std.mem.trim(u8, raw, &std.ascii.whitespace);
+            if (line.len == 0) continue;
+            const adapted = (try self.http.payload(a, line, true)) orelse continue;
+            const value = try std.json.parseFromSliceLeaky(Ollama.ChatResponse, a, adapted, .{ .ignore_unknown_fields = true });
+            return value;
+        }
+    }
+};
+
+fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest, turn: Provider.Turn, input: @import("../core/hooks.zig").Invocation) !ChatStream {
+    const url = try std.fmt.allocPrint(a, "{s}/api/chat", .{std.mem.trimEnd(u8, self.host, "/")});
+    var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = input, .url = url, .protocol = "ollama", .stop = turn.stop };
+    const body = try std.json.Stringify.valueAlloc(a, request, .{ .emit_null_optional_fields = false });
+    const prepared = try http.request(a, body, .{ .content_type = .{ .override = "application/json" }, .accept_encoding = .{ .override = "identity" } }, if (self.auth_value.len > 0) self.auth_header[0..1] else &.{});
+    const req = try a.create(std.http.Client.Request);
+    req.* = try self.client.http_client.client.request(.POST, try std.Uri.parse(url), .{
+        .headers = prepared.headers,
+        .extra_headers = prepared.extra_headers,
+        .keep_alive = false,
+        .redirect_behavior = .not_allowed,
+    });
+    errdefer req.deinit();
+    try req.sendBodyComplete(prepared.body);
+    self.watch(req);
+    errdefer self.forgetSocket();
+    var redirect: [0]u8 = undefined;
+    var response = try req.receiveHead(&redirect);
+    const head = try http.response(a, response.head);
+    const transfer = try a.alloc(u8, 1024 * 1024);
+    const decompress = try a.create(std.http.Decompress);
+    const compressed: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .deflate, .gzip => try a.alloc(u8, 1024 * 1024),
+        .zstd => try a.alloc(u8, std.compress.zstd.default_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    const reader = response.readerDecompressing(transfer, decompress, compressed);
+    self.last_status = head.status;
+    if (head.status.class() != .success) {
+        const raw = try reader.allocRemaining(a, .limited(max_rejection_bytes));
+        const why = (try http.payload(a, raw, false)).?;
+        self.captureRejection(why);
+        return error.HttpError;
+    }
+    return .{ .request = req, .reader = reader, .http = http, .scratch = .init(self.allocator) };
+}
+
 /// Runs on a worker thread; blocking here is expected.
 fn respond(
     ptr: *anyopaque,
@@ -735,16 +755,15 @@ fn respond(
             .stream = true,
             .think = if (self.think) .{ .bool = true } else null,
             .tools = tools,
-            .options = .{ .num_ctx = self.requestedContext(), .temperature = turn.settings.temperature, .num_predict = turn.settings.max_output_tokens },
+            .options = .{ .num_ctx = self.requestedContext(), .temperature = turn.settings.temperature, .num_predict = turn.settings.max_output_tokens, .top_p = turn.settings.top_p, .top_k = turn.settings.top_k, .seed = turn.settings.seed, .frequency_penalty = turn.settings.frequency_penalty, .presence_penalty = turn.settings.presence_penalty, .stop = turn.settings.stop },
         };
 
-        break self.client.chat(request) catch |err| {
-            self.captureRejection(request);
+        break self.chat(arena, request, turn, hook_attempt.?.turn.hook_input) catch |err| {
             const why = self.rejection orelse "";
             hook_attempt.?.error_message = @errorName(err);
             hook_attempt.?.finish();
 
-            if (self.waitAndRetry(sends, why, sink)) {
+            if (err == error.HttpError and self.waitAndRetry(sends, why, sink)) {
                 sends += 1;
                 continue;
             }

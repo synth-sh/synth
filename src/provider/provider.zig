@@ -59,6 +59,7 @@ abort: ?*const fn (*anyopaque) void = null,
 /// own prompt would have to be told about agents to do it.
 pub const Turn = struct {
     backend: ?*@import("backend.zig") = null,
+    stop: ?*const std.atomic.Value(bool) = null,
     model_policy: @import("../core/model_policy.zig").Policy = .{},
     settings: @import("../core/model_policy.zig").Settings = .{},
     /// The system prompt, complete. Borrowed for the length of the call.
@@ -292,8 +293,17 @@ pub const Reply = struct {
 
 /// Where a provider pushes partial output as it arrives. Every callback runs on
 /// the worker thread, so implementations must be thread safe.
+pub const RetryInfo = struct {
+    attempt: usize,
+    allowed: bool,
+    delay_ms: u64,
+    status: u16 = 0,
+    error_type: []const u8 = "",
+    error_message: []const u8 = "",
+};
+
 pub const Sink = struct {
-    onRetry: ?*const fn (*anyopaque, usize, u64) ?u64 = null,
+    onRetry: ?*const fn (*anyopaque, RetryInfo) ?u64 = null,
 
     userdata: *anyopaque,
     /// A fragment of the model's thinking output.
@@ -311,8 +321,11 @@ pub const Sink = struct {
     /// early - otherwise quitting mid-turn blocks until the model is done.
     stopped: *const fn (*anyopaque) bool,
     pub fn retryDelay(self: Sink, attempt: usize, delay: u64) ?u64 {
-        if (self.onRetry) |callback| return callback(self.userdata, attempt, delay);
-        return delay;
+        return self.retryDecision(.{ .attempt = attempt, .allowed = true, .delay_ms = delay });
+    }
+    pub fn retryDecision(self: Sink, info: RetryInfo) ?u64 {
+        if (self.onRetry) |callback| return callback(self.userdata, info);
+        return if (info.allowed) info.delay_ms else null;
     }
 };
 

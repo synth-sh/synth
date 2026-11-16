@@ -12,6 +12,7 @@ const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
 const log_file = @import("log_file.zig");
 const retry = @import("retry.zig");
+const HttpHooks = @import("http_hooks.zig");
 const window = @import("window.zig");
 const responses = @import("responses.zig");
 const anthropic = @import("messages.zig");
@@ -555,13 +556,15 @@ fn respond(
         defer hook_attempt.finish();
         errdefer |err| hook_attempt.error_message = @errorName(err);
         if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
-        const body = try self.buildRequest(arena, convo, turn);
+        var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = hook_attempt.turn.hook_input, .url = url, .protocol = @tagName(self.wire), .stop = turn.stop };
+        const prepared = try http.request(arena, try self.buildRequest(arena, convo, turn), self.requestHeaders(true), self.extra_headers);
+        const body = prepared.body;
         // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
 
         var request = try self.client.request(.POST, uri, .{
-            .headers = self.requestHeaders(true),
-            .extra_headers = self.extra_headers,
+            .headers = prepared.headers,
+            .extra_headers = prepared.extra_headers,
             .redirect_behavior = .unhandled,
             .keep_alive = false,
         });
@@ -577,15 +580,17 @@ fn respond(
         try self.refuseRedirect(response.head);
 
         // Read before the body reader is built, which invalidates the head.
-        const sse = streamed(response.head.content_type);
-        const asked_for = retry.retryAfterMs(headerValue(response.head, "retry-after"));
+        const head = try http.response(arena, response.head);
+        const sse = streamed(head.get("content-type"));
+        const asked_for = retry.retryAfterMs(head.get("retry-after"));
 
         const transfer = try arena.alloc(u8, transfer_buffer_bytes);
         const reader = response.reader(transfer);
 
-        if (response.head.status.class() != .success) {
-            const why = reader.allocRemaining(arena, .limited(max_listing_bytes)) catch "";
-            self.captureRejection(response.head.status, why);
+        if (head.status.class() != .success) {
+            const raw = reader.allocRemaining(arena, .limited(max_listing_bytes)) catch "";
+            const why = (try http.payload(arena, raw, false)).?;
+            self.captureRejection(head.status, why);
             hook_attempt.error_message = if (Provider.mentionsOverflow(why)) "ContextTooLarge" else "HttpError";
             hook_attempt.finish();
             if (attempt < self.retries.attempts and self.retryWithout(why)) {
@@ -597,7 +602,7 @@ fn respond(
                 }
             }
 
-            if (self.waitAndRetry(response.head.status, attempt, asked_for, sink)) {
+            if (self.waitAndRetry(head.status, attempt, asked_for, sink)) {
                 attempt += 1;
                 continue;
             }
@@ -609,6 +614,7 @@ fn respond(
             var stream: responses.ResponseStream = .init(allocator, sink);
             defer stream.deinit();
             stream.provider_tag = self.state_tag;
+            stream.http = &http;
             if (!sse) return error.UnexpectedResponse;
             try stream.readEvents(arena, reader);
             if (stream.failure) |failure| {
@@ -624,6 +630,7 @@ fn respond(
         if (self.wire == .messages) {
             var stream: anthropic.Stream = .init(allocator, sink);
             defer stream.deinit();
+            stream.http = &http;
             if (sse) {
                 stream.readEvents(arena, reader) catch |err| {
                     if (stream.rejection.len > 0) self.captureRejection(.ok, stream.rejection);
@@ -643,6 +650,7 @@ fn respond(
         }
 
         var collector: Collector = .init(allocator, sink);
+        collector.http = &http;
         errdefer collector.deinit();
 
         if (sse) {
@@ -687,15 +695,14 @@ fn waitAndRetry(
     sink: ?Provider.Sink,
 ) bool {
     if (attempt >= self.retries.attempts) return false;
-    if (!retry.transient(status)) return false;
-    if (retry.tooLong(self.retries, retry_after_ms)) return false;
+    const eligible = retry.transient(status) and !retry.tooLong(self.retries, retry_after_ms);
 
     if (sink) |s| {
         if (s.stopped(s.userdata)) return false;
     }
 
     const proposed = retry.waitMs(self.retries, attempt, retry_after_ms);
-    const wait = if (sink) |s| s.retryDelay(attempt, proposed) orelse return false else proposed;
+    const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = eligible, .delay_ms = proposed, .status = @intFromEnum(status), .error_type = "http_error", .error_message = self.rejection orelse "" }) orelse return false else if (eligible) proposed else return false;
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
 
     if (sink) |s| {
@@ -723,6 +730,7 @@ fn streamed(content_type: ?[]const u8) bool {
 const Collector = struct {
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
+    http: ?*HttpHooks.Exchange = null,
     text: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(Pending) = .empty,
     usage: Provider.Usage = .{},
@@ -773,7 +781,8 @@ const Collector = struct {
             if (std.mem.eql(u8, payload, "[DONE]")) return;
 
             _ = scratch.reset(.retain_capacity);
-            const chunk = std.json.parseFromSliceLeaky(Chunk, scratch.allocator(), payload, .{
+            const prepared = if (self.http) |http| (try http.payload(scratch.allocator(), payload, true)) orelse continue else payload;
+            const chunk = std.json.parseFromSliceLeaky(Chunk, scratch.allocator(), prepared, .{
                 .ignore_unknown_fields = true,
             }) catch continue;
 
@@ -784,7 +793,8 @@ const Collector = struct {
     /// Fold a whole non-streamed body in, which carries `message` where a
     /// stream carries `delta`.
     fn readWhole(self: *Collector, arena: std.mem.Allocator, body: []const u8) !void {
-        const parsed = std.json.parseFromSliceLeaky(Chunk, arena, body, .{
+        const prepared = if (self.http) |http| (try http.payload(arena, body, false)).? else body;
+        const parsed = std.json.parseFromSliceLeaky(Chunk, arena, prepared, .{
             .ignore_unknown_fields = true,
         }) catch return error.UnexpectedResponse;
 
@@ -952,7 +962,9 @@ fn buildRequest(
     convo: *Conversation,
     turn: Provider.Turn,
 ) ![]u8 {
-    if (self.wire == .messages and turn.settings.reasoning_effort != null) return error.UnsupportedModelSettings;
+    if (self.wire == .chat and turn.settings.top_k != null) return error.UnsupportedModelSettings;
+    if (self.wire == .responses and (turn.settings.top_k != null or turn.settings.seed != null or turn.settings.frequency_penalty != null or turn.settings.presence_penalty != null or turn.settings.stop != null)) return error.UnsupportedModelSettings;
+    if (self.wire == .messages and (turn.settings.reasoning_effort != null or turn.settings.seed != null or turn.settings.frequency_penalty != null or turn.settings.presence_penalty != null or (turn.settings.temperature orelse 0) > 1)) return error.UnsupportedModelSettings;
     switch (self.wire) {
         .responses => return responses.buildRequest(.{
             .effort = turn.settings.reasoning_effort orelse "",
@@ -982,6 +994,11 @@ fn buildRequest(
     }
     if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
     if (turn.settings.max_output_tokens) |v| try w.print(",\"max_completion_tokens\":{d}", .{v});
+    inline for (.{ "top_p", "seed", "frequency_penalty", "presence_penalty" }) |field| if (@field(turn.settings, field)) |v| try w.print(",\"" ++ field ++ "\":{d}", .{v});
+    if (turn.settings.stop) |v| {
+        try w.writeAll(",\"stop\":");
+        try std.json.Stringify.value(v, .{}, w);
+    }
     if (self.send_stream_options) {
         try w.writeAll(",\"stream_options\":{\"include_usage\":true}");
     }

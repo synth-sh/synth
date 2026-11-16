@@ -14,6 +14,7 @@ const log_file = @import("log_file.zig");
 const OpenAI = @import("openai.zig");
 const Provider = @import("provider.zig");
 const retry = @import("retry.zig");
+const HttpHooks = @import("http_hooks.zig");
 const responses = @import("responses.zig");
 const Refusal = responses.Refusal;
 const Failure = responses.Failure;
@@ -461,21 +462,19 @@ fn respond(
 
         const token = try store.accessToken(arena);
         const authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
-        const body = try self.buildRequest(arena, convo, turn);
+        var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = hook_attempt.turn.hook_input, .url = responses_url, .protocol = "responses", .stop = turn.stop };
+        const extra_headers = self.requestHeaders();
+        const prepared = try http.request(arena, try self.buildRequest(arena, convo, turn), .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" }, .content_type = .{ .override = "application/json" } }, &extra_headers);
+        const body = prepared.body;
         // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
         const uri = std.Uri.parse(responses_url) catch return error.InvalidHost;
 
-        const extra_headers = self.requestHeaders();
         var request = try self.client.request(.POST, uri, .{
             .redirect_behavior = .not_allowed,
             .keep_alive = false,
-            .headers = .{
-                .authorization = .{ .override = authorization },
-                .accept_encoding = .{ .override = "identity" },
-                .content_type = .{ .override = "application/json" },
-            },
-            .extra_headers = &extra_headers,
+            .headers = prepared.headers,
+            .extra_headers = prepared.extra_headers,
         });
         defer {
             self.forgetSocket();
@@ -486,18 +485,20 @@ fn respond(
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
-        const retry_after = retry.retryAfterMs(OpenAI.headerValue(response.head, "retry-after"));
+        const head = try http.response(arena, response.head);
+        const retry_after = retry.retryAfterMs(head.get("retry-after"));
         const transfer = try arena.alloc(u8, transfer_buffer_bytes);
         const reader = response.reader(transfer);
 
-        if (response.head.status.class() != .success) {
-            const why = reader.allocRemaining(arena, .limited(max_body_bytes)) catch "";
-            self.captureRejection(response.head.status, why);
+        if (head.status.class() != .success) {
+            const raw = reader.allocRemaining(arena, .limited(max_body_bytes)) catch "";
+            const why = (try http.payload(arena, raw, false)).?;
+            self.captureRejection(head.status, why);
             const refusal = Refusal.parse(arena, why);
-            hook_attempt.error_message = @errorName(refusal.toError(response.head.status));
+            hook_attempt.error_message = @errorName(refusal.toError(head.status));
             hook_attempt.finish();
 
-            if (response.head.status == .unauthorized and !refreshed and attempt < self.retries.attempts) {
+            if (head.status == .unauthorized and !refreshed and attempt < self.retries.attempts) {
                 const wait = if (sink) |s| s.retryDelay(attempt, 0) else @as(?u64, 0);
                 if (wait) |delay| {
                     try std.Io.sleep(self.io, .fromMilliseconds(@intCast(delay)), .awake);
@@ -507,16 +508,17 @@ fn respond(
                     continue;
                 }
             }
-            if (refusal.isTemporary() and self.waitAndRetry(response.head.status, attempt, retry_after, sink)) {
+            if (self.waitAndRetry(head.status, attempt, retry_after, sink)) {
                 attempt += 1;
                 continue;
             }
             if (Provider.mentionsOverflow(why)) return error.ContextTooLarge;
-            return @as(anyerror!Provider.Reply, refusal.toError(response.head.status));
+            return @as(anyerror!Provider.Reply, refusal.toError(head.status));
         }
 
         var stream: ResponseStream = .init(allocator, sink);
         defer stream.deinit();
+        stream.http = &http;
         stream.readEvents(arena, reader) catch |err| {
             if (stream.failure) |failure| {
                 self.rememberFailure(failure);
@@ -551,13 +553,11 @@ fn waitAndRetry(
     sink: ?Provider.Sink,
 ) bool {
     if (attempt >= self.retries.attempts) return false;
-    if (status == .too_many_requests) return false;
-    if (!retry.transient(status)) return false;
-    if (retry.tooLong(self.retries, retry_after_ms)) return false;
+    const eligible = retry.transient(status) and !retry.tooLong(self.retries, retry_after_ms) and status != .too_many_requests;
     if (stopped(sink)) return false;
 
     const proposed = retry.waitMs(self.retries, attempt, retry_after_ms);
-    const wait = if (sink) |s| s.retryDelay(attempt, proposed) orelse return false else proposed;
+    const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = eligible, .delay_ms = proposed, .status = @intFromEnum(status), .error_type = "http_error", .error_message = self.rejection orelse "" }) orelse return false else if (eligible) proposed else return false;
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
     return !stopped(sink);
 }

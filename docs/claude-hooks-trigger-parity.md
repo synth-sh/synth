@@ -1,8 +1,8 @@
 # Claude Code hook trigger coverage
 
-Synth now exposes 34 events: 27 of the 33 event names in the
+Synth now exposes 37 events: 27 of the 33 event names in the
 [Claude Code hooks reference](https://code.claude.com/docs/en/hooks) checked on
-November 15, 2026, plus three synth-specific events. This is trigger coverage
+November 15, 2026, plus ten synth-specific events. This is trigger coverage
 for synth's existing features, not full Claude Code hook protocol or product
 parity. Payloads, allowed effects, handler types, and watching differ as
 specified in [Hooks](hooks.md).
@@ -90,7 +90,7 @@ Cwd and additional roots stay in the running session and are not stored as
 SQLite workspace configuration. Hook discovery and project instructions remain
 anchored to the original project; adding a root does not trust its hook files.
 
-Checked-in input/result fixtures cover all 34 registered synth events. Runtime
+Checked-in input/result fixtures cover all 37 registered synth events. Runtime
 regressions cover worker success/failure separation, full parallel and owner
 batches, atomic task gates, automatic permission denial, terminal provider
 errors, explicit model-switch denial, instruction cache loads, skill-expansion
@@ -111,3 +111,7 @@ they neither select an inference backend nor grant a hook additional authority.
 Four additional synth request customization stages (`ModelResolve`,
 `ModelSettings`, `ModelContext`, and `ModelRetry`) provide typed, synchronous
 controls alongside observational request-attempt events. See [hooks](hooks.md#model-request-customization).
+
+`PermissionEvaluate`, `HttpRequest`, and `HttpResponse` add policy evaluation
+and native inference HTTP adaptation. WebSocket and catalog transforms are not
+part of this interface.

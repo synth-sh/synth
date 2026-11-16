@@ -154,6 +154,7 @@ hook_pre_seq: ?u64 = null,
 hook_pre_index: usize = 0,
 hook_asks: std.ArrayList([]const u8) = .empty,
 hook_permission_index: usize = 0,
+hook_evaluate_index: usize = 0,
 hook_context: ?[]u8 = null,
 hook_session_started: bool = false,
 interrupted: bool = false,
@@ -1182,7 +1183,7 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.ask();
 }
 
-const HookPurpose = enum { prompt, steering, owner_post, tool_policy, permission, lifecycle, auto_denied, task_policy, expansion };
+const HookPurpose = enum { prompt, steering, owner_post, tool_policy, permission, evaluation, lifecycle, auto_denied, task_policy, expansion };
 
 const HookResume = enum { begin_prompt, ask_model, compact, compact_session, after_compact, finish_turn, config_idle, failed_turn };
 
@@ -1190,6 +1191,7 @@ fn resetHookCursors(self: *Loop) void {
     self.hook_pre_seq = null;
     self.hook_pre_index = 0;
     self.hook_permission_index = 0;
+    self.hook_evaluate_index = 0;
     self.hook_task_seq = null;
     self.hook_task_cursor = 0;
     self.hook_permission_notice = null;
@@ -1513,7 +1515,7 @@ fn pollOtherHooks(self: *Loop) !bool {
         try self.ask();
         return true;
     }
-    if (self.hook_purpose == .tool_policy or self.hook_purpose == .permission) {
+    if (self.hook_purpose == .tool_policy or self.hook_purpose == .permission or self.hook_purpose == .evaluation) {
         const message_index = self.pendingIndex() orelse return false;
         const index = self.hook_call_index;
         const call = &self.conversation.messages.items[message_index].tool_calls[index];
@@ -1554,7 +1556,11 @@ fn pollOtherHooks(self: *Loop) !bool {
                 _ = try self.anchorToolPaths(call);
                 try self.prepareAction(call);
             }
-            if (self.hook_purpose == .permission and dispatch.result.permission == .allow) try self.approve(call);
+            if (self.hook_purpose == .evaluation and dispatch.result.permission == .ask) {
+                try self.hook_asks.append(self.allocator, call.id);
+                self.hook_permission_index = @max(self.hook_permission_index, index + 1);
+            }
+            if ((self.hook_purpose == .permission or self.hook_purpose == .evaluation) and dispatch.result.permission == .allow) try self.approve(call);
         }
         try self.persistToolCall(message_index, index);
         try self.autoApprove();
@@ -1567,7 +1573,13 @@ fn startPolicyHook(self: *Loop, purpose: HookPurpose, index: usize) !void {
     const message_index = self.pendingIndex() orelse return;
     const call = self.conversation.messages.items[message_index].tool_calls[index];
     self.hook_dispatch = try self.dispatchHook(.{
-        .event = if (purpose == .tool_policy) .pre_tool_use else .permission_request,
+        .event = switch (purpose) {
+            .tool_policy => .pre_tool_use,
+            .evaluation => .permission_evaluate,
+            else => .permission_request,
+        },
+        .permission_effect = if (self.needsNoDecision(&call)) "allow" else "ask",
+        .action = call.prepared_action orelse "",
         .tool_name = call.name,
         .tool_input = call.arguments,
         .tool_call_id = call.id,
@@ -2065,7 +2077,7 @@ fn pollRequest(self: *Loop) !bool {
             return true;
         }
 
-        const detail = self.provider.explain(err, self.allocator) catch
+        const detail = request.provider.explain(err, self.allocator) catch
             try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
         defer self.allocator.free(detail);
 
@@ -2330,12 +2342,20 @@ fn autoApprove(self: *Loop) !void {
                 self.hook_pre_seq = self.pending_seq;
                 self.hook_pre_index = 0;
                 self.hook_permission_index = 0;
+                self.hook_evaluate_index = 0;
                 self.hook_asks.clearRetainingCapacity();
             }
             if (i >= self.hook_pre_index) {
                 self.hook_pre_index = i + 1;
                 if (runner.set.forEvent(.pre_tool_use).len > 0) {
                     try self.startPolicyHook(.tool_policy, i);
+                    return;
+                }
+            }
+            if (i >= self.hook_evaluate_index) {
+                self.hook_evaluate_index = i + 1;
+                if (runner.set.permission_evaluate.len > 0) {
+                    try self.startPolicyHook(.evaluation, i);
                     return;
                 }
             }
@@ -2350,7 +2370,11 @@ fn autoApprove(self: *Loop) !void {
         if (self.needsNoDecision(call)) try self.approve(call);
     }
 
-    if (self.firstPending() != null) {
+    if (self.firstPending()) |index| {
+        for (self.hook_asks.items) |id| if (std.mem.eql(u8, id, calls[index].id)) {
+            self.awaitApproval();
+            return;
+        };
         if (self.approvals == .auto) return self.judgeNext();
         self.awaitApproval();
         return;
@@ -7360,4 +7384,23 @@ test "unavailable reviewer uses configured denial and a bounded deadline" {
     try settle(&loop);
     try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "should-not-exist", .{}));
+}
+
+test "permission evaluation can deny normally allowed reads and force a human ask" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const deny: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_evaluate = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionEvaluate\",\"effect\":\"deny\",\"reason\":\"policy\"}}'" }} } };
+    loop.hooks = &deny;
+    try loop.submit("inspect", .{});
+    try settle(&loop);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    const ask_runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_evaluate = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionEvaluate\",\"effect\":\"ask\"}}'" }} } };
+    loop.hooks = &ask_runner;
+    loop.approvals = .auto;
+    try loop.submit("inspect again", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectEqual(@as(usize, 0), fixture.fake.judged);
 }

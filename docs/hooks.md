@@ -5,6 +5,8 @@ boundaries. The TUI, ACP, headless mode, and task subagents share the runtime.
 Commands run from the session working directory and receive one JSON object on
 stdin. The initial working directory is the project root.
 
+For a short overview, see [Features enabled by Synth hooks](hooks-features.md).
+
 ## Upgrade and trust
 
 **Existing hooks require a one-time review after this upgrade.** No declaration
@@ -607,9 +609,8 @@ makes review unavailable and follows the configured fallback. `request_settings`
 contains the prepared settings, and `route` names the selected route. Retry input
 also contains the current attempt, proposed delay, and `retry_allowed`.
 
-Retry hooks may cancel a retry or adjust its delay. The provider retains control
-of retry eligibility: no retry after streaming, no retry of permanent refusals,
-and no override of its attempt ceiling. These four stages reject asynchronous
+Retry hooks may cancel a retry, override HTTP-failure eligibility, or adjust its
+delay. The provider retains its attempt ceiling and prevents retries after streaming. These four stages reject asynchronous
 handlers; errors prevent that request or retry from proceeding.
 
 ## Authorization provenance and execution evidence
@@ -638,3 +639,119 @@ These checks are harness policy, not an OS sandbox. Shell commands and trusted
 hook commands still run with the process's permissions. Filesystem checks cannot
 make a path immutable against another process changing it between checking and
 opening it.
+
+## Context preparation and transport adapters
+
+`ModelResolve` receives the canonical `request_context` plus `request_system`,
+`request_instruction`, `request_tools`, and public `request_routes` metadata.
+A router can inspect previous tool failures and choose a permitted route for the
+next call. Route credentials are excluded. Selection remains request-scoped.
+
+`ModelContext` additionally accepts `requestContext`:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "ModelContext",
+    "requestContext": {
+      "system": "Request-specific instructions",
+      "tools": ["read", "glob", "grep"],
+      "messages": [
+        {"seq": 12, "text": "A shorter excerpt", "omit_images": true},
+        {"seq": 13, "omit_thinking": true, "omit_attachments": true},
+        {"seq": 14, "tool_results": [{"call_id": "call_7", "text": "Filtered result"}]}
+      ]
+    }
+  }
+}
+```
+
+All fields are optional. `instruction` replaces the one-off instruction.
+`messages` edits refer to stable sequence numbers. `omit: true` removes a plain
+message; removing an assistant tool-call message, tool result, or stored system
+summary is rejected to preserve exchange structure. Tool-result edits replace
+both the call's result and its corresponding result message. Edited messages
+lose stale provider replay state. Stored history and human authorization evidence
+remain unchanged. The selected tools must be a unique subset of the original
+tool definitions; calls to excluded tools are rejected even if a model emits them.
+Approval reviewer context remains immutable.
+
+Generation settings now also include `top_p`, `top_k`, `seed`,
+`frequency_penalty`, `presence_penalty`, and `stop`. Unsupported protocol settings
+fail before transport. Chat supports all of these except `top_k`; Responses
+supports `top_p`; Messages supports `top_p`, `top_k`, and `stop` (sent as
+`stop_sequences`); Ollama uses the corresponding native options. Existing
+ChatGPT/Copilot generation-override restrictions remain in force.
+
+`ModelRetry` receives `retry_allowed`, `retry_delay_ms`, `http_status`,
+`error_type`, and `error_message`. It may make an otherwise terminal HTTP failure
+retryable, veto a proposed retry, or adjust its delay. The configured attempt
+ceiling, cancellation, context-overflow recovery, and no-retry-after-output rules
+remain enforced by the provider.
+
+### HTTP adapters
+
+`HttpRequest` runs immediately before each inference HTTP send. `HttpResponse`
+runs at response headers and then for each complete JSON body or SSE/NDJSON
+record, before protocol parsing. Both use the standard scope/purpose filters and
+are synchronous. Hook errors stop the affected request.
+
+The `http` input is a JSON-encoded object containing `phase`, `method`, `url`,
+`protocol`, `status`, `headers`, `body`, and stream `index`. Phases are `request`,
+`headers`, `body`, and `event`. Protocols are `chat`, `responses`, `messages`, and
+`ollama`. Responses and Messages use SSE records; Ollama uses NDJSON records.
+Known credential headers appear as `<redacted>` in hook input.
+
+A request adapter can return:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "HttpRequest",
+    "http": {"headers": {"x-trace-id": "local-review-run"}}
+  }
+}
+```
+
+`http.headers` maps header names to strings, or null to remove a header. Returning
+`<redacted>` preserves the existing header. Request/body/event phases may return
+`http.body` as replacement JSON. The `headers` response phase accepts header
+changes and `http.status` (200–599, excluding redirects). An event may set
+`http.drop: true` to discard that record. Other phase/effect combinations fail.
+
+Adapters cannot change the destination URL, Host, connection framing headers,
+or the routed model. Redirects are refused. Changes to approval-reviewer bodies,
+status, or records are rejected. Adapters operate on inference calls, not model
+catalog discovery, OAuth, or tool web requests. They preserve streaming and do not
+expose arbitrary binary-body or WebSocket interception.
+
+These are trusted protocol adapters. A successful JSON rewrite does not establish
+that its tool-call ids, completion markers, or usage fields make protocol sense.
+All resulting tool proposals still pass tool admission, hook policies, and
+approval checks.
+
+### Permission evaluation
+
+`PermissionEvaluate` runs after pre-tool policy for each admitted call, including
+read-only and otherwise allowed calls. Input includes `permission_effect`
+(`allow` or `ask`) and the immutable prepared `action`. Return
+`hookSpecificOutput.effect` as `allow`, `ask`, or `deny`, with an optional `reason`.
+An explicit ask reaches the user even in automatic/all approval modes. A denial
+from admission, another handler, or `PreToolUse` remains final. This event cannot
+rewrite the action. `PermissionRequest` remains the separate hook for calls
+that still require an approval decision.
+
+### Handler composition and verification
+
+Matching handlers see the stage input snapshot. Outputs combine in declaration
+order: independent settings and HTTP headers merge, context edits append, and
+repeated tool selections intersect. The last supplied system/instruction, route,
+HTTP body, or scalar setting wins. Permission denials and retry vetoes dominate
+allowances. Stream drops cannot be undone by a later handler.
+
+Run `zig build test` for unit and regression coverage. Run
+`zig build test-hook-requests` for the built CLI against isolated, offline HTTP
+servers; this additional target requires Python 3 from the host. It checks actual
+request routing, settings and headers, context/canonical separation, blocked tool
+execution, Chat/Responses/Messages/Ollama adaptation, bounded retries, permission
+effects, and protected endpoint/model/reviewer boundaries.
