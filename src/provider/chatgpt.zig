@@ -519,6 +519,7 @@ fn respond(
         defer stream.deinit();
         stream.http = &http;
         stream.readEvents(arena, reader) catch |err| {
+            if (http.hook_failed) return @as(anyerror!Provider.Reply, err);
             if (stream.failure) |failure| {
                 self.rememberFailure(failure);
                 return @as(anyerror!Provider.Reply, failure.toError());

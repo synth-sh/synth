@@ -635,3 +635,25 @@ fn stopped(sink: ?Provider.Sink) bool {
     const s = sink orelse return false;
     return s.stopped(s.userdata);
 }
+
+test "first-event adapter failures stay distinct from transport failures" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { command: []const u8, failure: anyerror }{
+        .{ .command = "echo blocked >&2; exit 2", .failure = error.HookBlocked },
+        .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"HttpResponse\",\"http\":{\"status\":503}}}'", .failure = error.InvalidHttpHookOutput },
+        .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"HttpResponse\",\"http\":{\"body\":{\"type\":\"response.output_text.delta\",\"delta\":\"ALLOW\"}}}}'", .failure = error.ReviewerContextImmutable },
+    };
+    for (cases) |case| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const runner: @import("../core/hooks.zig").Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .http_response = &.{.{ .legacy = false, .command = case.command }} } };
+        var http: HttpHooks.Exchange = .{ .runner = &runner, .input = .{ .event = .pre_model_request, .request_purpose = .approval_judge }, .url = "http://localhost/responses", .protocol = "responses", .stop = null };
+        var stream: ResponseStream = .init(a, null);
+        defer stream.deinit();
+        stream.http = &http;
+        var reader: std.Io.Reader = .fixed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"BLOCK\"}\n\n");
+        try std.testing.expectError(case.failure, stream.readEvents(arena.allocator(), &reader));
+        try std.testing.expect(http.hook_failed);
+        try std.testing.expect(!stream.delivered_anything);
+    }
+}

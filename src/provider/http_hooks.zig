@@ -27,6 +27,7 @@ pub const Exchange = struct {
     stop: ?*const std.atomic.Value(bool),
     head: Head = .{ .status = .ok, .headers = &.{} },
     index: usize = 0,
+    hook_failed: bool = false,
 
     pub fn enabled(self: Exchange, a: std.mem.Allocator, event: Hooks.Event) bool {
         const runner = self.runner orelse return false;
@@ -113,6 +114,7 @@ pub const Exchange = struct {
     }
 
     pub fn payload(self: *Exchange, a: std.mem.Allocator, body: []const u8, streaming: bool) !?[]const u8 {
+        errdefer self.hook_failed = true;
         defer self.index += 1;
         if (!self.enabled(a, .http_response)) return body;
         const input = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch std.json.Value{ .string = body };
