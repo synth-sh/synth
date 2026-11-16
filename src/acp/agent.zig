@@ -383,6 +383,9 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     } else if (eql(u8, method, m.load_tool_result)) {
         const asked = try rpc.parse(synth.LoadToolResult, arena, params);
         return connection.reply(id, try session.loadToolResult(arena, asked.seq, asked.call));
+    } else if (eql(u8, method, m.load_image)) {
+        const asked = try rpc.parse(synth.LoadImage, arena, params);
+        return connection.reply(id, try session.loadImage(arena, asked.seq, asked.index));
     } else if (eql(u8, method, m.load_attachment)) {
         const asked = try rpc.parse(synth.LoadAttachment, arena, params);
         return connection.reply(id, try session.loadAttachment(arena, asked.seq, asked.index));
@@ -945,6 +948,7 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownTool => "no such tool",
         error.EmptyAllowance => "an allowance needs a pattern",
         error.UnknownAttachment => "no such attachment",
+        error.UnknownImage => "no such image",
         error.NoTranscript => "that call left no transcript",
         error.StillConnecting => "still connecting - try again in a moment",
         error.NoMcpState => "nowhere to keep MCP state, so this cannot be remembered",
@@ -2186,6 +2190,15 @@ const Session = struct {
         return try self.agent.options.db.loadToolResult(arena, session_id, @intCast(seq), index) orelse error.UnknownToolCall;
     }
 
+    fn loadImage(self: *Session, arena: std.mem.Allocator, seq: u64, index: u32) ![]const u8 {
+        if (self.held(seq)) |msg| {
+            if (index < msg.images.len) return msg.images[index];
+        }
+        if (seq > std.math.maxInt(i64)) return error.UnknownImage;
+        const session_id = self.stack.loop.session_id orelse return error.UnknownImage;
+        return try self.agent.options.db.loadImage(arena, session_id, @intCast(seq), index) orelse error.UnknownImage;
+    }
+
     fn loadAttachment(self: *Session, arena: std.mem.Allocator, seq: u64, index: u32) ![]const u8 {
         if (self.held(seq)) |msg| {
             if (index >= msg.attachments.len) return error.UnknownAttachment;
@@ -2986,12 +2999,18 @@ test "a prompt sent while busy steers the turn, and both are answered when it en
     try client.initialize(true);
     const session = (try client.open(fixture.project)).sessionId;
 
+    const arena = client.arena.allocator();
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ fixture.project, "steered file.txt" }),
+        .data = "a steered file",
+    });
+
     fixture.script.gate.reset();
     const first = try client.prompt(session, "make a note");
     const second = try client.request(protocol.method.session_prompt, .{
         .sessionId = session,
         .prompt = .{
-            .{ .type = "text", .text = "and this" },
+            .{ .type = "text", .text = "and this @\"steered file.txt\"" },
             .{ .type = "resource", .resource = .{ .uri = "pasted", .text = "a long paste" } },
         },
     });
@@ -3006,9 +3025,11 @@ test "a prompt sent while busy steers the turn, and both are answered when it en
     const steered = while (true) {
         const message = try client.awaitMethod(synth.method.appended);
         const appended = try rpc.parse(synth.Appended, client.arena.allocator(), message.params);
-        if (std.mem.eql(u8, appended.message.text, "and this")) break appended.message;
+        if (std.mem.eql(u8, appended.message.text, "and this @\"steered file.txt\"")) break appended.message;
     };
-    try testing.expectEqualStrings("a long paste", steered.attachments[0].content);
+    try testing.expectEqual(2, steered.attachments.len);
+    try testing.expectEqualStrings("a steered file", steered.attachments[0].content);
+    try testing.expectEqualStrings("a long paste", steered.attachments[1].content);
     try client.choose((try client.awaitPermission()).id, "deny");
     try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(first));
     try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(second));

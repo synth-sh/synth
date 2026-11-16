@@ -51,6 +51,7 @@ pub const method = struct {
     pub const models_updated = "_synth/models_updated";
     pub const load_tool_result = "_synth/load_tool_result";
     pub const load_attachment = "_synth/load_attachment";
+    pub const load_image = "_synth/load_image";
     pub const load_thinking = "_synth/load_thinking";
     pub const subagent = "_synth/subagent";
     pub const page_history = "_synth/page_history";
@@ -107,6 +108,8 @@ pub const Message = struct {
     tool_name: ?[]const u8 = null,
     tool_call_id: ?[]const u8 = null,
     attachments: []const Attachment = &.{},
+    /// Includes images whose bodies are only available through load_image.
+    image_count: u32 = 0,
 
     /// Borrows `msg`'s strings; only the arrays are allocated.
     pub fn from(arena: std.mem.Allocator, msg: *const Conversation.Message) !Message {
@@ -128,6 +131,7 @@ pub const Message = struct {
         };
         return .{
             .seq = msg.seq,
+            .image_count = @max(msg.image_count, @as(u32, @intCast(msg.images.len))),
             .role = msg.role,
             .text = msg.text,
             .thinking = msg.thinking,
@@ -164,6 +168,7 @@ pub const Message = struct {
         };
         const view: Conversation.Message = .{
             .seq = self.seq,
+            .image_count = self.image_count,
             .role = self.role,
             .text = self.text,
             .thinking = self.thinking,
@@ -364,6 +369,7 @@ pub const ConnectProvider = struct {
 pub const ToggleMcp = struct { sessionId: []const u8, name: []const u8 };
 pub const ListModels = struct { sessionId: []const u8, recent: u32 = 5 };
 pub const LoadToolResult = struct { sessionId: []const u8, seq: u64, call: u32 };
+pub const LoadImage = struct { sessionId: []const u8, seq: u64, index: u32 };
 pub const LoadAttachment = struct { sessionId: []const u8, seq: u64, index: u32 };
 pub const LoadThinking = struct { sessionId: []const u8, seq: u64 };
 pub const Subagent = struct { sessionId: []const u8, seq: u64, call: u32 };
