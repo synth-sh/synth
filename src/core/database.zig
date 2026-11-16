@@ -1067,7 +1067,8 @@ pub fn loadMessages(
     limit: usize,
 ) ![]Conversation.Message {
     var rows = try self.conn.rows(
-        \\SELECT id, seq, role, text, thinking_ms, thinking_bytes, tool_call_id, tool_name
+        \\SELECT id, seq, role, text, thinking_ms, thinking_bytes, tool_call_id, tool_name,
+        \\  (SELECT count(*) FROM blob WHERE message_id = message.id AND kind = 'image')
         \\FROM message
         \\WHERE session_id = ? AND seq < ?
         \\ORDER BY seq DESC
@@ -1097,6 +1098,7 @@ pub fn loadMessages(
             .text = text,
             .thinking_ms = thinking_ms,
             .thinking_bytes = thinking_bytes,
+            .image_count = @intCast(row.int(8)),
         };
         errdefer msg.deinit(allocator);
         if (row.nullableText(6)) |call_id| msg.tool_call_id = try allocator.dupe(u8, call_id);
@@ -1116,14 +1118,9 @@ pub fn loadMessages(
         msg.tool_calls = try self.loadToolCalls(allocator, id);
         msg.attachments = try self.loadAttachments(allocator, id);
 
-        if (!loaded_images) {
-            const images = try self.loadImages(allocator, id);
-            if (images.len > 0) {
-                msg.images = images;
-                loaded_images = true;
-            } else {
-                allocator.free(images);
-            }
+        if (!loaded_images and msg.image_count > 0) {
+            msg.images = try self.loadImages(allocator, id);
+            loaded_images = true;
         }
 
         try messages.append(allocator, msg);
@@ -1243,6 +1240,15 @@ pub fn loadAttachment(
         \\SELECT a.body FROM attachment a JOIN message m ON a.message_id = m.id
         \\WHERE m.session_id = ? AND m.seq = ? AND a.seq = ?
     , .{ session_id, seq, attachment_seq }) orelse return null;
+    defer row.deinit();
+    return try allocator.dupe(u8, row.text(0));
+}
+
+pub fn loadImage(self: *Database, allocator: std.mem.Allocator, session_id: i64, seq: i64, index: i64) !?[]const u8 {
+    const row = try self.conn.row(
+        \\SELECT b.body FROM blob b JOIN message m ON b.message_id = m.id
+        \\WHERE m.session_id = ? AND m.seq = ? AND b.kind = 'image' AND b.seq = ?
+    , .{ session_id, seq, index }) orelse return null;
     defer row.deinit();
     return try allocator.dupe(u8, row.text(0));
 }
@@ -2545,4 +2551,34 @@ test "recent sessions come from every project, and only those with anything in t
             try std.testing.expectEqual(@as(u64, 1), info.messages);
         }
     }
+}
+
+test "image metadata survives eviction and image loading is session scoped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/images.db", .{buf[0..n]});
+    defer std.testing.allocator.free(path);
+    var db = try init(std.testing.allocator, std.testing.io, path);
+    defer db.deinit();
+    const project = try db.resolveProject("/tmp/images", "git", "images");
+    const session = try db.createSession(project, "/tmp/images", "test");
+    const other = try db.createSession(project, "/tmp/images", "test");
+    for (0..2) |seq| {
+        const message = try db.appendMessage(session, @intCast(seq), "user", "image", null, 0, null);
+        try db.appendBlob(message, 0, "image", "aW1hZ2U=");
+    }
+    const messages = try db.loadMessages(std.testing.allocator, session, 10, 10);
+    defer {
+        for (messages) |*msg| msg.deinit(std.testing.allocator);
+        std.testing.allocator.free(messages);
+    }
+    try std.testing.expectEqual(1, messages[1].image_count);
+    try std.testing.expectEqual(0, messages[1].images.len);
+    const image_body = (try db.loadImage(std.testing.allocator, session, 0, 0)).?;
+    defer std.testing.allocator.free(image_body);
+    try std.testing.expectEqualStrings("aW1hZ2U=", image_body);
+    try std.testing.expect(try db.loadImage(std.testing.allocator, other, 0, 0) == null);
+    try std.testing.expect(try db.loadImage(std.testing.allocator, session, 0, 1) == null);
 }

@@ -148,9 +148,9 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     /// Files referenced by `@path` in this message. User messages only.
     attachments: []Attachment = &.{},
-    /// Base64-encoded images pasted with this message. User messages only, and
-    /// memory-only: nothing persists them yet.
+    /// Base64-encoded images retained for the active context.
     images: [][]const u8 = &.{},
+    image_count: u32 = 0,
     /// What the provider asked to have replayed with this turn. Assistant
     /// messages only; see `Provider.Reply.provider_state`.
     provider_state: ?[]const u8 = null,
@@ -182,6 +182,7 @@ pub const Message = struct {
             .role = self.role,
             .text = try allocator.dupe(u8, self.text),
             .thinking_ms = self.thinking_ms,
+            .image_count = @max(self.image_count, @as(u32, @intCast(self.images.len))),
             .thinking_bytes = if (self.thinking_bytes > 0) self.thinking_bytes else (if (self.thinking) |t| t.len else 0),
         };
         errdefer owned.deinit(allocator);

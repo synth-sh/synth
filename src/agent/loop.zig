@@ -851,6 +851,21 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
 }
 
 fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
+    try self.recordUserPrompt(prompt, extras);
+    self.steps = 0;
+    self.recovered_from_overflow = false;
+    self.repeats = 0;
+    self.outcome = null;
+    self.turn_start_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
+    self.turn_started_ms = tool.monotonicMilliseconds(self.io);
+    self.turn_tokens = 0;
+    if (self.last_calls) |calls| self.allocator.free(calls);
+    self.last_calls = null;
+    self.last_error = null;
+    try self.ask();
+}
+
+fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
     var mentioned: mention.Resolved =
         mention.resolve(self.allocator, self.io, self.project_root, prompt) catch .{};
     defer mentioned.deinit(self.allocator);
@@ -868,17 +883,6 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
 
     _ = try self.conversation.addUser(prompt, attachments, images);
     try self.persistMessage(self.conversation.messages.items.len - 1);
-    self.steps = 0;
-    self.recovered_from_overflow = false;
-    self.repeats = 0;
-    self.outcome = null;
-    self.turn_start_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
-    self.turn_started_ms = tool.monotonicMilliseconds(self.io);
-    self.turn_tokens = 0;
-    if (self.last_calls) |calls| self.allocator.free(calls);
-    self.last_calls = null;
-    self.last_error = null;
-    try self.ask();
 }
 
 fn pollPromptHooks(self: *Loop) !bool {
@@ -1034,8 +1038,7 @@ fn applySteering(self: *Loop) !void {
     while (self.steering.items.len > 0) {
         var pending = self.steering.orderedRemove(0);
         defer pending.deinit(self.allocator);
-        _ = try self.conversation.addUser(pending.prompt, pending.attachments, pending.images);
-        try self.persistMessage(self.conversation.messages.items.len - 1);
+        try self.recordUserPrompt(pending.prompt, pending.asExtras());
     }
 }
 
