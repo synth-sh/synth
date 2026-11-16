@@ -575,8 +575,8 @@ transport attempts, including retries.
 | --- | --- | --- |
 | `ModelResolve` | Once before preparing a request | `route`: a configured route id |
 | `ModelSettings` | After selecting the route | `settings`: supported generation and retry settings |
-| `ModelContext` | After settings, before serialization | `contextEdits`: `[{"seq":42,"text":"replacement"}]` |
-| `ModelRetry` | Before a retryable, unstreamed failure is retried | `retryAllowed`: boolean; `retryDelayMs`: 0–60000 |
+| `ModelContext` | After settings, before serialization | `requestContext` or legacy `contextEdits`: `[{"seq":42,"text":"replacement"}]` |
+| `ModelRetry` | After an HTTP failure, before a permitted further attempt | `retryAllowed`: boolean; `retryDelayMs`: 0–60000 |
 
 For example, an approved policy handler can respond with:
 
@@ -610,8 +610,9 @@ contains the prepared settings, and `route` names the selected route. Retry inpu
 also contains the current attempt, proposed delay, and `retry_allowed`.
 
 Retry hooks may cancel a retry, override HTTP-failure eligibility, or adjust its
-delay. The provider retains its attempt ceiling and prevents retries after streaming. These four stages reject asynchronous
-handlers; errors prevent that request or retry from proceeding.
+delay. The provider retains its attempt ceiling and prevents retries after
+streaming. These four stages reject asynchronous handlers; errors prevent that
+request or retry from proceeding.
 
 ## Authorization provenance and execution evidence
 
@@ -748,6 +749,9 @@ order: independent settings and HTTP headers merge, context edits append, and
 repeated tool selections intersect. The last supplied system/instruction, route,
 HTTP body, or scalar setting wins. Permission denials and retry vetoes dominate
 allowances. Stream drops cannot be undone by a later handler.
+Null optional outputs leave earlier values unchanged. HTTP events contain their
+wire body and identity metadata; they omit the separate model-context snapshot
+so streamed records do not repeatedly copy the conversation.
 
 Run `zig build test` for unit and regression coverage. Run
 `zig build test-hook-requests` for the built CLI against isolated, offline HTTP

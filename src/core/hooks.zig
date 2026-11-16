@@ -1084,6 +1084,12 @@ pub const Runner = struct {
                 }
             }
         }
+        if (invocation.event.requestStage()) {
+            if (result.blocked) |blocked| {
+                if (self.runtime) |runtime| try runtime.notice(blocked);
+                return error.HookBlocked;
+            }
+        }
         return result;
     }
 
@@ -2017,5 +2023,15 @@ test "request and permission mutation stages fail closed on malformed handler ou
             result.deinit(a);
             return error.MalformedHookWasAccepted;
         } else |_| {}
+    }
+}
+
+test "request mutation stages stop on blocking command exits" {
+    const a = std.testing.allocator;
+    inline for (.{ Event.model_resolve, Event.model_context, Event.model_settings, Event.model_retry, Event.http_request, Event.http_response }) |event| {
+        var set: Set = .{};
+        @field(set, @tagName(event)) = &.{.{ .legacy = false, .command = "echo blocked >&2; exit 2" }};
+        const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = set };
+        try std.testing.expectError(error.HookBlocked, runner.evaluate(a, .{ .event = event }));
     }
 }

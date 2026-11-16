@@ -40,6 +40,7 @@ pub const Exchange = struct {
         runner.stop = self.stop;
         var input = self.input;
         input.event = if (std.mem.eql(u8, phase, "request")) .http_request else .http_response;
+        inline for (.{ "request_context", "request_system", "request_instruction", "request_tools", "request_routes" }) |field| @field(input, field) = "";
         if (!runner.hasMatching(a, input, false)) return null;
         var visible: std.json.ObjectMap = .empty;
         for (headers) |header| try visible.put(a, header.name, .{ .string = if (sensitive(header.name)) "<redacted>" else header.value });
@@ -83,6 +84,11 @@ pub const Exchange = struct {
             try updateHeaders(a, &all, overrides);
             inline for (std.meta.fields(std.http.Client.Request.Headers)) |field| {
                 if (@field(adjusted, field.name) == .override) @field(adjusted, field.name) = .omit;
+                var entries = overrides.object.iterator();
+                while (entries.next()) |entry| {
+                    if (entry.value_ptr.* == .string and std.mem.eql(u8, entry.value_ptr.string, "<redacted>")) continue;
+                    if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, try headerName(a, field.name))) @field(adjusted, field.name) = .omit;
+                }
             }
         } else return .{ .body = prepared, .headers = headers, .extra_headers = extra };
         return .{ .body = prepared, .headers = adjusted, .extra_headers = all.items };

@@ -77,12 +77,13 @@ fn combine(allocator: std.mem.Allocator, before: []const u8, after: []const u8, 
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             const value = entry.value_ptr.*;
+            if (value == .null) continue;
             if (lhs.object.getPtr(key)) |old| {
                 if (std.mem.eql(u8, key, "messages")) {
                     try old.array.appendSlice(value.array.items);
                     continue;
                 }
-                if (std.mem.eql(u8, key, "tools")) {
+                if (std.mem.eql(u8, key, "tools") and old.* == .array and value == .array) {
                     var kept: std.array_list.Managed(std.json.Value) = .init(a);
                     for (old.array.items) |candidate| {
                         for (value.array.items) |allowed| if (std.mem.eql(u8, candidate.string, allowed.string)) {
@@ -334,4 +335,20 @@ test "request handler outputs compose without losing restrictions or independent
     const http = try std.json.parseFromSlice(std.json.Value, a, result.http.?, .{});
     defer http.deinit();
     try std.testing.expectEqual(@as(usize, 2), http.value.object.get("headers").?.object.count());
+}
+
+test "null optional context fields do not erase restrictions during composition" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |reverse| {
+        var result: Result = .{};
+        defer result.deinit(a);
+        const nullable: Result = .{ .request_context = @constCast("{\"tools\":null,\"system\":null}") };
+        const selected: Result = .{ .request_context = @constCast("{\"tools\":[\"read\"],\"system\":\"prepared\"}") };
+        try result.merge(a, if (reverse) selected else nullable);
+        try result.merge(a, if (reverse) nullable else selected);
+        const parsed = try std.json.parseFromSlice(@import("request_context.zig").Patch, a, result.request_context.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("read", parsed.value.tools.?[0]);
+        try std.testing.expectEqualStrings("prepared", parsed.value.system.?);
+    }
 }

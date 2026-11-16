@@ -2370,11 +2370,7 @@ fn autoApprove(self: *Loop) !void {
         if (self.needsNoDecision(call)) try self.approve(call);
     }
 
-    if (self.firstPending()) |index| {
-        for (self.hook_asks.items) |id| if (std.mem.eql(u8, id, calls[index].id)) {
-            self.awaitApproval();
-            return;
-        };
+    if (self.firstPending() != null) {
         if (self.approvals == .auto) return self.judgeNext();
         self.awaitApproval();
         return;
@@ -2416,6 +2412,10 @@ fn judgeNext(self: *Loop) !void {
     const calls = self.conversation.messages.items[message_index].tool_calls;
     for (calls, 0..) |*call, index| {
         if (call.status != .pending) continue;
+        for (self.hook_asks.items) |id| if (std.mem.eql(u8, id, call.id)) {
+            self.awaitApproval();
+            return;
+        };
         if (self.editsInside(call)) {
             try self.approve(call);
             continue;
@@ -7403,4 +7403,26 @@ test "permission evaluation can deny normally allowed reads and force a human as
     try settle(&loop);
     try testing.expectEqual(State.awaiting_approval, loop.state);
     try testing.expectEqual(@as(usize, 0), fixture.fake.judged);
+}
+
+test "automatic review cannot bypass a later call requiring human approval" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+    loop.auto_approve_safe = false;
+    fixture.fake.parallel_calls = 2;
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch requires-approval\"}";
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_evaluate = &.{.{ .legacy = false, .command =
+        \\read payload; case "$payload" in *'"tool_call_id":"fake-2"'*) printf '%s' '{"hookSpecificOutput":{"hookEventName":"PermissionEvaluate","effect":"ask"}}';; esac
+    }} } };
+    loop.hooks = &runner;
+    try loop.submit("inspect only", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
+    try testing.expectEqualStrings("fake-2", loop.pendingCall().?.id);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "requires-approval", .{}));
 }

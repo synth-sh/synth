@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 
 BINARY = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "zig-out/bin/synth"
 
@@ -29,6 +30,11 @@ def tool(name, arguments):
 @contextlib.contextmanager
 def session(name, respond, logic="", events=(), protocol="chat", attempts=2, extra_hooks=None):
     requests = []
+    errors = []
+
+    class Server(http.server.ThreadingHTTPServer):
+        def handle_error(self, *_):
+            errors.append(traceback.format_exc())
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -43,7 +49,7 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             self.wfile.write(body)
 
         def do_POST(self):
-            packet = {"path": self.path, "headers": dict(self.headers), "body": json.loads(self.rfile.read(int(self.headers["Content-Length"])))}
+            packet = {"path": self.path, "headers": dict(self.headers), "raw_headers": list(self.headers.items()), "body": json.loads(self.rfile.read(int(self.headers["Content-Length"])))}
             requests.append(packet)
             status, value, content_type = respond(packet, requests)
             body = value.encode() if isinstance(value, str) else json.dumps(value).encode()
@@ -53,7 +59,7 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             self.end_headers()
             self.wfile.write(body)
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = Server(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -88,6 +94,7 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             result = run("run", "--allow", "route-me canonical human request")
             log = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()] if (root / "events.jsonl").exists() else []
             assert all("forbidden" not in packet["path"] for packet in requests), requests
+            assert not errors, '\n'.join(errors)
             yield root, result, requests, log
     finally:
         server.shutdown()
@@ -129,7 +136,9 @@ elif e=='ModelSettings':
     print('PASS request routing, private route metadata, context/system/tool filtering, generation settings, canonical provenance')
 
     adapter = """
-h=json.loads(p['http'])
+if e in ('HttpRequest','HttpResponse'):
+ assert all(p[key]=='' for key in ('request_context','request_system','request_instruction','request_tools','request_routes'))
+ h=json.loads(p['http'])
 if e=='HttpRequest':
  assert h['headers'].get('authorization',h['headers'].get('Authorization'))=='<redacted>'
  body=h['body']; body['adapter_marker']='present'
@@ -154,12 +163,26 @@ elif e=='HttpResponse' and h['phase'] in ('event','body'):
             end = {'type': 'response.completed', 'response': {'usage': {'input_tokens': 8, 'output_tokens': 2}}} if protocol == 'responses' else {'type': 'message_stop'} if protocol == 'messages' else {'message': {'role': 'assistant', 'content': ''}, 'done': True, 'prompt_eval_count': 8, 'eval_count': 2}
             prefix = 'data: ' if protocol != 'ollama' else ''
             return 200, ''.join(prefix + json.dumps(item) + '\n\n' for item in (body, end)), 'text/event-stream' if protocol != 'ollama' else 'application/x-ndjson'
-        with session(f"wire-{protocol}", adapted, adapter, ('HttpRequest', 'HttpResponse'), protocol=protocol) as (_, result, requests, log):
+        with session(f"wire-{protocol}", adapted, adapter, ('ModelResolve', 'ModelContext', 'HttpRequest', 'HttpResponse'), protocol=protocol) as (_, result, requests, log):
             assert result.returncode == 0, (result.stdout, result.stderr)
             expect(result, f'{protocol} adapted')
             assert len(requests) == 1
             assert any(json.loads(item['http'])['phase'] == 'headers' for item in log if item['hook_event_name'] == 'HttpResponse')
     print('PASS native Chat body, Responses SSE, Messages SSE, Ollama NDJSON adapters and request headers')
+
+    for value in ('custom-agent', None):
+        logic = "out={'http':{'headers':{'User-Agent':" + repr(value) + "}}}"
+        with session('standard-header', lambda *_: chat(), logic, ('HttpRequest',)) as (_, result, requests, _):
+            assert result.returncode == 0, result.stderr
+            values = [value for name, value in requests[0]['raw_headers'] if name.lower() == 'user-agent']
+            assert values == ([] if value is None else [value]), values
+    for event in ('ModelResolve', 'ModelContext', 'ModelSettings', 'HttpRequest', 'HttpResponse'):
+        hooks = lambda _, event=event: {event: [{'hooks': [{'command': 'echo adapter-blocked >&2; exit 2'}]}]}
+        with session('blocked-stage', lambda *_: chat('must-not-appear'), extra_hooks=hooks) as (_, result, requests, _):
+            assert len(requests) == (1 if event == 'HttpResponse' else 0)
+            expect(result, 'HookBlocked')
+            assert 'must-not-appear' not in result.stdout
+    print('PASS standard header replacement/removal, request-stage blockers, and bounded HTTP event payloads')
 
     retry = """
 if e=='ModelRetry':
