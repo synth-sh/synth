@@ -594,15 +594,14 @@ fn respond(
             hook_attempt.error_message = if (Provider.mentionsOverflow(why)) "ContextTooLarge" else "HttpError";
             hook_attempt.finish();
             if (attempt < self.retries.attempts and self.retryWithout(why)) {
-                const wait = if (sink) |s| s.retryDelay(attempt, 0) else @as(?u64, 0);
+                const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = "http_error", .error_message = why }) else @as(?u64, 0);
                 if (wait) |delay| {
                     try std.Io.sleep(self.io, .fromMilliseconds(@intCast(delay)), .awake);
+                    self.clearRejection();
                     attempt += 1;
                     continue;
                 }
-            }
-
-            if (self.waitAndRetry(head.status, attempt, asked_for, sink)) {
+            } else if (self.waitAndRetry(head.status, attempt, asked_for, sink)) {
                 attempt += 1;
                 continue;
             }
@@ -676,7 +675,6 @@ fn retryWithout(self: *OpenAIProvider, why: []const u8) bool {
     if (!self.send_stream_options) return false;
     if (!containsIgnoreCase(why, "stream_options")) return false;
     self.send_stream_options = false;
-    self.clearRejection();
     return true;
 }
 

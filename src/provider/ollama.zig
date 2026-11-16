@@ -694,7 +694,7 @@ fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest
     const reader = response.readerDecompressing(transfer, decompress, compressed);
     self.last_status = head.status;
     if (head.status.class() != .success) {
-        const raw = try reader.allocRemaining(a, .limited(max_rejection_bytes));
+        const raw = reader.allocRemaining(a, .limited(4 * 1024 * 1024)) catch "";
         const why = (try http.payload(a, raw, false)).?;
         self.captureRejection(why);
         return error.HttpError;

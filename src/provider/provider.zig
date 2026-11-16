@@ -320,9 +320,6 @@ pub const Sink = struct {
     /// killed, so a provider that streams must check between chunks and return
     /// early - otherwise quitting mid-turn blocks until the model is done.
     stopped: *const fn (*anyopaque) bool,
-    pub fn retryDelay(self: Sink, attempt: usize, delay: u64) ?u64 {
-        return self.retryDecision(.{ .attempt = attempt, .allowed = true, .delay_ms = delay });
-    }
     pub fn retryDecision(self: Sink, info: RetryInfo) ?u64 {
         if (self.onRetry) |callback| return callback(self.userdata, info);
         return if (info.allowed) info.delay_ms else null;

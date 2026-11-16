@@ -592,6 +592,9 @@ route for all three purposes and prevents falling back to the active provider.
 Explicit routes support Ollama and OpenAI-compatible endpoints. A new endpoint
 receives only that route's explicit credential; it never inherits the active
 provider's key. OpenAI-compatible redirects are refused.
+OpenAI routes select `protocol` as `chat` (default), `responses`, or `messages`.
+Route keys use Bearer authentication; an `HttpRequest` adapter can supply
+service-specific headers such as `x-api-key` and `anthropic-version`.
 
 `settings` accepts `temperature` (0–2), `max_output_tokens` (1–1048576),
 `reasoning_effort` (a level supported by the selected backend/model), `attempts`
@@ -741,6 +744,7 @@ An explicit ask reaches the user even in automatic/all approval modes. A denial
 from admission, another handler, or `PreToolUse` remains final. This event cannot
 rewrite the action. `PermissionRequest` remains the separate hook for calls
 that still require an approval decision.
+Later permission allowances cannot override an earlier explicit ask.
 
 ### Handler composition and verification
 

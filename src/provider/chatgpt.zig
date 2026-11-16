@@ -499,7 +499,7 @@ fn respond(
             hook_attempt.finish();
 
             if (head.status == .unauthorized and !refreshed and attempt < self.retries.attempts) {
-                const wait = if (sink) |s| s.retryDelay(attempt, 0) else @as(?u64, 0);
+                const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = "http_error", .error_message = why }) else @as(?u64, 0);
                 if (wait) |delay| {
                     try std.Io.sleep(self.io, .fromMilliseconds(@intCast(delay)), .awake);
                     try store.forceRefresh();
@@ -507,8 +507,7 @@ fn respond(
                     attempt += 1;
                     continue;
                 }
-            }
-            if (self.waitAndRetry(head.status, attempt, retry_after, sink)) {
+            } else if (self.waitAndRetry(head.status, attempt, retry_after, sink)) {
                 attempt += 1;
                 continue;
             }

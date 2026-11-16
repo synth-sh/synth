@@ -1303,7 +1303,11 @@ pub fn exportHookInput(self: *Loop, invocation: Hooks.Invocation) !Hooks.Invocat
     try self.prepareHookIdentity();
     var input = self.hookInput(invocation);
     const runner = self.hooks orelse return input;
-    const events = [_]Hooks.Event{ invocation.event, if (invocation.event == .pre_model_request) .post_model_request else invocation.event, if (invocation.event == .pre_model_request) .message_display else invocation.event, if (invocation.event == .post_tool_use) .post_tool_use_failure else invocation.event };
+    const events: []const Hooks.Event = switch (invocation.event) {
+        .pre_model_request => &.{ .pre_model_request, .post_model_request, .message_display, .model_resolve, .model_settings, .model_context, .model_retry, .http_request, .http_response },
+        .post_tool_use => &.{ .post_tool_use, .post_tool_use_failure },
+        else => &.{invocation.event},
+    };
     var needed = false;
     for (events) |event| {
         for (runner.set.forEvent(event)) |hook| {
@@ -1560,7 +1564,7 @@ fn pollOtherHooks(self: *Loop) !bool {
                 try self.hook_asks.append(self.allocator, call.id);
                 self.hook_permission_index = @max(self.hook_permission_index, index + 1);
             }
-            if ((self.hook_purpose == .permission or self.hook_purpose == .evaluation) and dispatch.result.permission == .allow) try self.approve(call);
+            if ((self.hook_purpose == .permission or self.hook_purpose == .evaluation) and dispatch.result.permission == .allow and !self.hookRequiresApproval(call)) try self.approve(call);
         }
         try self.persistToolCall(message_index, index);
         try self.autoApprove();
@@ -2412,10 +2416,10 @@ fn judgeNext(self: *Loop) !void {
     const calls = self.conversation.messages.items[message_index].tool_calls;
     for (calls, 0..) |*call, index| {
         if (call.status != .pending) continue;
-        for (self.hook_asks.items) |id| if (std.mem.eql(u8, id, call.id)) {
+        if (self.hookRequiresApproval(call)) {
             self.awaitApproval();
             return;
-        };
+        }
         if (self.editsInside(call)) {
             try self.approve(call);
             continue;
@@ -2857,7 +2861,7 @@ fn refuse(self: *Loop, message_index: usize, call_index: usize) !void {
 /// has already said always to allow.
 fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (!self.agent.allows(call.name)) return false;
-    for (self.hook_asks.items) |id| if (std.mem.eql(u8, call.id, id)) return false;
+    if (self.hookRequiresApproval(call)) return false;
     if (self.approvals == .all) return true;
 
     if (self.outsidePath(self.allocator, call) catch null) |path| {
@@ -2869,6 +2873,11 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (definition.read_only) return true;
     if (self.isSafe(call)) return true;
     return self.isAllowed(call);
+}
+
+fn hookRequiresApproval(self: *const Loop, call: *const Conversation.ToolCall) bool {
+    for (self.hook_asks.items) |id| if (std.mem.eql(u8, call.id, id)) return true;
+    return false;
 }
 
 /// Whether a call cleared to run may resolve paths outside the project: one
@@ -7425,4 +7434,24 @@ test "automatic review cannot bypass a later call requiring human approval" {
     try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
     try testing.expectEqualStrings("fake-2", loop.pendingCall().?.id);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "requires-approval", .{}));
+}
+
+test "an explicit pre-tool ask survives later permission allowances" {
+    for ([_]Config.Approvals{ .auto, .all }) |mode| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        var loop = fixture.loop();
+        defer loop.deinit();
+        loop.approvals = mode;
+        const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{
+            .pre_tool_use = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"ask\"}}'" }},
+            .permission_evaluate = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionEvaluate\",\"effect\":\"allow\"}}'" }},
+            .permission_request = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" }},
+        } };
+        loop.hooks = &runner;
+        try loop.submit("inspect", .{});
+        try settle(&loop);
+        try testing.expectEqual(State.awaiting_approval, loop.state);
+        try testing.expectEqual(@as(usize, 0), fixture.fake.judged);
+    }
 }

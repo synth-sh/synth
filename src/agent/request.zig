@@ -592,7 +592,7 @@ test "request settings and retry hooks enforce bounds before transport" {
         fn respond(_: *anyopaque, _: *Conversation, turn: Provider.Turn, _: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
             try std.testing.expectEqual(@as(?f32, 0.25), turn.settings.temperature);
             try std.testing.expectEqual(@as(?u32, 128), turn.settings.max_output_tokens);
-            try std.testing.expectEqual(@as(?u64, 7), sink.?.retryDelay(1, 500));
+            try std.testing.expectEqual(@as(?u64, 7), sink.?.retryDecision(.{ .attempt = 1, .allowed = true, .delay_ms = 500 }));
             return .{};
         }
     };

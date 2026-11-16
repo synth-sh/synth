@@ -139,6 +139,7 @@ elif e=='ModelSettings':
 if e in ('HttpRequest','HttpResponse'):
  assert all(p[key]=='' for key in ('request_context','request_system','request_instruction','request_tools','request_routes'))
  h=json.loads(p['http'])
+ if e=='HttpResponse': assert 'route-me canonical human request' in open(p['transcript_path']).read()
 if e=='HttpRequest':
  assert h['headers'].get('authorization',h['headers'].get('Authorization'))=='<redacted>'
  body=h['body']; body['adapter_marker']='present'
@@ -163,7 +164,8 @@ elif e=='HttpResponse' and h['phase'] in ('event','body'):
             end = {'type': 'response.completed', 'response': {'usage': {'input_tokens': 8, 'output_tokens': 2}}} if protocol == 'responses' else {'type': 'message_stop'} if protocol == 'messages' else {'message': {'role': 'assistant', 'content': ''}, 'done': True, 'prompt_eval_count': 8, 'eval_count': 2}
             prefix = 'data: ' if protocol != 'ollama' else ''
             return 200, ''.join(prefix + json.dumps(item) + '\n\n' for item in (body, end)), 'text/event-stream' if protocol != 'ollama' else 'application/x-ndjson'
-        with session(f"wire-{protocol}", adapted, adapter, ('ModelResolve', 'ModelContext', 'HttpRequest', 'HttpResponse'), protocol=protocol) as (_, result, requests, log):
+        snapshots = lambda command: {'HttpResponse': [{'hooks': [{'command': command, 'transcript': True}]}]}
+        with session(f"wire-{protocol}", adapted, adapter, ('ModelResolve', 'ModelContext', 'HttpRequest', 'HttpResponse'), protocol=protocol, extra_hooks=snapshots) as (_, result, requests, log):
             assert result.returncode == 0, (result.stdout, result.stderr)
             expect(result, f'{protocol} adapted')
             assert len(requests) == 1
@@ -199,6 +201,22 @@ if e=='ModelRetry':
         expect(result, 'Request failed')
     print('PASS terminal HTTP failure recovery with a hard physical-attempt ceiling')
 
+    compatibility_veto = """
+if e=='ModelRetry':
+ assert p['http_status']==400 and p['retry_allowed'] and p['error_type']=='http_error'
+ assert 'stream_options' in p['error_message']
+ out={'retryAllowed':False}
+"""
+    with session('compatibility-veto', lambda *_: (400, {'error': {'message': 'unsupported stream_options'}}, 'application/json'), compatibility_veto, ('ModelRetry',)) as (_, result, requests, log):
+        assert len(requests) == 1 and len(log) == 1
+        expect(result, 'stream_options')
+    for size in (3000, 4 * 1024 * 1024 + 1):
+        with session('ollama-large-error', lambda *_: (503, 'proxy failure ' + 'x' * size, 'text/html'), protocol='ollama') as (_, result, requests, _):
+            assert len(requests) == 2
+            expect(result, 'Request failed')
+            assert 'StreamTooLong' not in result.stdout + result.stderr
+    print('PASS compatibility retry metadata/veto and bounded oversized Ollama error handling')
+
     def proposed(packet, _):
         if '/review/' in packet['path']:
             return chat('BLOCK')
@@ -219,6 +237,10 @@ if e=='ModelRetry':
         with sqlite3.connect(root/'session.db') as db:
             assert db.execute('select status from tool_call').fetchall() == [('rejected',)]
     with session('forced-ask', proposed, "out={'effect':'ask'}", ('PermissionEvaluate',)) as (root, result, requests, _):
+        assert not (root/'allowed.txt').exists()
+        assert not any('/review/' in packet['path'] for packet in requests)
+    earlier_ask = "if e=='PreToolUse': out={'permissionDecision':'ask'}\nelif e=='PermissionEvaluate': out={'effect':'allow'}\n"
+    with session('earlier-ask', proposed, earlier_ask, ('PreToolUse', 'PermissionEvaluate')) as (root, result, requests, _):
         assert not (root/'allowed.txt').exists()
         assert not any('/review/' in packet['path'] for packet in requests)
     print('PASS permission allow/deny/ask, read-only interception, and final pre-tool denials')
