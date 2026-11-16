@@ -25,8 +25,8 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See [MCP](mcp.md). |
-| `hooks` | object | none | Commands run on selected agent lifecycle events. See [Hooks](hooks.md). |
-| `hook_timeout_ms` | number | `30000` | How long a hook command may run before it is killed. |
+| `hooks` | object | none | Legacy command lists or grouped command/MCP lifecycle handlers. Inline, user, and project sources are additive. Every definition needs explicit trust; see [Hooks](hooks.md). |
+| `hook_timeout_ms` | integer | `30000` | Default hook timeout, 1–86,400,000 ms. A handler can override `timeout_ms`; shutdown/interruption cleanup is capped separately. |
 | `web` | object | none | Settings for the web tools. See below. |
 | `prune` | object | shed after 30 days | What a prune throws away. See [Pruning](#pruning). |
 | `bell` | string | `unfocused` | When a finished turn says so: `unfocused`, `always` or `never`. See below. |

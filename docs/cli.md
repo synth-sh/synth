@@ -5,6 +5,10 @@ synth [project]                start the TUI (default)
 synth run [--allow] <message>  one headless turn, no TUI
 synth session list|show|rm     sessions for this project
 synth session search <text>    find text in this project's transcripts
+synth hooks list|review        inspect lifecycle hooks and pending trust
+synth hooks trust <id>         trust one exact reviewed hook definition
+synth hooks revoke <id>        remove trust without deleting the declaration
+synth hooks enable|disable <id> control a declaration separately from trust
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
 synth db status|prune|vacuum   what the database holds, and shrinking it
@@ -35,7 +39,7 @@ elsewhere attaches to it there. An editor that offers its own view of files
 gets reads and edits through it, unsaved changes included, and one that keeps
 terminals runs commands in them, shown in the call as they run. MCP servers
 the editor brings connect beside those in `config.json`, which wins a clash of
-names; skills and `/compact` are offered as its slash commands.
+names; skills, `/compact`, and `/hooks` are offered as its slash commands.
 
 Quitting stops the session, a turn in progress included, unless another
 terminal is attached to it. `/detach` leaves it running instead, and so does
@@ -54,3 +58,11 @@ starts `synth acp` under your login shell, so tools see the environment a
 login there would. A remote session keeps running when the connection
 drops, as it does after `/detach`, and `synth remote connect <host>` with no
 id offers the sessions there to pick from.
+
+## Hook review
+
+`synth hooks review` shows the definitions that an explicit `trust <id>`
+authorizes. Existing hooks require this one-time review after upgrade; changed
+definitions need review again. Trust state stays in private user storage, even
+for debug builds. Listing and review never execute hooks or connect providers.
+See [Hooks](hooks.md) for sources, events, grouped handlers, and migration.

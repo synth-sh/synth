@@ -77,3 +77,17 @@ a file in a turn, synth keeps what the file held; `/rewind` lists the prompts
 that changed files, shows what going back to before one would put back, flags
 anything changed since by other means, and restores it. Files changed through
 the shell are not tracked, and the transcript stays as it was.
+
+## Hook review
+
+Use `/hooks` to list lifecycle hooks and their trust/enable state, source,
+matcher, timeout, mode, and recent results. `/hooks review` shows their exact
+definitions. After reviewing one, `/hooks trust <id>` permits it to execute;
+`/hooks revoke <id>` removes trust, and `/hooks disable <id>` or
+`/hooks enable <id>` changes enablement separately. Trust changes require an
+idle session and an explicit user operation. These operations also exist as
+`synth hooks ...` for headless use and through ACP's `_synth/hooks` request.
+
+Existing hooks need review after upgrade. A pending review is shown before a
+prompt can reach the model. Definition changes invalidate its old trust id.
+See [Hooks](hooks.md) for lifecycle behavior and configuration examples.
