@@ -2574,6 +2574,10 @@ test "image metadata survives eviction and image loading is session scoped" {
         for (messages) |*msg| msg.deinit(std.testing.allocator);
         std.testing.allocator.free(messages);
     }
+    try std.testing.expectEqual(2, messages.len);
+    try std.testing.expectEqual(1, messages[0].image_count);
+    try std.testing.expectEqual(1, messages[0].images.len);
+    try std.testing.expectEqualStrings("aW1hZ2U=", messages[0].images[0]);
     try std.testing.expectEqual(1, messages[1].image_count);
     try std.testing.expectEqual(0, messages[1].images.len);
     const image_body = (try db.loadImage(std.testing.allocator, session, 0, 0)).?;

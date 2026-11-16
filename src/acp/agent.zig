@@ -948,6 +948,7 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownTool => "no such tool",
         error.EmptyAllowance => "an allowance needs a pattern",
         error.UnknownAttachment => "no such attachment",
+        error.UnknownImage => "no such image",
         error.NoTranscript => "that call left no transcript",
         error.StillConnecting => "still connecting - try again in a moment",
         error.NoMcpState => "nowhere to keep MCP state, so this cannot be remembered",
@@ -2193,9 +2194,9 @@ const Session = struct {
         if (self.held(seq)) |msg| {
             if (index < msg.images.len) return msg.images[index];
         }
-        if (seq > std.math.maxInt(i64)) return error.UnknownMessage;
-        const session_id = self.stack.loop.session_id orelse return error.UnknownMessage;
-        return try self.agent.options.db.loadImage(arena, session_id, @intCast(seq), index) orelse error.UnknownAttachment;
+        if (seq > std.math.maxInt(i64)) return error.UnknownImage;
+        const session_id = self.stack.loop.session_id orelse return error.UnknownImage;
+        return try self.agent.options.db.loadImage(arena, session_id, @intCast(seq), index) orelse error.UnknownImage;
     }
 
     fn loadAttachment(self: *Session, arena: std.mem.Allocator, seq: u64, index: u32) ![]const u8 {

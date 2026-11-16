@@ -654,6 +654,9 @@ test "only the newest images stay in memory" {
     try std.testing.expectEqual(@as(usize, 0), convo.messages.items[1].images.len);
     try std.testing.expectEqual(@as(usize, 1), convo.messages.items[2].images.len);
     try std.testing.expectEqualStrings("image 2", convo.messages.items[2].images[0]);
+    for (convo.messages.items) |msg| {
+        try std.testing.expectEqual(1, msg.image_count);
+    }
 }
 
 test "the newest attachments stay whole and older ones fall back to a preview" {
