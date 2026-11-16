@@ -39,7 +39,7 @@ elsewhere attaches to it there. An editor that offers its own view of files
 gets reads and edits through it, unsaved changes included, and one that keeps
 terminals runs commands in them, shown in the call as they run. MCP servers
 the editor brings connect beside those in `config.json`, which wins a clash of
-names; skills, `/compact`, and `/hooks` are offered as its slash commands.
+names; skills, `/compact`, `/hooks`, `/cd`, and `/add-dir` are offered as its slash commands.
 
 Quitting stops the session, a turn in progress included, unless another
 terminal is attached to it. `/detach` leaves it running instead, and so does
@@ -61,8 +61,19 @@ id offers the sessions there to pick from.
 
 ## Hook review
 
+Hook listing/review includes configured `when` filters; recent execution records
+include agent scope and request purpose. See [Targeted routing](hooks.md#targeted-routing).
+
 `synth hooks review` shows the definitions that an explicit `trust <id>`
 authorizes. Existing hooks require this one-time review after upgrade; changed
 definitions need review again. Trust state stays in private user storage, even
 for debug builds. Listing and review never execute hooks or connect providers.
 See [Hooks](hooks.md) for sources, events, grouped handlers, and migration.
+
+
+ACP clients can change session directories through `_synth/change_directory`
+or register a permitted root through `_synth/add_directory`. Both requests take
+`{"sessionId":"…","path":"…"}` and require an idle session. Root registration
+emits `DirectoryAdded` with `source: "register_repo_root"`. Status updates expose
+`cwd` and `additional_roots`; `root` and `project` retain their session identity
+and original project meaning. See [Session directories](usage.md#session-directories).

@@ -27,6 +27,8 @@ missing: bool = false,
 unstarted: ?struct { config: *const Config, active: catalog.Active },
 /// The configured model is yet to be checked against what the provider has.
 model_unchecked: bool = false,
+request_route: bool = false,
+model_policy: Config.ModelPolicy.Policy = .{},
 
 /// `backend` is built from `active` but not yet reached: an agent answers
 /// `initialize` first, and reaches it when the first session opens.
@@ -37,6 +39,7 @@ pub fn init(io: std.Io, config: *const Config, auth: *Auth, chatgpt: ?*chatgpt_a
         .chatgpt = chatgpt,
         .backend = backend,
         .active_id = active.entry.id,
+        .model_policy = config.model_requests,
         .unstarted = .{ .config = config, .active = active },
     };
 }
@@ -45,6 +48,12 @@ pub fn init(io: std.Io, config: *const Config, auth: *Auth, chatgpt: ?*chatgpt_a
 pub fn start(self: *Providers, arena: std.mem.Allocator, db: *Database) !void {
     const unstarted = self.unstarted orelse return;
     self.unstarted = null;
+    if (unstarted.config.model_requests.agent != null) {
+        try self.backend.startWithoutProbe();
+        self.request_route = true;
+        self.missing = false;
+        return;
+    }
     try self.backend.start();
     self.model_unchecked = true;
     self.missing = !try usable(arena, db, unstarted.config, unstarted.active, self.auth, self.chatgpt, self.backend);
@@ -63,6 +72,7 @@ pub fn checkModel(self: *Providers) bool {
 /// Whether the session has nothing to answer it: none was chosen, or the
 /// ChatGPT sign-in it runs on has ended.
 pub fn isMissing(self: *const Providers) bool {
+    if (self.request_route) return false;
     if (self.missing) return true;
     if (!std.mem.eql(u8, self.active_id, catalog.chatgpt_id)) return false;
     const store = self.chatgpt orelse return true;
@@ -100,6 +110,7 @@ pub fn hostOf(arena: std.mem.Allocator, db: *Database, entry: catalog.Entry) ![]
 /// Store `key` when one is given and point the session at the provider.
 /// Returns what the session now answers as.
 pub fn connect(self: *Providers, entry: catalog.Entry, host: []const u8, key: ?[]const u8) !Provider {
+    if (self.model_policy.restrict_routes) return error.ModelRouteDenied;
     if (key) |secret| {
         try self.auth.set(entry.id, secret);
         try self.auth.save(self.io, self.auth.path);
@@ -120,6 +131,7 @@ pub fn signedOut(self: *Providers) void {
 /// `isConnected`. The one in use answers through `session`; the rest get a
 /// client of their own just for the asking.
 pub fn offered(self: *const Providers, arena: std.mem.Allocator, db: *Database, session: Provider) ![]const synth.Offered {
+    if (self.model_policy.restrict_routes) return &.{};
     var out: std.ArrayList(synth.Offered) = .empty;
     for (catalog.all) |entry| {
         if (!entry.ready(self.auth, self.chatgpt)) continue;

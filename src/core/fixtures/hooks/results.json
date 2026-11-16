@@ -186,5 +186,314 @@
         }
       }
     }
+  },
+  {
+    "event": "PostToolUseFailure",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PostToolUseFailure",
+        "additionalContext": "context"
+      }
+    },
+    "context": true
+  },
+  {
+    "event": "PostToolBatch",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PostToolBatch",
+        "additionalContext": "context"
+      }
+    },
+    "context": true
+  },
+  {
+    "event": "PermissionDenied",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PermissionDenied",
+        "retry": true
+      }
+    },
+    "retry": true
+  },
+  {
+    "event": "StopFailure",
+    "output": {}
+  },
+  {
+    "event": "Notification",
+    "output": {}
+  },
+  {
+    "event": "InstructionsLoaded",
+    "output": {}
+  },
+  {
+    "event": "ConfigChange",
+    "output": {
+      "decision": "block",
+      "reason": "policy"
+    },
+    "blocked": true
+  },
+  {
+    "event": "FileChanged",
+    "output": {}
+  },
+  {
+    "event": "PreModelSwitch",
+    "output": {
+      "decision": "block",
+      "reason": "policy"
+    },
+    "blocked": true
+  },
+  {
+    "event": "PostModelSwitch",
+    "output": {}
+  },
+  {
+    "event": "TaskCreated",
+    "output": {
+      "decision": "block",
+      "reason": "policy"
+    },
+    "blocked": true
+  },
+  {
+    "event": "TaskCompleted",
+    "output": {
+      "decision": "block",
+      "reason": "policy"
+    },
+    "blocked": true
+  },
+  {
+    "event": "UserPromptExpansion",
+    "output": {
+      "decision": "block",
+      "reason": "policy"
+    },
+    "blocked": true
+  },
+  {
+    "event": "MessageDisplay",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "MessageDisplay",
+        "displayContent": "Visible text"
+      }
+    },
+    "display": true
+  },
+  {
+    "event": "PostToolUseFailure",
+    "output": {
+      "decision": "block",
+      "reason": "invalid effect"
+    },
+    "invalid": true
+  },
+  {
+    "event": "StopFailure",
+    "output": {
+      "decision": "block",
+      "reason": "invalid effect"
+    },
+    "invalid": true
+  },
+  {
+    "event": "Notification",
+    "output": {
+      "decision": "block",
+      "reason": "invalid effect"
+    },
+    "invalid": true
+  },
+  {
+    "event": "InstructionsLoaded",
+    "output": {
+      "decision": "block",
+      "reason": "invalid effect"
+    },
+    "invalid": true
+  },
+  {
+    "event": "FileChanged",
+    "output": {
+      "decision": "block",
+      "reason": "invalid effect"
+    },
+    "invalid": true
+  },
+  {
+    "event": "PostModelSwitch",
+    "output": {
+      "decision": "block",
+      "reason": "invalid effect"
+    },
+    "invalid": true
+  },
+  {
+    "event": "MessageDisplay",
+    "output": {
+      "decision": "block",
+      "reason": "invalid effect"
+    },
+    "invalid": true
+  },
+  {
+    "event": "PostToolBatch",
+    "output": {
+      "continue": false,
+      "stopReason": "stop batch"
+    },
+    "blocked": true
+  },
+  {
+    "event": "PermissionDenied",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PermissionDenied",
+        "retry": "yes"
+      }
+    },
+    "invalid": true
+  },
+  {
+    "event": "CwdChanged",
+    "output": {
+      "systemMessage": "observed"
+    },
+    "message": "observed"
+  },
+  {
+    "event": "DirectoryAdded",
+    "output": {
+      "systemMessage": "observed"
+    },
+    "message": "observed"
+  },
+  {
+    "event": "ModelResolve",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelResolve"
+      }
+    }
+  },
+  {
+    "event": "ModelContext",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelContext"
+      }
+    }
+  },
+  {
+    "event": "ModelSettings",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelSettings"
+      }
+    }
+  },
+  {
+    "event": "ModelRetry",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelRetry"
+      }
+    }
+  },
+  {
+    "event": "ModelResolve",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelResolve",
+        "route": "local"
+      }
+    }
+  },
+  {
+    "event": "ModelContext",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelContext",
+        "contextEdits": [
+          {
+            "seq": 3,
+            "text": "prepared"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "event": "ModelSettings",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelSettings",
+        "settings": {
+          "temperature": 0.2,
+          "max_output_tokens": 4096,
+          "attempts": 2
+        }
+      }
+    }
+  },
+  {
+    "event": "ModelRetry",
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelRetry",
+        "retryDelayMs": 25
+      }
+    }
+  },
+  {
+    "event": "PreModelRequest",
+    "invalid": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreModelRequest",
+        "route": "local"
+      }
+    }
+  },
+  {
+    "event": "ModelSettings",
+    "invalid": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelSettings",
+        "settings": {
+          "attempts": 999
+        }
+      }
+    }
+  },
+  {
+    "event": "ModelRetry",
+    "invalid": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelRetry",
+        "retryDelayMs": 60001
+      }
+    }
+  },
+  {
+    "event": "ModelSettings",
+    "invalid": true,
+    "output": {
+      "hookSpecificOutput": {
+        "hookEventName": "ModelSettings",
+        "settings": {
+          "typo": 1
+        }
+      }
+    }
   }
 ]

@@ -28,6 +28,26 @@ pub const Event = enum {
     interrupt,
     pre_model_request,
     post_model_request,
+    post_tool_use_failure,
+    post_tool_batch,
+    permission_denied,
+    stop_failure,
+    notification,
+    instructions_loaded,
+    config_change,
+    file_changed,
+    pre_model_switch,
+    post_model_switch,
+    task_created,
+    task_completed,
+    user_prompt_expansion,
+    message_display,
+    cwd_changed,
+    directory_added,
+    model_retry,
+    model_settings,
+    model_context,
+    model_resolve,
 
     pub fn name(self: Event) []const u8 {
         return switch (self) {
@@ -45,6 +65,26 @@ pub const Event = enum {
             .interrupt => "Interrupt",
             .pre_model_request => "PreModelRequest",
             .post_model_request => "PostModelRequest",
+            .post_tool_use_failure => "PostToolUseFailure",
+            .post_tool_batch => "PostToolBatch",
+            .permission_denied => "PermissionDenied",
+            .stop_failure => "StopFailure",
+            .notification => "Notification",
+            .instructions_loaded => "InstructionsLoaded",
+            .config_change => "ConfigChange",
+            .file_changed => "FileChanged",
+            .pre_model_switch => "PreModelSwitch",
+            .post_model_switch => "PostModelSwitch",
+            .task_created => "TaskCreated",
+            .task_completed => "TaskCompleted",
+            .user_prompt_expansion => "UserPromptExpansion",
+            .message_display => "MessageDisplay",
+            .cwd_changed => "CwdChanged",
+            .directory_added => "DirectoryAdded",
+            .model_retry => "ModelRetry",
+            .model_settings => "ModelSettings",
+            .model_context => "ModelContext",
+            .model_resolve => "ModelResolve",
         };
     }
     pub fn fromName(value: []const u8) ?Event {
@@ -53,10 +93,66 @@ pub const Event = enum {
         }
         return null;
     }
+    pub fn matcherValue(self: Event, input: Invocation) ?[]const u8 {
+        if (self.toolMatcher()) return input.tool_name;
+        return switch (self) {
+            .session_start, .config_change, .directory_added => input.source,
+            .session_end => input.reason,
+            .notification => input.notification_type,
+            .subagent_start, .subagent_stop => input.agent_type,
+            .pre_compact, .post_compact => input.trigger,
+            .instructions_loaded => input.load_reason,
+            .pre_model_switch, .post_model_switch => input.to_model,
+            .stop_failure => input.error_type,
+            .file_changed => std.fs.path.basename(input.file_path),
+            else => null,
+        };
+    }
+
+    pub fn observational(self: Event) bool {
+        return switch (self) {
+            .session_end, .interrupt, .subagent_start, .pre_model_request, .post_model_request, .post_tool_use_failure, .permission_denied, .stop_failure, .notification, .instructions_loaded, .file_changed, .post_model_switch, .message_display, .cwd_changed, .directory_added => true,
+            else => false,
+        };
+    }
+
     pub fn toolMatcher(self: Event) bool {
-        return self == .pre_tool_use or self == .post_tool_use or self == .permission_request;
+        return self == .pre_tool_use or self == .post_tool_use or self == .post_tool_use_failure or self == .permission_request or self == .permission_denied;
     }
 };
+
+pub const AgentScope = enum { main, subagent };
+pub const RequestPurpose = @import("model_policy.zig").Purpose;
+
+pub const When = struct {
+    agent_scope: ?AgentScope = null,
+    request_purpose: ?RequestPurpose = null,
+    agent_type: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    provider: ?[]const u8 = null,
+
+    fn accepts(self: When, input: Invocation) bool {
+        if (self.agent_scope) |value| if (value != input.agent_scope) return false;
+        if (self.request_purpose) |value| if (value != input.request_purpose) return false;
+        inline for (.{ "agent_type", "model", "provider" }) |field| {
+            if (@field(self, field)) |value| if (!std.mem.eql(u8, value, @field(input, field))) return false;
+        }
+        return true;
+    }
+};
+
+fn parseWhen(allocator: std.mem.Allocator, value: std.json.Value) !When {
+    if (value != .object or value.object.count() == 0) return error.InvalidHookFilter;
+    var fields = value.object.iterator();
+    while (fields.next()) |field| {
+        if (field.value_ptr.* != .string or field.value_ptr.string.len == 0) return error.InvalidHookFilter;
+    }
+    const encoded = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    return std.json.parseFromSliceLeaky(When, allocator, encoded, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidHookFilter,
+    };
+}
 
 pub const Hook = struct {
     matcher: []const u8 = "",
@@ -73,6 +169,19 @@ pub const Hook = struct {
     server: []const u8 = "",
     tool: []const u8 = "",
     arguments: std.json.Value = .null,
+    when: ?When = null,
+
+    pub fn jsonStringify(self: Hook, writer: anytype) !void {
+        // Absent filters must preserve previously trusted declaration bytes.
+        try writer.beginObject();
+        inline for (std.meta.fields(Hook)) |field| {
+            if (!std.mem.eql(u8, field.name, "when") or self.when != null) {
+                try writer.objectField(field.name);
+                try writer.write(@field(self, field.name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const Set = struct {
@@ -91,6 +200,27 @@ pub const Set = struct {
     pre_model_request: []const Hook = &.{},
     post_model_request: []const Hook = &.{},
 
+    post_tool_use_failure: []const Hook = &.{},
+    post_tool_batch: []const Hook = &.{},
+    permission_denied: []const Hook = &.{},
+    stop_failure: []const Hook = &.{},
+    notification: []const Hook = &.{},
+    instructions_loaded: []const Hook = &.{},
+    config_change: []const Hook = &.{},
+    file_changed: []const Hook = &.{},
+    pre_model_switch: []const Hook = &.{},
+    post_model_switch: []const Hook = &.{},
+    task_created: []const Hook = &.{},
+    task_completed: []const Hook = &.{},
+    user_prompt_expansion: []const Hook = &.{},
+    message_display: []const Hook = &.{},
+    cwd_changed: []const Hook = &.{},
+    directory_added: []const Hook = &.{},
+    model_retry: []const Hook = &.{},
+    model_settings: []const Hook = &.{},
+    model_context: []const Hook = &.{},
+    model_resolve: []const Hook = &.{},
+
     pub fn forEvent(self: Set, event: Event) []const Hook {
         return switch (event) {
             .session_start => self.session_start,
@@ -107,6 +237,26 @@ pub const Set = struct {
             .interrupt => self.interrupt,
             .pre_model_request => self.pre_model_request,
             .post_model_request => self.post_model_request,
+            .post_tool_use_failure => self.post_tool_use_failure,
+            .post_tool_batch => self.post_tool_batch,
+            .permission_denied => self.permission_denied,
+            .stop_failure => self.stop_failure,
+            .notification => self.notification,
+            .instructions_loaded => self.instructions_loaded,
+            .config_change => self.config_change,
+            .file_changed => self.file_changed,
+            .pre_model_switch => self.pre_model_switch,
+            .post_model_switch => self.post_model_switch,
+            .task_created => self.task_created,
+            .task_completed => self.task_completed,
+            .user_prompt_expansion => self.user_prompt_expansion,
+            .message_display => self.message_display,
+            .cwd_changed => self.cwd_changed,
+            .directory_added => self.directory_added,
+            .model_retry => self.model_retry,
+            .model_settings => self.model_settings,
+            .model_context => self.model_context,
+            .model_resolve => self.model_resolve,
         };
     }
     pub fn append(self: *Set, allocator: std.mem.Allocator, other: Set) !void {
@@ -120,6 +270,7 @@ pub const Set = struct {
 
 pub fn effectiveTimeout(event: Event, fallback: u64, hook: Hook) u64 {
     if (event == .session_end or event == .interrupt) return @min(hook.timeout_ms orelse 1000, 3000);
+    if (event == .message_display and fallback == default_timeout_ms) return hook.timeout_ms orelse 10_000;
     return hook.timeout_ms orelse fallback;
 }
 
@@ -141,11 +292,13 @@ pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []cons
                 if (m != .string) return error.InvalidHookMatcher;
                 break :blk m.string;
             } else "";
+            const when = if (definition.object.get("when")) |filter| try parseWhen(allocator, filter) else null;
+            if (event == .file_changed and (std.mem.indexOfScalar(u8, matcher, '/') != null or std.mem.indexOfScalar(u8, matcher, '\\') != null)) return error.InvalidHookMatcher;
             if (definition.object.get("hooks")) |group| {
                 if (group != .array or definition.object.contains("command")) return error.InvalidHooks;
                 var group_fields = definition.object.iterator();
                 while (group_fields.next()) |field| {
-                    if (!std.mem.eql(u8, field.key_ptr.*, "matcher") and !std.mem.eql(u8, field.key_ptr.*, "hooks")) return error.InvalidHookDefinition;
+                    if (!std.mem.eql(u8, field.key_ptr.*, "matcher") and !std.mem.eql(u8, field.key_ptr.*, "hooks") and !std.mem.eql(u8, field.key_ptr.*, "when")) return error.InvalidHookDefinition;
                 }
                 for (group.array.items) |handler| {
                     try validateDefinition(handler, false);
@@ -158,12 +311,14 @@ pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []cons
                         if (hook.async) return error.AsyncMcpHookUnsupported;
                         if (event == .session_end) return error.SessionEndMcpHookUnsupported;
                     } else if (hook.server.len > 0 or hook.tool.len > 0 or hook.arguments != .null) return error.InvalidHookDefinition;
+                    if (hook.async and (event == .model_resolve or event == .model_context or event == .model_settings or event == .model_retry)) return error.InvalidHookAsync;
                     if (hook.async and event == .session_end) return error.AsyncSessionEndHookUnsupported;
                     if (hook.timeout_ms) |ms| try validTimeout(ms);
                     hook.matcher = matcher;
+                    hook.when = when;
                     hook.source = source;
                     hook.legacy = false;
-                    if (event.toolMatcher() and matcher.len > 0 and !std.mem.eql(u8, matcher, "*")) {
+                    if (event.matcherValue(.{ .event = event }) != null and event != .file_changed and matcher.len > 0 and !std.mem.eql(u8, matcher, "*")) {
                         var compiled = try compileMatcher(allocator, matcher);
                         compiled.deinit();
                     }
@@ -201,7 +356,7 @@ fn validateDefinition(value: std.json.Value, legacy: bool) !void {
             if (std.mem.eql(u8, key, "command")) return error.InvalidHookDefinition;
         } else if (std.mem.eql(u8, key, "server") or std.mem.eql(u8, key, "tool") or std.mem.eql(u8, key, "arguments")) return error.InvalidHookDefinition;
         if (legacy) {
-            if (std.mem.eql(u8, key, "matcher") or std.mem.eql(u8, key, "command") or std.mem.eql(u8, key, "timeout_ms") or std.mem.eql(u8, key, "transcript")) continue;
+            if (std.mem.eql(u8, key, "matcher") or std.mem.eql(u8, key, "command") or std.mem.eql(u8, key, "timeout_ms") or std.mem.eql(u8, key, "transcript") or std.mem.eql(u8, key, "when")) continue;
             return error.InvalidHookDefinition;
         }
         var valid = false;
@@ -213,7 +368,21 @@ fn validateDefinition(value: std.json.Value, legacy: bool) !void {
 }
 
 pub const Invocation = struct {
+    route: []const u8 = "",
+    request_context: []const u8 = "",
+    request_settings: []const u8 = "",
+    retry_delay_ms: u64 = 0,
+    retry_allowed: bool = false,
     event: Event,
+    agent_scope: AgentScope = .main,
+    request_purpose: RequestPurpose = .agent,
+    provider: []const u8 = "",
+    parent_agent_id: []const u8 = "",
+    parent_tool_call_id: []const u8 = "",
+    cwd: ?[]const u8 = null,
+    old_cwd: []const u8 = "",
+    new_cwd: []const u8 = "",
+    directory: []const u8 = "",
     prompt: []const u8 = "",
     tool_name: []const u8 = "",
     tool_input: []const u8 = "{}",
@@ -238,6 +407,30 @@ pub const Invocation = struct {
     reason: []const u8 = "",
     request_id: u64 = 0,
     attempt: u32 = 0,
+    tool_calls: []const u8 = "[]",
+    error_type: []const u8 = "",
+    is_interrupt: bool = false,
+    duration_ms: i64 = 0,
+    notification_type: []const u8 = "",
+    message: []const u8 = "",
+    title: []const u8 = "",
+    file_path: []const u8 = "",
+    event_type: []const u8 = "",
+    load_reason: []const u8 = "",
+    memory_type: []const u8 = "",
+    from_model: []const u8 = "",
+    to_model: []const u8 = "",
+    requested_model: ?[]const u8 = null,
+    task_id: []const u8 = "",
+    task_subject: []const u8 = "",
+    task_description: []const u8 = "",
+    command_name: []const u8 = "",
+    command_args: []const u8 = "",
+    expanded_prompt: []const u8 = "",
+    message_id: []const u8 = "",
+    index: usize = 0,
+    final: bool = false,
+    delta: []const u8 = "",
 
     pub fn dupe(self: Invocation, arena: std.mem.Allocator) !Invocation {
         var copy = self;
@@ -254,6 +447,8 @@ pub const Invocation = struct {
 pub const Record = struct {
     id: [64]u8 = @splat(0),
     event: Event,
+    agent_scope: AgentScope = .main,
+    request_purpose: RequestPurpose = .agent,
     started_ms: i64,
     duration_ms: i64,
     status: []const u8,
@@ -279,8 +474,12 @@ pub const Runtime = struct {
     records_next: usize = 0,
     records_mutex: std.Io.Mutex = .init,
     pending: Result = .{},
+    deliveries: std.ArrayList(Delivery) = .empty,
+
     temp_dir: ?[]u8 = null,
     temp_mutex: std.Io.Mutex = .init,
+
+    const Delivery = struct { agent_id: []u8, result: Result = .{} };
 
     fn enter(self: *Runtime, stop: ?*const std.atomic.Value(bool), deadline_ms: ?i64) !void {
         while (true) {
@@ -299,6 +498,8 @@ pub const Runtime = struct {
         self.records_mutex.lockUncancelable(self.io);
         defer self.records_mutex.unlock(self.io);
         var record_value: Record = .{ .event = invocation.event, .started_ms = started, .duration_ms = std.Io.Clock.now(.awake, self.io).toMilliseconds() - started, .status = status };
+        record_value.agent_scope = invocation.agent_scope;
+        record_value.request_purpose = invocation.request_purpose;
         record_value.exit_code = exit_code;
         record_value.request_id = invocation.request_id;
         record_value.attempt = invocation.attempt;
@@ -341,7 +542,7 @@ pub const Runtime = struct {
             self.pending.message = message;
             return;
         }
-        if (job.result.blocked != null or job.result.replacement != null or job.result.permission != null or job.result.feedback != null or job.result.stop) {
+        if (job.result.blocked != null or job.result.replacement != null or job.result.permission != null or job.result.feedback != null or job.result.stop or job.result.retry or job.result.display_content != null) {
             if (job.result.message) |old| job.arena.allocator().free(old);
             job.result.message = try job.arena.allocator().dupe(u8, "Background hook control effects were ignored");
         }
@@ -350,8 +551,26 @@ pub const Runtime = struct {
         job.result.feedback = null;
         job.result.permission = null;
         job.result.stop = false;
-        try self.pending.merge(self.allocator, job.result);
-        try self.bound(self.allocator, &self.pending);
+        job.result.retry = false;
+        job.result.display_content = null;
+        var destination: ?*Result = &self.pending;
+        if (job.invocation.agent_id.len > 0) {
+            destination = null;
+            for (self.deliveries.items) |*delivery| {
+                if (std.mem.eql(u8, delivery.agent_id, job.invocation.agent_id)) {
+                    destination = &delivery.result;
+                    break;
+                }
+            }
+            if (destination == null) {
+                const id = try self.allocator.dupe(u8, job.invocation.agent_id);
+                errdefer self.allocator.free(id);
+                try self.deliveries.append(self.allocator, .{ .agent_id = id });
+                destination = &self.deliveries.items[self.deliveries.items.len - 1].result;
+            }
+        }
+        try destination.?.merge(self.allocator, job.result);
+        try self.bound(self.allocator, destination.?);
     }
     pub fn notice(self: *Runtime, message: []const u8) !void {
         self.background_mutex.lockUncancelable(self.io);
@@ -362,6 +581,28 @@ pub const Runtime = struct {
         try self.bound(self.allocator, &self.pending);
     }
     pub fn drain(self: *Runtime, allocator: std.mem.Allocator) !Result {
+        return self.drainFor(allocator, "");
+    }
+    pub fn discardAgent(self: *Runtime, agent_id: []const u8) void {
+        self.background_mutex.lockUncancelable(self.io);
+        defer self.background_mutex.unlock(self.io);
+        var i: usize = 0;
+        while (i < self.background.items.len) {
+            if (std.mem.eql(u8, self.background.items[i].invocation.agent_id, agent_id)) {
+                const job = self.background.orderedRemove(i);
+                job.destroy();
+            } else i += 1;
+        }
+        i = 0;
+        while (i < self.deliveries.items.len) {
+            if (std.mem.eql(u8, self.deliveries.items[i].agent_id, agent_id)) {
+                var delivery = self.deliveries.orderedRemove(i);
+                self.allocator.free(delivery.agent_id);
+                delivery.result.deinit(self.allocator);
+            } else i += 1;
+        }
+    }
+    pub fn drainFor(self: *Runtime, allocator: std.mem.Allocator, agent_id: []const u8) !Result {
         self.background_mutex.lockUncancelable(self.io);
         defer self.background_mutex.unlock(self.io);
         var i: usize = 0;
@@ -378,8 +619,23 @@ pub const Runtime = struct {
         }
         var result: Result = .{};
         errdefer result.deinit(allocator);
-        try result.merge(allocator, self.pending);
-        self.pending.deinit(self.allocator);
+        if (agent_id.len == 0) {
+            try result.merge(allocator, self.pending);
+            self.pending.deinit(self.allocator);
+        } else if (self.pending.message) |message| {
+            result.message = try allocator.dupe(u8, message);
+            self.allocator.free(message);
+            self.pending.message = null;
+        }
+        i = 0;
+        while (i < self.deliveries.items.len) {
+            if (std.mem.eql(u8, self.deliveries.items[i].agent_id, agent_id)) {
+                var delivery = self.deliveries.orderedRemove(i);
+                defer self.allocator.free(delivery.agent_id);
+                defer delivery.result.deinit(self.allocator);
+                try result.merge(allocator, delivery.result);
+            } else i += 1;
+        }
         return result;
     }
     pub fn privatePath(self: *Runtime, allocator: std.mem.Allocator, extension: []const u8) ![]u8 {
@@ -423,16 +679,25 @@ pub const Runtime = struct {
         defer self.background_mutex.unlock(self.io);
         for (self.background.items) |job| job.destroy();
         self.background.clearRetainingCapacity();
+        for (self.deliveries.items) |*delivery| {
+            self.allocator.free(delivery.agent_id);
+            delivery.result.deinit(self.allocator);
+        }
+        self.deliveries.clearRetainingCapacity();
         self.pending.deinit(self.allocator);
         self.stop.store(false, .release);
     }
     pub fn deinit(self: *Runtime) void {
         self.cancelBackground();
         self.background.deinit(self.allocator);
+        self.deliveries.deinit(self.allocator);
+        self.deliveries = .empty;
+        self.background = .empty;
         self.pending.deinit(self.allocator);
         if (self.temp_dir) |path| {
             std.Io.Dir.cwd().deleteTree(self.io, path) catch {};
             self.allocator.free(path);
+            self.temp_dir = null;
         }
     }
 };
@@ -508,6 +773,28 @@ pub const Runner = struct {
         return flag.load(.acquire);
     }
 
+    pub fn hasMatching(self: Runner, allocator: std.mem.Allocator, invocation: Invocation, require_trust: bool) bool {
+        for (self.set.forEvent(invocation.event)) |hook| {
+            if (!hook.enabled or (require_trust and !hook.trusted)) continue;
+            if (hookMatches(allocator, hook, invocation) catch false) return true;
+        }
+        return false;
+    }
+
+    pub fn observe(self: Runner, invocation: Invocation) !void {
+        if (!invocation.event.observational()) return error.InvalidHookEvent;
+        const runtime = self.runtime orelse return;
+        for (self.set.forEvent(invocation.event)) |hook| {
+            if (!hook.enabled) continue;
+            if (!try hookMatches(runtime.allocator, hook, invocation)) continue;
+            if (!hook.trusted) {
+                try runtime.notice("Hooks need review; an observation handler was not executed");
+                continue;
+            }
+            try runtime.launch(self, hook, invocation);
+        }
+    }
+
     pub fn dispatch(self: Runner, allocator: std.mem.Allocator, invocation: Invocation) !?[]u8 {
         var result = try self.evaluate(allocator, invocation);
         defer result.deinit(allocator);
@@ -519,7 +806,15 @@ pub const Runner = struct {
     pub fn evaluate(self: Runner, allocator: std.mem.Allocator, invocation: Invocation) !Result {
         var outcome: Result = .{};
         errdefer outcome.deinit(allocator);
-        const definitions = self.set.forEvent(invocation.event);
+        var inherited: std.ArrayList(Hook) = .empty;
+        defer inherited.deinit(allocator);
+        var inherited_count: usize = 0;
+        if (invocation.event == .post_tool_use_failure) {
+            for (self.set.post_tool_use) |hook| if (hook.legacy) try inherited.append(allocator, hook);
+            inherited_count = inherited.items.len;
+            try inherited.appendSlice(allocator, self.set.post_tool_use_failure);
+        }
+        const definitions = if (invocation.event == .post_tool_use_failure) inherited.items else self.set.forEvent(invocation.event);
         var at: usize = 0;
         var completion: std.atomic.Value(usize) = .init(0);
         var replacement_order: usize = 0;
@@ -528,6 +823,7 @@ pub const Runner = struct {
         var legacy_blocked = false;
         while (at < definitions.len) {
             const hook = definitions[at];
+            if (hook.async and (invocation.event == .model_resolve or invocation.event == .model_context or invocation.event == .model_settings or invocation.event == .model_retry)) return error.InvalidHookAsync;
             if (self.givenUp()) return error.Cancelled;
             if (!hook.enabled) {
                 at += 1;
@@ -560,7 +856,9 @@ pub const Runner = struct {
                     at += 1;
                     continue;
                 }
-                var result = self.runHook(allocator, hook, invocation) catch |err| {
+                var legacy_input = invocation;
+                if (at < inherited_count) legacy_input.event = .post_tool_use;
+                var result = self.runHook(allocator, hook, legacy_input) catch |err| {
                     if (at < failure_at) {
                         failure = err;
                         failure_at = at;
@@ -613,6 +911,7 @@ pub const Runner = struct {
                         }
                         continue;
                     }
+                    if (grouped.async and (invocation.event == .model_resolve or invocation.event == .model_context or invocation.event == .model_settings or invocation.event == .model_retry)) return error.InvalidHookAsync;
                     if (grouped.async) {
                         const runtime = self.runtime orelse return error.BackgroundHooksUnavailable;
                         try runtime.launch(self, grouped, invocation);
@@ -668,7 +967,7 @@ pub const Runner = struct {
         }
         if (failure) |err| {
             const strict = switch (invocation.event) {
-                .session_start, .user_prompt_submit, .pre_tool_use, .permission_request, .pre_compact, .post_compact => true,
+                .session_start, .user_prompt_submit, .pre_tool_use, .permission_request, .pre_compact, .post_compact, .post_tool_batch, .task_created, .task_completed, .pre_model_switch, .user_prompt_expansion, .config_change => true,
                 else => false,
             };
             if (strict or err == error.OutOfMemory) return err;
@@ -730,10 +1029,10 @@ pub const Runner = struct {
         if (!hook.legacy and command.overflow) return error.HookOutputTooLarge;
         var result: Result = .{};
         errdefer result.deinit(allocator);
-        const advisory = invocation.event == .pre_model_request or invocation.event == .post_model_request or invocation.event == .interrupt or invocation.event == .session_end or invocation.event == .subagent_start;
-        if (command.code == 2 and advisory) {
+        const advisory = invocation.event.observational();
+        if (command.code == 2 and advisory and !(hook.legacy and invocation.event == .post_tool_use_failure)) {
             result.message = try allocator.dupe(u8, "Observation hook exited 2; control effect ignored");
-        } else if (command.code == 2 and (invocation.event != .post_tool_use or !hook.legacy)) {
+        } else if (command.code == 2 and ((invocation.event != .post_tool_use and invocation.event != .post_tool_use_failure) or !hook.legacy)) {
             const reason = std.mem.trim(u8, command.stderr, " \t\r\n");
             result.blocked = try allocator.dupe(u8, if (reason.len > 0) reason else "blocked by hook");
         } else if (!hook.legacy and command.code == 0) {
@@ -749,7 +1048,7 @@ pub const Runner = struct {
                 }
             }
         }
-        inline for (.{ "context", "message", "blocked", "feedback" }) |field| {
+        inline for (.{ "context", "message", "blocked", "feedback", "display_content" }) |field| {
             if (@field(result, field)) |value| {
                 if (ansi.hasControls(value)) {
                     const cleaned = try ansi.clean(allocator, value);
@@ -774,7 +1073,7 @@ pub const Runner = struct {
         command: []const u8,
         invocation: Invocation,
     ) !CommandResult {
-        var dir = try std.Io.Dir.cwd().openDir(self.io, self.root, .{});
+        var dir = try std.Io.Dir.cwd().openDir(self.io, invocation.cwd orelse self.root, .{});
         defer dir.close(self.io);
 
         var payload_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1022,12 +1321,19 @@ fn compileMatcher(allocator: std.mem.Allocator, pattern: []const u8) !regex.Rege
 }
 
 fn hookMatches(allocator: std.mem.Allocator, hook: Hook, invocation: Invocation) !bool {
-    if (!invocation.event.toolMatcher()) return true;
-    if (hook.legacy) return matches(hook.matcher, invocation.tool_name);
+    if (hook.when) |filter| if (!filter.accepts(invocation)) return false;
+    const value = invocation.event.matcherValue(invocation) orelse return true;
+    if (hook.legacy) return matches(hook.matcher, value);
     if (hook.matcher.len == 0 or std.mem.eql(u8, hook.matcher, "*")) return true;
+    if (invocation.event == .file_changed) {
+        var names = std.mem.tokenizeScalar(u8, hook.matcher, '|');
+        while (names.next()) |name| if (std.mem.eql(u8, value, name)) return true;
+        return false;
+    }
     var compiled = try compileMatcher(allocator, hook.matcher);
     defer compiled.deinit();
-    if (try compiled.checkedMatches(invocation.tool_name)) return true;
+    if (try compiled.checkedMatches(value)) return true;
+    if (!invocation.event.toolMatcher()) return false;
     const alias: []const u8 = if (std.mem.eql(u8, invocation.tool_name, "bash")) "Bash" else if (std.mem.eql(u8, invocation.tool_name, "read")) "Read" else if (std.mem.eql(u8, invocation.tool_name, "write")) "Write" else if (std.mem.eql(u8, invocation.tool_name, "edit")) "Edit" else if (std.mem.eql(u8, invocation.tool_name, "task")) "Agent" else "";
     return alias.len > 0 and try compiled.checkedMatches(alias);
 }
@@ -1046,16 +1352,23 @@ fn writeJson(
     try w.writeAll("{\"hook_event_name\":");
     try std.json.Stringify.encodeJsonString(invocation.event.name(), .{}, w);
     try w.writeAll(",\"cwd\":");
-    try std.json.Stringify.encodeJsonString(root, .{}, w);
+    try std.json.Stringify.encodeJsonString(invocation.cwd orelse root, .{}, w);
 
-    inline for (.{ "session_id", "turn_id", "tool_call_id", "agent_id", "agent_type", "model", "permission_mode", "source", "trigger", "status", "error_message", "parent_session_id", "reason" }) |field| {
+    try w.writeAll(",\"agent_scope\":");
+    try std.json.Stringify.value(invocation.agent_scope, .{}, w);
+    try w.writeAll(",\"request_purpose\":");
+    try std.json.Stringify.value(invocation.request_purpose, .{}, w);
+    inline for (.{ "route", "request_context", "request_settings", "provider", "parent_agent_id", "parent_tool_call_id", "old_cwd", "new_cwd", "directory", "session_id", "turn_id", "tool_call_id", "agent_id", "agent_type", "model", "permission_mode", "source", "trigger", "status", "error_type", "error_message", "parent_session_id", "reason", "notification_type", "message", "title", "file_path", "event_type", "load_reason", "memory_type", "from_model", "to_model", "task_id", "task_subject", "task_description", "command_name", "command_args", "expanded_prompt", "message_id", "delta" }) |field| {
         try w.writeAll(",\"" ++ field ++ "\":");
         try std.json.Stringify.encodeJsonString(@field(invocation, field), .{}, w);
     }
     try w.writeAll(",\"tool_use_id\":");
     try std.json.Stringify.encodeJsonString(invocation.tool_call_id, .{}, w);
+    try w.writeAll(",\"requested_model\":");
+    try std.json.Stringify.value(invocation.requested_model, .{}, w);
     try w.writeAll(",\"last_assistant_message\":");
     try std.json.Stringify.value(invocation.last_assistant_message, .{}, w);
+    try w.print(",\"retry_delay_ms\":{d},\"retry_allowed\":{s}", .{ invocation.retry_delay_ms, if (invocation.retry_allowed) "true" else "false" });
     try w.print(",\"request_id\":{d},\"attempt\":{d}", .{ invocation.request_id, invocation.attempt });
     if (invocation.event == .subagent_stop) {
         try w.writeAll(",\"agent_transcript_path\":");
@@ -1064,7 +1377,7 @@ fn writeJson(
     try w.writeAll(",\"transcript_path\":");
     try std.json.Stringify.value(invocation.transcript_path, .{}, w);
     try w.print(",\"stop_hook_active\":{s},\"input_tokens\":{d},\"output_tokens\":{d}", .{ if (invocation.stop_hook_active) "true" else "false", invocation.input_tokens, invocation.output_tokens });
-    if (invocation.event == .user_prompt_submit) {
+    if (invocation.event == .user_prompt_submit or invocation.event == .user_prompt_expansion) {
         try w.writeAll(",\"prompt\":");
         try std.json.Stringify.encodeJsonString(invocation.prompt, .{}, w);
     }
@@ -1078,9 +1391,22 @@ fn writeJson(
             try w.writeAll("{}");
         }
     }
-    if (invocation.event == .post_tool_use) {
+    if (invocation.event == .post_tool_use or invocation.event == .post_tool_use_failure) {
         try w.writeAll(",\"tool_response\":");
         try std.json.Stringify.encodeJsonString(invocation.tool_response, .{}, w);
+    }
+    try w.writeAll(",\"error\":");
+    try std.json.Stringify.encodeJsonString(if (invocation.error_type.len > 0) invocation.error_type else invocation.error_message, .{}, w);
+    try w.writeAll(",\"error_details\":");
+    try std.json.Stringify.encodeJsonString(invocation.error_message, .{}, w);
+    try w.print(",\"is_interrupt\":{s},\"duration_ms\":{d},\"index\":{d},\"final\":{s}", .{ if (invocation.is_interrupt) "true" else "false", invocation.duration_ms, invocation.index, if (invocation.final) "true" else "false" });
+    if (invocation.event == .file_changed) {
+        try w.writeAll(",\"event\":");
+        try std.json.Stringify.encodeJsonString(invocation.event_type, .{}, w);
+    }
+    if (invocation.event == .post_tool_batch) {
+        try w.writeAll(",\"tool_calls\":");
+        if (try std.json.validate(allocator, invocation.tool_calls)) try w.writeAll(invocation.tool_calls) else try w.writeAll("[]");
     }
     try w.writeByte('}');
 }
@@ -1552,4 +1878,103 @@ test "MCP interpolation must produce an argument object before calling the serve
     const hook: Hook = .{ .legacy = false, .type = .mcp_tool, .server = "test", .tool = "gate", .arguments = .{ .string = "${tool_name}" } };
     const runner: Runner = .{ .io = std.testing.io, .root = ".", .mcp_executor = .{ .userdata = &slot, .call = Executor.call }, .set = .{ .pre_tool_use = &.{hook} } };
     try std.testing.expectError(error.InvalidHookMcpArguments, runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use, .tool_name = "bash" }));
+}
+
+test "event matchers filter lifecycle metadata and ignore unsupported matcher fields" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { input: Invocation, matcher: []const u8 }{
+        .{ .input = .{ .event = .session_start, .source = "resume" }, .matcher = "resume|clear" },
+        .{ .input = .{ .event = .session_end, .reason = "clear" }, .matcher = "clear" },
+        .{ .input = .{ .event = .pre_compact, .trigger = "auto" }, .matcher = "auto" },
+        .{ .input = .{ .event = .post_compact, .trigger = "manual" }, .matcher = "manual" },
+        .{ .input = .{ .event = .subagent_start, .agent_type = "explore" }, .matcher = "explore" },
+        .{ .input = .{ .event = .subagent_stop, .agent_type = "review" }, .matcher = "review" },
+        .{ .input = .{ .event = .notification, .notification_type = "permission_prompt" }, .matcher = "permission_prompt" },
+        .{ .input = .{ .event = .stop_failure, .error_type = "rate_limit" }, .matcher = "rate_limit" },
+        .{ .input = .{ .event = .pre_model_switch, .to_model = "local-model" }, .matcher = "^local-" },
+        .{ .input = .{ .event = .post_model_switch, .to_model = "cloud-model" }, .matcher = "^cloud-" },
+        .{ .input = .{ .event = .config_change, .source = "project_settings" }, .matcher = "project_settings" },
+        .{ .input = .{ .event = .instructions_loaded, .load_reason = "compact" }, .matcher = "compact" },
+        .{ .input = .{ .event = .file_changed, .file_path = "/p/.env" }, .matcher = ".env|.envrc" },
+        .{ .input = .{ .event = .post_tool_use_failure, .tool_name = "bash" }, .matcher = "Bash" },
+        .{ .input = .{ .event = .permission_denied, .tool_name = "write" }, .matcher = "Write" },
+    };
+    for (cases) |case| {
+        try std.testing.expect(try hookMatches(a, .{ .legacy = false, .matcher = case.matcher }, case.input));
+        try std.testing.expect(!try hookMatches(a, .{ .legacy = false, .matcher = "unrelated" }, case.input));
+    }
+    try std.testing.expect(try hookMatches(a, .{ .legacy = false, .matcher = "ignored" }, .{ .event = .post_tool_batch }));
+}
+
+test "every supported event has input and result fixtures and parses as configuration" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const inputs = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/inputs.json"), .{});
+    const results = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/results.json"), .{});
+    inline for (std.meta.fields(Event)) |field| {
+        const event: Event = @field(Event, field.name);
+        var has_input = false;
+        var has_result = false;
+        for (inputs.array.items) |item| if (std.mem.eql(u8, item.object.get("event").?.string, event.name())) {
+            has_input = true;
+        };
+        for (results.array.items) |item| if (std.mem.eql(u8, item.object.get("event").?.string, event.name()) and !item.object.contains("invalid")) {
+            has_result = true;
+        };
+        try std.testing.expect(has_input and has_result);
+        const source = try std.fmt.allocPrint(a, "{{\"{s}\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"true\"}}]}}]}}", .{event.name()});
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{});
+        const set = try parse(a, config, "fixture");
+        try std.testing.expectEqual(@as(usize, 1), set.forEvent(event).len);
+    }
+    for ([_][]const u8{ "Setup", "TeammateIdle", "WorktreeCreate", "WorktreeRemove", "Elicitation", "ElicitationResult" }) |name| {
+        const source = try std.fmt.allocPrint(a, "{{\"{s}\":[]}}", .{name});
+        const unsupported = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{});
+        try std.testing.expectError(error.InvalidHookEvent, parse(a, unsupported, "fixture"));
+    }
+}
+
+test "routing filters require every exact field and compose with event matchers" {
+    const a = std.testing.allocator;
+    const input: Invocation = .{ .event = .pre_tool_use, .agent_scope = .subagent, .request_purpose = .agent, .agent_type = "task", .model = "qwen3", .provider = "local", .tool_name = "read" };
+    const filter: When = .{ .agent_scope = .subagent, .request_purpose = .agent, .agent_type = "task", .model = "qwen3", .provider = "local" };
+    try std.testing.expect(try hookMatches(a, .{ .legacy = false, .matcher = "^Read$", .when = filter }, input));
+    const mismatches = [_]When{
+        .{ .agent_scope = .main }, .{ .request_purpose = .approval_judge }, .{ .agent_type = "build" }, .{ .model = "qwen" }, .{ .provider = "remote" },
+    };
+    for (mismatches) |wrong| try std.testing.expect(!try hookMatches(a, .{ .when = wrong }, input));
+    try std.testing.expect(!try hookMatches(a, .{ .matcher = "write", .when = filter }, input));
+    try std.testing.expect(!try hookMatches(a, .{ .when = .{ .agent_scope = .subagent } }, .{ .event = .stop }));
+}
+
+test "routing configuration rejects typos null selectors and handler-level ambiguity" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "{}", "null", "[]", "{\"agent_scope\":\"child\"}", "{\"request_purpose\":\"judge\"}", "{\"model\":null}", "{\"provider\":\"\"}", "{\"agent_scp\":\"main\"}" }) |filter| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, filter, .{});
+        try std.testing.expectError(error.InvalidHookFilter, parseWhen(a, value));
+    }
+    const source =
+        \\{"PreToolUse":[{"matcher":"Read","when":{"agent_scope":"subagent","request_purpose":"agent","model":"qwen3"},"hooks":[{"command":"true"}]},{"when":{"agent_scope":"main"},"command":"true"}]}
+    ;
+    const set = try parse(a, try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{}), "policy.json");
+    try std.testing.expectEqual(AgentScope.subagent, set.pre_tool_use[0].when.?.agent_scope.?);
+    try std.testing.expectEqualStrings("qwen3", set.pre_tool_use[0].when.?.model.?);
+    try std.testing.expect(set.pre_tool_use[1].legacy);
+    try std.testing.expectEqual(AgentScope.main, set.pre_tool_use[1].when.?.agent_scope.?);
+    const ambiguous = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"PreToolUse":[{"hooks":[{"command":"true","when":{"agent_scope":"main"}}]}]}
+    , .{});
+    try std.testing.expectError(error.InvalidHookDefinition, parse(a, ambiguous, "policy.json"));
+}
+
+test "unfiltered declaration encoding retains existing trust identity bytes" {
+    const a = std.testing.allocator;
+    const encoded = try std.json.Stringify.valueAlloc(a, Hook{ .command = "true" }, .{});
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings(
+        \\{"matcher":"","command":"true","legacy":true,"id":"","trusted":true,"enabled":true,"transcript":false,"source":"config","timeout_ms":null,"async":false,"type":"command","server":"","tool":"","arguments":null}
+    , encoded);
 }

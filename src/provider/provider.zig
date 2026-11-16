@@ -58,6 +58,9 @@ abort: ?*const fn (*anyopaque) void = null,
 /// decisions a backend has no business making, and a backend that assembled its
 /// own prompt would have to be told about agents to do it.
 pub const Turn = struct {
+    backend: ?*@import("backend.zig") = null,
+    model_policy: @import("../core/model_policy.zig").Policy = .{},
+    settings: @import("../core/model_policy.zig").Settings = .{},
     /// The system prompt, complete. Borrowed for the length of the call.
     system: []const u8,
     /// Tool definitions as JSON, from `Registry.schemaJson`. Empty means the
@@ -68,6 +71,8 @@ pub const Turn = struct {
     instruction: []const u8 = "",
     /// Reserve less output space while summarizing, but never discard history.
     compacting: bool = false,
+    display_messages: bool = false,
+    stream_display: bool = true,
     hooks: ?*const Hooks.Runner = null,
     attempts: ?*std.atomic.Value(u32) = null,
     hook_input: Hooks.Invocation = .{ .event = .pre_model_request },
@@ -206,6 +211,17 @@ pub fn mentionsOverflow(why: []const u8) bool {
     return false;
 }
 
+pub fn errorType(err: anyerror, details: []const u8) []const u8 {
+    const name = @errorName(err);
+    inline for (.{ .{ "rate_limit", "rate limit", "RateLimit" }, .{ "authentication_failed", "unauthorized", "Unauthorized" }, .{ "model_not_found", "model not found", "ModelNotFound" }, .{ "overloaded", "overloaded", "Overloaded" }, .{ "billing_error", "billing", "BillingError" }, .{ "invalid_request", "context", "ContextTooLarge" } }) |entry| {
+        if (containsIgnoreCase(details, entry[1]) or containsIgnoreCase(name, entry[2])) return entry[0];
+    }
+    if (containsIgnoreCase(details, "429")) return "rate_limit";
+    if (containsIgnoreCase(details, "401") or containsIgnoreCase(details, "403")) return "authentication_failed";
+    if (containsIgnoreCase(details, "500") or containsIgnoreCase(details, "502") or containsIgnoreCase(details, "503")) return "server_error";
+    return "unknown";
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     var i: usize = 0;
@@ -277,6 +293,8 @@ pub const Reply = struct {
 /// Where a provider pushes partial output as it arrives. Every callback runs on
 /// the worker thread, so implementations must be thread safe.
 pub const Sink = struct {
+    onRetry: ?*const fn (*anyopaque, usize, u64) ?u64 = null,
+
     userdata: *anyopaque,
     /// A fragment of the model's thinking output.
     onThinking: *const fn (*anyopaque, []const u8) void,
@@ -292,6 +310,10 @@ pub const Sink = struct {
     /// killed, so a provider that streams must check between chunks and return
     /// early - otherwise quitting mid-turn blocks until the model is done.
     stopped: *const fn (*anyopaque) bool,
+    pub fn retryDelay(self: Sink, attempt: usize, delay: u64) ?u64 {
+        if (self.onRetry) |callback| return callback(self.userdata, attempt, delay);
+        return delay;
+    }
 };
 
 fn ignoreThinkingDone(_: *anyopaque) void {}

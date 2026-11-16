@@ -409,6 +409,14 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         for (files) |*file| file.path = projectRelative(session.stack.loop.project_root, file.path);
         if (asked.apply and files.len > 0) self.noticeFmt(.info, "Put back {d} file{s} as before that prompt", .{ files.len, if (files.len == 1) "" else "s" });
         return connection.reply(id, files);
+    } else if (eql(u8, method, m.change_directory)) {
+        const asked = try rpc.parse(synth.Directory, arena, params);
+        try session.stack.loop.changeDirectory(asked.path);
+        try session.publish(arena, true);
+    } else if (eql(u8, method, m.add_directory)) {
+        const asked = try rpc.parse(synth.Directory, arena, params);
+        try session.stack.loop.addDirectory(asked.path, "register_repo_root");
+        try session.publish(arena, true);
     } else if (eql(u8, method, m.hooks)) {
         const asked = try rpc.parse(synth.Hooks, arena, params);
         return connection.reply(id, try session.stack.manageHooks(arena, asked.action, asked.id));
@@ -618,6 +626,16 @@ fn share(self: *Agent, session: *Session) !void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     self.live = .{ .handle = handle, .root = root };
+}
+
+fn shareDirectory(self: *Agent, path: []const u8) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const live = if (self.live) |*value| value else return;
+    if (std.mem.eql(u8, live.root, path)) return;
+    const owned = try self.allocator.dupe(u8, path);
+    self.allocator.free(live.root);
+    live.root = owned;
 }
 
 fn unshare(self: *Agent) void {
@@ -1612,6 +1630,8 @@ const Session = struct {
 
     fn notice(self: *Session, severity: protocol.Severity, comptime fmt: []const u8, args: anytype) void {
         self.agent.noticeFmt(severity, fmt, args);
+        var buffer: [512]u8 = undefined;
+        self.stack.loop.notifyHook("notice", std.fmt.bufPrint(&buffer, fmt, args) catch fmt);
     }
 
     /// Advance the session, and do what a TUI's tick does for a local one:
@@ -1679,13 +1699,23 @@ const Session = struct {
 
         const loop = &self.stack.loop;
         if (std.mem.startsWith(u8, text.items, "/")) {
+            if (std.mem.eql(u8, text.items, "/cd") or std.mem.startsWith(u8, text.items, "/cd ")) {
+                const path = std.mem.trim(u8, text.items[3..], " \t\n");
+                if (path.len == 0) return self.notice(.info, "{s}", .{loop.workingDirectory()});
+                try loop.changeDirectory(path);
+                return self.notice(.info, "Working directory: {s}", .{loop.workingDirectory()});
+            }
+            if (std.mem.eql(u8, text.items, "/add-dir") or std.mem.startsWith(u8, text.items, "/add-dir ")) {
+                try loop.addDirectory(std.mem.trim(u8, text.items[8..], " \t\n"), "slash_command");
+                return self.notice(.info, "Directory added to this session", .{});
+            }
             if (skill.findIn(self.stack.skills.skills, skill.idOf(text.items))) |found| {
                 if (loop.isBusy()) return error.Busy;
                 try attachments.append(arena, .{
                     .path = try std.fs.path.join(arena, &.{ found.dir, skill.file_name }),
                     .content = try skill_tool.render(arena, found),
                 });
-                return loop.submit(text.items, .{ .attachments = attachments.items, .images = images.items });
+                return loop.submit(text.items, .{ .attachments = attachments.items, .images = images.items, .command_name = found.id, .command_args = std.mem.trimStart(u8, text.items[@min(text.items.len, found.id.len + 1)..], " \t\n"), .expanded_prompt = attachments.items[attachments.items.len - 1].content });
             }
             if (std.mem.eql(u8, text.items, "/hooks") or std.mem.startsWith(u8, text.items, "/hooks ")) {
                 var words = std.mem.tokenizeAny(u8, text.items, " \t\n");
@@ -1821,10 +1851,11 @@ const Session = struct {
         const chosen: Chosen = if (by_editor) chosenModel(request.value) else .{ .provider = extra.provider, .model = request.value };
         const provider_id = self.providerId();
         const switching = if (chosen.provider) |wanted| !std.mem.eql(u8, wanted, provider_id) else false;
+        const change = try loop.beginModelSwitch(chosen.model, if (by_editor) "sdk" else "picker");
         if (switching) {
             try self.useProvider(catalog.find(chosen.provider.?) orelse return error.UnknownProvider, null, null);
         }
-        try loop.switchModel(chosen.model);
+        try loop.commitModelSwitch(change);
         self.rememberModel();
         if (extra.effort) |level| try self.chooseEffort(level) else self.restoreEffort();
         if (switching) self.announceProvider();
@@ -1850,6 +1881,7 @@ const Session = struct {
     /// the streaming request, and the status. With `send` false, only note
     /// it as sent, for a snapshot about to carry it.
     fn publish(self: *Session, arena: std.mem.Allocator, send: bool) !void {
+        try self.agent.shareDirectory(self.stack.loop.workingDirectory());
         const convo = &self.stack.convo;
         for (convo.messages.items) |*msg| {
             const mark = signature(msg);
@@ -1962,10 +1994,12 @@ const Session = struct {
     /// skills, and compacting.
     fn tellCommands(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
         const skills = self.stack.skills.skills;
-        const commands = try arena.alloc(protocol.Command, skills.len + 2);
+        const commands = try arena.alloc(protocol.Command, skills.len + 4);
         commands[0] = .{ .name = "compact", .description = "Summarise the conversation so far to free up context" };
         commands[1] = .{ .name = "hooks", .description = "Review, trust and control lifecycle hooks", .input = .{ .hint = "[list|review|trust|revoke|enable|disable] [id]" } };
-        for (skills, commands[2..]) |found, *command| command.* = .{
+        commands[2] = .{ .name = "cd", .description = "Change the session working directory", .input = .{ .hint = "[path]" } };
+        commands[3] = .{ .name = "add-dir", .description = "Add a permitted directory to this session", .input = .{ .hint = "path" } };
+        for (skills, commands[4..]) |found, *command| command.* = .{
             .name = found.id,
             .description = if (found.description.len > 0) found.description else found.name,
             .input = .{ .hint = "what to do, if anything" },
@@ -2034,7 +2068,8 @@ const Session = struct {
             if (thinking.len > self.told_thinking) self.tell(.{ .agent_thought_chunk = .{ .content = .{ .text = thinking[self.told_thinking..] } } });
         }
         const streamed = self.told_text.items;
-        const rest = if (std.mem.startsWith(u8, msg.text, streamed)) msg.text[streamed.len..] else msg.text;
+        const visible = msg.displayedText();
+        const rest = if (std.mem.startsWith(u8, visible, streamed)) visible[streamed.len..] else visible;
         if (rest.len > 0) self.tell(.{ .agent_message_chunk = .{ .content = .{ .text = rest } } });
     }
 
@@ -2125,6 +2160,8 @@ const Session = struct {
             .title = loop.title(),
             .handle = self.handle,
             .root = self.cwd,
+            .cwd = loop.workingDirectory(),
+            .additional_roots = loop.additional_roots.items,
             .project = self.stack.project.root,
             .branch = self.stack.project.branch orelse "",
             .agent = loop.agent.id,
@@ -2279,6 +2316,7 @@ const Session = struct {
             return self.notice(.warning, "Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
         };
         self.announceProvider();
+        self.stack.loop.notifyHook("auth_success", entry.label);
         if (std.mem.eql(u8, entry.id, catalog.chatgpt_id)) self.welcomeToPlanUsage();
     }
 
@@ -2396,6 +2434,7 @@ const Session = struct {
     }
 
     fn startListings(self: *Session, arena: std.mem.Allocator) !void {
+        if (self.stack.loop.model_policy.restrict_routes) return;
         const providers = self.agent.options.source.providers;
         for (catalog.all, 0..) |entry, i| {
             if (self.model_jobs[i] != null) continue;
@@ -2560,6 +2599,8 @@ fn callSignature(call: *const Conversation.ToolCall) u64 {
 fn signature(msg: *const Conversation.Message) u64 {
     var hasher: std.hash.Wyhash = .init(0);
     std.hash.autoHash(&hasher, msg.text.len);
+    std.hash.autoHash(&hasher, msg.display_text != null);
+    if (msg.display_text) |text| hasher.update(text);
     std.hash.autoHash(&hasher, if (msg.thinking) |text| text.len else 0);
     std.hash.autoHash(&hasher, msg.thinking_ms);
     for (msg.tool_calls) |call| {

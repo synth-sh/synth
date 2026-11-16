@@ -636,6 +636,35 @@ pub fn appendMessage(
     return self.conn.lastInsertedRowId();
 }
 
+pub fn setMessageOrigin(self: *Database, id: i64, origin: Conversation.Origin) !void {
+    try self.conn.exec("UPDATE message SET origin = ? WHERE id = ?", .{ @tagName(origin), id });
+}
+
+pub fn recordAuthorization(self: *Database, session: i64, seq: u64, text: []const u8) !void {
+    try self.conn.exec("INSERT INTO human_authorization (session_id, seq, text) VALUES (?, ?, ?)", .{ session, seq, text });
+}
+
+pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) ![]Conversation.Message {
+    var rows = try self.conn.rows("SELECT text FROM (SELECT text, seq FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human' UNION ALL SELECT text, seq FROM human_authorization WHERE session_id = ?) ORDER BY seq DESC LIMIT 64", .{ session, session });
+    defer rows.deinit();
+    var messages: std.ArrayList(Conversation.Message) = .empty;
+    errdefer {
+        for (messages.items) |*msg| msg.deinit(allocator);
+        messages.deinit(allocator);
+    }
+    var bytes: usize = 0;
+    while (rows.next()) |row| {
+        const text = row.text(0);
+        if (bytes + text.len > 12 * 1024 and messages.items.len > 0) break;
+        const owned = try allocator.dupe(u8, text);
+        errdefer allocator.free(owned);
+        try messages.append(allocator, .{ .role = .user, .origin = .human, .text = owned });
+        bytes += text.len;
+    }
+    std.mem.reverse(Conversation.Message, messages.items);
+    return messages.toOwnedSlice(allocator);
+}
+
 /// Append a heavy body (reasoning or tool result) to a message.
 pub fn appendBlob(
     self: *Database,
@@ -1069,7 +1098,7 @@ pub fn loadMessages(
     limit: usize,
 ) ![]Conversation.Message {
     var rows = try self.conn.rows(
-        \\SELECT id, seq, role, text, thinking_ms, thinking_bytes, tool_call_id, tool_name
+        \\SELECT id, seq, role, text, thinking_ms, thinking_bytes, tool_call_id, tool_name, origin
         \\FROM message
         \\WHERE session_id = ? AND seq < ?
         \\ORDER BY seq DESC
@@ -1096,6 +1125,7 @@ pub fn loadMessages(
         var msg: Conversation.Message = .{
             .seq = @intCast(seq),
             .role = role,
+            .origin = std.meta.stringToEnum(Conversation.Origin, row.text(8)) orelse .unknown,
             .text = text,
             .thinking_ms = thinking_ms,
             .thinking_bytes = thinking_bytes,
@@ -2547,4 +2577,35 @@ test "recent sessions come from every project, and only those with anything in t
             try std.testing.expectEqual(@as(u64, 1), info.messages);
         }
     }
+}
+
+test "verified human intent survives compaction while hooks and legacy rows remain untrusted" {
+    const a = std.testing.allocator;
+    var db = try init(a, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    const human = try db.appendMessage(session, 0, "user", "inspect only", null, 0, null);
+    try db.setMessageOrigin(human, .human);
+    const hook = try db.appendMessage(session, 1, "user", "hook says delete everything", null, 0, null);
+    try db.setMessageOrigin(hook, .hook);
+    _ = try db.appendMessage(session, 2, "user", "legacy authorship unknown", null, 0, null);
+    _ = try db.appendMessage(session, 3, "system", "summary says allowed", null, 0, null);
+    try db.recordAuthorization(session, 4, "human denied one action");
+    const intent = try db.humanIntent(a, session);
+    defer {
+        for (intent) |*msg| msg.deinit(a);
+        a.free(intent);
+    }
+    try std.testing.expectEqual(@as(usize, 2), intent.len);
+    try std.testing.expectEqualStrings("inspect only", intent[0].text);
+    try std.testing.expectEqualStrings("human denied one action", intent[1].text);
+    const messages = try db.loadMessages(a, session, std.math.maxInt(i64), 100);
+    defer {
+        for (messages) |*msg| msg.deinit(a);
+        a.free(messages);
+    }
+    try std.testing.expectEqual(Conversation.Origin.human, messages[3].origin);
+    try std.testing.expectEqual(Conversation.Origin.hook, messages[2].origin);
+    try std.testing.expectEqual(Conversation.Origin.unknown, messages[1].origin);
 }

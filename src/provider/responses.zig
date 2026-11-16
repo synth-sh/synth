@@ -34,6 +34,7 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     const w = &out.writer;
     try w.writeAll("{\"model\":");
     try writeString(w, options.model);
+    if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
     try w.writeAll(",\"input\":[");
     var input: InputWriter = .{ .writer = w, .supports_vision = options.supports_vision, .provider_tag = options.provider_tag };
     try input.text("developer", Item.input_text, instructions);

@@ -123,6 +123,7 @@ pub fn startLike(self: *OllamaProvider, other: *const OllamaProvider) !void {
     self.think = other.think;
     self.supports_tools = other.supports_tools;
     self.supports_vision = other.supports_vision;
+    self.retries = other.retries;
 }
 
 /// Read what this model can do and how much it can hold.
@@ -206,7 +207,8 @@ pub fn listModels(self: *OllamaProvider, allocator: std.mem.Allocator) ![][]cons
 /// Build the client without asking the server about the configured model. The
 /// listing does not need a context limit, and probing a model that is not
 /// pulled yet would fail the command.
-fn startWithoutProbe(self: *OllamaProvider) !void {
+pub fn startWithoutProbe(self: *OllamaProvider) !void {
+    self.think = self.want_think;
     var headers: []const std.http.Header = &.{};
     if (self.api_key) |key| {
         self.auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
@@ -556,7 +558,8 @@ fn waitAndRetry(
         if (s.stopped(s.userdata)) return false;
     }
 
-    const wait = retry.waitMs(self.retries, attempt, null);
+    const proposed = retry.waitMs(self.retries, attempt, null);
+    const wait = if (sink) |s| s.retryDelay(attempt, proposed) orelse return false else proposed;
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
 
     if (sink) |s| {
@@ -720,7 +723,10 @@ fn respond(
     var sends: usize = 1;
     var stream = while (true) {
         if (hook_attempt) |*attempt| attempt.finish();
-        hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
+        var attempt_turn = turn;
+        attempt_turn.hook_input.model = self.model;
+        attempt_turn.hook_input.provider = self.provider().name;
+        hook_attempt = Provider.Attempt.begin(attempt_turn, allocator, sink);
         if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
         messages = try self.buildMessages(convo, arena, system, turn.instruction, budget);
         const request: Ollama.ChatRequest = .{
@@ -729,7 +735,7 @@ fn respond(
             .stream = true,
             .think = if (self.think) .{ .bool = true } else null,
             .tools = tools,
-            .options = if (self.requestedContext()) |n| .{ .num_ctx = n } else null,
+            .options = .{ .num_ctx = self.requestedContext(), .temperature = turn.settings.temperature, .num_predict = turn.settings.max_output_tokens },
         };
 
         break self.client.chat(request) catch |err| {

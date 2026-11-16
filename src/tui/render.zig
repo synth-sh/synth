@@ -894,6 +894,7 @@ pub fn drawApproval(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surfa
         .name = call.name,
         .description = self.mirror.status.pending_description,
         .arguments = call.arguments,
+        .prepared_action = call.prepared_action,
         .project = self.projectLabel(),
         .proposals = self.mirror.status.pending_proposals,
         .width = width,

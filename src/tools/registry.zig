@@ -28,12 +28,23 @@ pub fn init(allocator: std.mem.Allocator) !Registry {
 
     for (filesystem.all) |t| try self.register(t);
     for (shell.all) |t| try self.register(t);
+    try self.register(.{
+        .name = "cd",
+        .description = "Change the session working directory for subsequent tool calls. Use this instead of cd inside bash when the change should persist.",
+        .schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}",
+        .handler = changeDirectory,
+        .read_only = true,
+    });
     for (task.all) |t| try self.register(t);
     for (ask.all) |t| try self.register(t);
     for (todo.all) |t| try self.register(t);
     for (web.all) |t| try self.register(t);
 
     return self;
+}
+
+fn changeDirectory(ctx: Context, _: Input) !Output {
+    return Output.err(try ctx.allocator.dupe(u8, "cd needs an agent session"));
 }
 
 pub fn deinit(self: *Registry) void {
@@ -179,7 +190,7 @@ test "schema is valid JSON the model can be shown" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(usize, 12), parsed.value.array.items.len);
+    try std.testing.expectEqual(@as(usize, 13), parsed.value.array.items.len);
 }
 
 test "unknown tools and bad arguments come back as errors, not failures" {

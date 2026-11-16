@@ -75,6 +75,7 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     const w = &out.writer;
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(options.model, .{}, w);
+    if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
     try w.print(",\"stream\":true,\"max_tokens\":{d},\"system\":", .{@max(@as(u32, 1), options.max_output_tokens)});
     const system = try window.systemText(arena, turn.system, kept, 0);
     if (system.len > 0) {

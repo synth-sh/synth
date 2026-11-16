@@ -908,9 +908,9 @@ pub fn showReplacedTranscript(self: *Model) !void {
     self.scroll = 0;
     self.slash.skills = self.mirror.skills;
     const where = if (std.mem.eql(u8, self.mirror.host, remote_client.here))
-        try homeRelative(self.allocator, if (self.environ) |env| env.get("HOME") else null, self.mirror.status.root)
+        try homeRelative(self.allocator, if (self.environ) |env| env.get("HOME") else null, self.mirror.status.cwd)
     else
-        try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ self.mirror.host, self.mirror.status.root });
+        try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ self.mirror.host, self.mirror.status.cwd });
     self.allocator.free(self.cwd_display);
     self.cwd_display = where;
 }

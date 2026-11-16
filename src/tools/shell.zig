@@ -22,7 +22,7 @@ const poll_slice_ms: u64 = 100;
 pub const all: []const tool.Tool = &.{
     .{
         .name = "bash",
-        .description = "Run a shell command from the project root and return its output.",
+        .description = "Run a shell command from the session working directory and return its output. Use the cd tool for a persistent directory change.",
         .schema =
         \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
         ,
@@ -45,7 +45,7 @@ fn bash(ctx: Context, input: Input) !Output {
     var dir = std.Io.Dir.cwd().openDir(ctx.io, ctx.project_root, .{}) catch |err| {
         return Output.err(try std.fmt.allocPrint(
             ctx.allocator,
-            "bash: cannot open project root: {s}",
+            "bash: cannot open working directory: {s}",
             .{@errorName(err)},
         ));
     };

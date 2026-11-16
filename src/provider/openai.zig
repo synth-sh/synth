@@ -122,6 +122,7 @@ pub fn start(self: *OpenAIProvider) !void {
 /// a listing needs: the context window does not matter, and a model the server
 /// has never heard of should not fail the command.
 pub fn startWithoutProbe(self: *OpenAIProvider) !void {
+    self.context_limit = knownWindow(self.model);
     if (self.api_key) |key| {
         if (key.len > 0) {
             self.auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
@@ -140,6 +141,11 @@ pub fn startLike(self: *OpenAIProvider, other: *const OpenAIProvider) !void {
     self.supports_tools = other.supports_tools;
     self.supports_vision = other.supports_vision;
     self.send_stream_options = other.send_stream_options;
+    self.wire = other.wire;
+    self.max_output_tokens = other.max_output_tokens;
+    self.versioned_paths = other.versioned_paths;
+    self.state_tag = other.state_tag;
+    self.retries = other.retries;
 }
 
 /// Read the context window for the current model.
@@ -542,7 +548,10 @@ fn respond(
 
     var attempt: usize = 1;
     while (true) {
-        var hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
+        var attempt_turn = turn;
+        attempt_turn.hook_input.model = self.model;
+        attempt_turn.hook_input.provider = self.provider().name;
+        var hook_attempt = Provider.Attempt.begin(attempt_turn, allocator, sink);
         defer hook_attempt.finish();
         errdefer |err| hook_attempt.error_message = @errorName(err);
         if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
@@ -579,7 +588,14 @@ fn respond(
             self.captureRejection(response.head.status, why);
             hook_attempt.error_message = if (Provider.mentionsOverflow(why)) "ContextTooLarge" else "HttpError";
             hook_attempt.finish();
-            if (self.retryWithout(why)) continue;
+            if (attempt < self.retries.attempts and self.retryWithout(why)) {
+                const wait = if (sink) |s| s.retryDelay(attempt, 0) else @as(?u64, 0);
+                if (wait) |delay| {
+                    try std.Io.sleep(self.io, .fromMilliseconds(@intCast(delay)), .awake);
+                    attempt += 1;
+                    continue;
+                }
+            }
 
             if (self.waitAndRetry(response.head.status, attempt, asked_for, sink)) {
                 attempt += 1;
@@ -678,7 +694,8 @@ fn waitAndRetry(
         if (s.stopped(s.userdata)) return false;
     }
 
-    const wait = retry.waitMs(self.retries, attempt, retry_after_ms);
+    const proposed = retry.waitMs(self.retries, attempt, retry_after_ms);
+    const wait = if (sink) |s| s.retryDelay(attempt, proposed) orelse return false else proposed;
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
 
     if (sink) |s| {
@@ -935,19 +952,21 @@ fn buildRequest(
     convo: *Conversation,
     turn: Provider.Turn,
 ) ![]u8 {
+    if (self.wire == .messages and turn.settings.reasoning_effort != null) return error.UnsupportedModelSettings;
     switch (self.wire) {
         .responses => return responses.buildRequest(.{
+            .effort = turn.settings.reasoning_effort orelse "",
             .model = self.model,
             .context_limit = self.context_limit,
             .supports_vision = self.supports_vision,
             .provider_tag = self.state_tag,
-            .max_output_tokens = self.max_output_tokens,
+            .max_output_tokens = turn.settings.max_output_tokens orelse self.max_output_tokens,
         }, arena, convo, turn),
         .messages => return anthropic.buildRequest(.{
             .model = self.model,
             .context_limit = self.context_limit,
             .vision = self.supports_vision,
-            .max_output_tokens = if (self.max_output_tokens > 0) self.max_output_tokens else 4096,
+            .max_output_tokens = turn.settings.max_output_tokens orelse if (self.max_output_tokens > 0) self.max_output_tokens else 4096,
         }, arena, convo, turn),
         .chat => {},
     }
@@ -957,6 +976,12 @@ fn buildRequest(
     try w.writeAll("{\"model\":");
     try std.json.Stringify.encodeJsonString(self.model, .{}, w);
     try w.writeAll(",\"stream\":true");
+    if (turn.settings.reasoning_effort) |v| {
+        try w.writeAll(",\"reasoning_effort\":");
+        try std.json.Stringify.value(v, .{}, w);
+    }
+    if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
+    if (turn.settings.max_output_tokens) |v| try w.print(",\"max_completion_tokens\":{d}", .{v});
     if (self.send_stream_options) {
         try w.writeAll(",\"stream_options\":{\"include_usage\":true}");
     }
@@ -1973,13 +1998,13 @@ test "actual retries emit one paired hook trace per model attempt" {
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
-    const logger: Hooks.Hook = .{ .command = "cat >> requests" };
+    const logger: Hooks.Hook = .{ .command = "cat >> requests", .when = .{ .agent_scope = .subagent, .request_purpose = .approval_judge, .model = "fake" } };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .pre_model_request = &.{logger}, .post_model_request = &.{logger} } };
     var attempts: std.atomic.Value(u32) = .init(0);
     var convo: Conversation = .init(testing.allocator);
     defer convo.deinit();
     try convo.add(.user, "go");
-    var reply = try respond(&backend, &convo, .{ .system = "test", .hooks = &runner, .attempts = &attempts }, testing.allocator, null);
+    var reply = try respond(&backend, &convo, .{ .system = "test", .hooks = &runner, .attempts = &attempts, .hook_input = .{ .event = .pre_model_request, .agent_scope = .subagent, .request_purpose = .approval_judge, .model = "stale" } }, testing.allocator, null);
     defer reply.deinit(testing.allocator);
     try future.await(testing.io);
     try testing.expectEqualStrings("done", reply.text);
@@ -1991,6 +2016,9 @@ test "actual retries emit one paired hook trace per model attempt" {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
         defer parsed.deinit();
         const fields = parsed.value.object;
+        try testing.expectEqualStrings("subagent", parsed.value.object.get("agent_scope").?.string);
+        try testing.expectEqualStrings("approval_judge", parsed.value.object.get("request_purpose").?.string);
+        try testing.expectEqualStrings("fake", parsed.value.object.get("model").?.string);
         try testing.expectEqualStrings(event, fields.get("hook_event_name").?.string);
         try testing.expectEqual(@as(i64, @intCast(index / 2 + 1)), fields.get("attempt").?.integer);
         if (index == 1) {

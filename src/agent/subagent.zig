@@ -226,9 +226,18 @@ pub const Runner = struct {
             &child.reads,
             parent.project_root,
         );
+        errdefer if (!child.started) child.loop.deinit();
+        if (parent.working_directory) |path| child.loop.working_directory = try parent.allocator.dupe(u8, path);
+        for (parent.additional_roots.items) |path| {
+            const owned = try parent.allocator.dupe(u8, path);
+            errdefer parent.allocator.free(owned);
+            try child.loop.additional_roots.append(parent.allocator, owned);
+        }
         child.loop.project = parent.project;
         child.loop.skills = parent.skills;
         child.loop.hooks = parent.hooks;
+        child.loop.backend = if (child.backend) |backend| &backend.backend else parent.backend;
+        child.loop.model_policy = parent.model_policy;
         child.loop.system_prompt = parent.system_prompt;
         child.loop.commit_trailer = parent.commit_trailer;
         child.loop.delegate = null;
@@ -835,16 +844,39 @@ test "child tools inherit pre-tool denial and return its reason to the parent" {
     const harness = try Harness.init();
     defer harness.deinit();
     const Hooks = @import("../core/hooks.zig");
-    const hooks: Hooks.Runner = .{ .io = testing.io, .root = ".", .set = .{ .pre_tool_use = &.{.{ .matcher = "read", .command = "echo child read denied >&2; exit 2" }} } };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(testing.io, &buffer)];
+    harness.parent.project_root = root;
+    const hooks: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .pre_tool_use = &.{
+        .{ .matcher = "read", .command = "touch wrong-main-policy", .when = .{ .agent_scope = .main } },
+        .{ .matcher = "read", .command = "cat > child-policy.json; echo child read denied >&2; exit 2", .when = .{ .agent_scope = .subagent, .agent_type = "task", .model = "fake" } },
+    } } };
     harness.parent.hooks = &hooks;
+    var parent_calls = [_]Conversation.ToolCall{.{ .id = "delegate-42", .name = "task", .arguments = "{}" }};
+    const parent_call = try harness.convo.append(.{ .role = .assistant, .text = "delegating", .tool_calls = &parent_calls });
+    harness.parent.pending_seq = parent_call.seq;
     harness.fake.script = &.{
-        .{ .call = .{ .name = "read", .arguments = "{\"path\":\"README.md\"}" } },
+        .{ .call = .{ .name = "read", .arguments = "{\"path\":\"README.md\",\"agent_scope\":\"main\",\"request_purpose\":\"approval_judge\",\"model\":\"spoofed\"}" } },
         .{ .text = "checked" },
     };
     const answer = try runTask(harness, .{ .agent = "task", .prompt = "read a file" });
     defer testing.allocator.free(answer);
     try testing.expect(std.mem.indexOf(u8, answer, "child read denied") != null);
     try testing.expect(std.mem.indexOf(u8, answer, "Subagent hook") != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, "wrong-main-policy", .{}));
+    const trace = try tmp.dir.readFileAlloc(testing.io, "child-policy.json", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(trace);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, trace, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("subagent", parsed.value.object.get("agent_scope").?.string);
+    try testing.expectEqualStrings("fake", parsed.value.object.get("model").?.string);
+    try testing.expectEqualStrings("spoofed", parsed.value.object.get("tool_input").?.object.get("model").?.string);
+    try testing.expectEqualStrings("agent", parsed.value.object.get("request_purpose").?.string);
+    try testing.expectEqualStrings("delegate-42", parsed.value.object.get("parent_tool_call_id").?.string);
+    try testing.expectEqualStrings(&harness.parent.hook_identity, parsed.value.object.get("parent_agent_id").?.string);
+    try testing.expect(!std.mem.eql(u8, &harness.parent.hook_identity, parsed.value.object.get("agent_id").?.string));
 }
 
 test "subagent lifecycle context and continuation retain child identity" {
@@ -880,4 +912,40 @@ test "subagent lifecycle context and continuation retain child identity" {
         try testing.expectEqualStrings(&harness.parent.hook_identity, fields.get("session_id").?.string);
     }
     try testing.expect(lines.next() == null);
+}
+
+test "a child snapshots directory state without sharing mutable parent storage" {
+    const harness = try Harness.init();
+    defer harness.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "sub");
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(testing.io, &buffer)];
+    harness.parent.project_root = root;
+    try harness.parent.changeDirectory("sub");
+    const extra = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(extra);
+    try harness.parent.addDirectory(extra, "register_repo_root");
+    harness.fake.script = &.{.{ .text = "ready" }};
+    var child: Child = .{
+        .agent = "task",
+        .prompt = "inspect",
+        .label = "inspect",
+        .index = 0,
+        .cancelled = null,
+        .progress = null,
+        .convo = .init(testing.allocator),
+        .reads = .init(testing.allocator),
+    };
+    defer child.convo.deinit();
+    defer child.reads.deinit();
+    try harness.runner.begin(&child);
+    defer child.loop.deinit();
+    try testing.expectEqualStrings(harness.parent.workingDirectory(), child.loop.workingDirectory());
+    try testing.expect(child.loop.working_directory.?.ptr != harness.parent.working_directory.?.ptr);
+    try testing.expectEqualStrings(extra, child.loop.additional_roots.items[0]);
+    try testing.expect(child.loop.additional_roots.items[0].ptr != harness.parent.additional_roots.items[0].ptr);
+    try harness.parent.changeDirectory("..");
+    try testing.expect(std.mem.endsWith(u8, child.loop.workingDirectory(), "/sub"));
 }

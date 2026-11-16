@@ -202,7 +202,7 @@ pub fn replay(arena: std.mem.Allocator, root: []const u8, messages: []const Conv
         .user => if (msg.text.len > 0) try out.append(arena, .{ .user_message_chunk = .{ .content = .{ .text = msg.text } } }),
         .assistant => {
             if (msg.thinking) |thinking| try out.append(arena, .{ .agent_thought_chunk = .{ .content = .{ .text = thinking } } });
-            if (msg.text.len > 0) try out.append(arena, .{ .agent_message_chunk = .{ .content = .{ .text = msg.text } } });
+            if (msg.displayedText().len > 0) try out.append(arena, .{ .agent_message_chunk = .{ .content = .{ .text = msg.displayedText() } } });
             for (msg.tool_calls, 0..) |*call, index| try out.append(arena, .{ .tool_call = try toolCall(arena, root, msg.seq, index, call) });
         },
         .system, .tool, .summary => {},

@@ -17,7 +17,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `system_prompt` | string | the built-in brief | Replaces the base instructions entirely. |
 | `think` | bool | `true` | Ask for reasoning output. Turn off for models that do not support it. |
 | `auto_approve_safe_commands` | bool | `true` | Let a preset of read-only shell commands run without a prompt. Off makes every command a question, however harmless. |
-| `approvals` | string | `"ask"` | Who decides a call that would otherwise ask: `ask` puts it to you, `auto` has the session's model judge it (see [Auto approvals](usage.md#auto-approvals)), `all` runs everything, paths outside the project included - for a machine set aside for the agent. `PreToolUse` hooks still run under each. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
+| `approvals` | string | `"ask"` | Who decides a call that would otherwise ask: `ask` puts it to you, `auto` has the configured reviewer judge it (the session model by default; see [Auto approvals](usage.md#auto-approvals)), `all` runs everything, paths outside the project included - for a machine set aside for the agent. `PreToolUse` hooks still run under each. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |
@@ -25,7 +25,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See [MCP](mcp.md). |
-| `hooks` | object | none | Legacy command lists or grouped command/MCP lifecycle handlers. Inline, user, and project sources are additive. Every definition needs explicit trust; see [Hooks](hooks.md). |
+| `hooks` | object | none | 30 lifecycle events, with legacy command lists or grouped command/MCP handlers. Inline, user, and project sources are additive. Optional `when` filters select agent scope, request purpose, role, model, and provider. Every definition needs explicit trust; see [Hooks](hooks.md#targeted-routing). |
 | `hook_timeout_ms` | integer | `30000` | Default hook timeout, 1–86,400,000 ms. A handler can override `timeout_ms`; shutdown/interruption cleanup is capped separately. |
 | `web` | object | none | Settings for the web tools. See below. |
 | `prune` | object | shed after 30 days | What a prune throws away. See [Pruning](#pruning). |
@@ -139,3 +139,66 @@ synth db vacuum        hand freed pages back to the filesystem
 `db status` is a dry run: it says what a prune would take without taking it.
 A day count given to `db prune` only ever sheds, so losing a transcript stays
 something `config.json` has to ask for.
+
+## Purpose-based models and approval review
+
+`model_requests` selects models independently for agent turns, automatic approval
+review, and compaction. For a local-only configuration:
+
+```json
+{
+  "approvals": "auto",
+  "auto_approve_safe_commands": false,
+  "model_requests": {
+    "restrict_routes": true,
+    "agent": "local-agent",
+    "approval_judge": "local-review",
+    "compaction": "local-agent",
+    "reviewer_timeout_ms": 30000,
+    "reviewer_fallback": "deny",
+    "routes": [
+      {
+        "id": "local-agent",
+        "provider": "ollama",
+        "endpoint": "http://localhost:11434",
+        "model": "qwen3",
+        "context_limit": 32768,
+        "purposes": ["agent", "compaction"],
+        "settings": {"max_output_tokens": 8192}
+      },
+      {
+        "id": "local-review",
+        "provider": "openai",
+        "endpoint": "http://localhost:8080/v1",
+        "model": "reviewer",
+        "context_limit": 8192,
+        "purposes": ["approval_judge"],
+        "settings": {"temperature": 0, "max_output_tokens": 1024, "attempts": 1}
+      }
+    ]
+  }
+}
+```
+
+Omitting a purpose uses the active provider unless `restrict_routes` is enabled.
+Each request owns an independent backend client. Selecting a reviewer or
+compaction model does not mutate the agent's model. Route credentials are
+optional and explicit (`api_key`); an active provider's credential is never
+forwarded to a configured route.
+
+The review deadline defaults to 30 seconds, including preparation and retries;
+it can be set from 1 to 300000 ms. Failure, timeout, malformed verdicts, invalid
+routing, or missing verified human intent use `reviewer_fallback`: `ask` by
+default, or `deny`. Neither fallback permits an action automatically. Legacy
+sessions with unknown message provenance need a fresh human request for automatic
+review. Ordinary read-only and configured standing allowances still follow the
+existing approval rules.
+
+See [model customization hooks](hooks.md#model-request-customization) for request
+context, generation settings, and bounded retry controls.
+
+A route may set `context_limit` (0–1048576 tokens). Zero uses the backend
+default or known model table. For local models, set their usable context window;
+Ollama also receives this value as `num_ctx`. With restricted routes, provider
+auto-discovery and model/provider switching are disabled. Explicit tool and hook
+network access remains governed by tool permissions and hook trust.

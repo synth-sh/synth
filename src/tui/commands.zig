@@ -54,6 +54,19 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         try pruneNow(self, ctx);
         return true;
     }
+    if (isCommand(line, "/cd")) {
+        if (self.mirror.isBusy()) return refuseCommand(self, ctx, line);
+        const path = std.mem.trim(u8, line[3..], " ");
+        if (path.len == 0) {
+            try self.notification.showFmt(ctx, .info, "{s}", .{self.mirror.status.cwd});
+        } else try self.mirror.changeDirectory(path);
+        return true;
+    }
+    if (isCommand(line, "/add-dir")) {
+        if (self.mirror.isBusy()) return refuseCommand(self, ctx, line);
+        try self.mirror.addDirectory(std.mem.trim(u8, line[8..], " "));
+        return true;
+    }
     if (std.mem.eql(u8, line, "/compact")) {
         if (try offerProvidersInstead(self)) return true;
         if (self.mirror.isBusy()) return refuseCommand(self, ctx, line);

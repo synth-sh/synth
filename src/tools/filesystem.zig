@@ -267,12 +267,29 @@ fn scopeOf(ctx: Context, path: []const u8) ![]const u8 {
     return ctx.allocator.dupe(u8, resolved[ctx.project_root.len + 1 ..]);
 }
 
-fn globTool(ctx: Context, input: Input) !Output {
+fn searchBase(ctx: Context, path: []const u8) ![]const u8 {
+    const resolved = try resolve(ctx, path);
+    defer ctx.allocator.free(resolved);
+    if (under(resolved, ctx.project_root)) return ctx.allocator.dupe(u8, ctx.project_root);
+    for (ctx.additional_roots) |root| {
+        if (under(resolved, root)) return ctx.allocator.dupe(u8, root);
+    }
+    const stat = try std.Io.Dir.cwd().statFile(ctx.io, resolved, .{});
+    return ctx.allocator.dupe(u8, if (stat.kind == .directory) resolved else std.fs.path.dirname(resolved) orelse resolved);
+}
+
+fn globTool(context: Context, input: Input) !Output {
+    var ctx = context;
     const pattern = input.string("pattern") orelse
         return Output.err(try ctx.allocator.dupe(u8, "glob: 'pattern' is required"));
     const path = input.string("path") orelse ".";
 
-    const scope = scopeOf(ctx, path) catch |err| return pathError(ctx, path, err);
+    const scope_path = resolve(ctx, path) catch |err| return pathError(ctx, path, err);
+    defer ctx.allocator.free(scope_path);
+    const base = searchBase(ctx, scope_path) catch |err| return pathError(ctx, path, err);
+    defer ctx.allocator.free(base);
+    ctx.project_root = base;
+    const scope = scopeOf(ctx, scope_path) catch |err| return pathError(ctx, path, err);
     defer if (scope.len > 0) ctx.allocator.free(scope);
 
     var set: glob.Set = glob.Set.init(ctx.allocator, pattern) catch |err| {
@@ -374,7 +391,8 @@ fn isBinary(source: []const u8) bool {
     return std.mem.indexOfScalar(u8, head, 0) != null;
 }
 
-fn grep(ctx: Context, input: Input) !Output {
+fn grep(context: Context, input: Input) !Output {
+    var ctx = context;
     const pattern = input.string("pattern") orelse
         return Output.err(try ctx.allocator.dupe(u8, "grep: 'pattern' is required"));
     const path = input.string("path") orelse ".";
@@ -385,7 +403,12 @@ fn grep(ctx: Context, input: Input) !Output {
     const before = window(input.integer("before") orelse shared);
     const after = window(input.integer("after") orelse shared);
 
-    const scope = scopeOf(ctx, path) catch |err| return pathError(ctx, path, err);
+    const scope_path = resolve(ctx, path) catch |err| return pathError(ctx, path, err);
+    defer ctx.allocator.free(scope_path);
+    const base = searchBase(ctx, scope_path) catch |err| return pathError(ctx, path, err);
+    defer ctx.allocator.free(base);
+    ctx.project_root = base;
+    const scope = scopeOf(ctx, scope_path) catch |err| return pathError(ctx, path, err);
     defer if (scope.len > 0) ctx.allocator.free(scope);
 
     var matcher = Matcher.init(ctx.allocator, pattern, literal, ignore_case) catch |err| {
@@ -1110,4 +1133,31 @@ test "a search that ran out of time says so rather than saying cancelled" {
     defer testing.allocator.free(searched.content);
     try testing.expect(searched.is_error);
     try testing.expectEqualStrings("search timed out", searched.content);
+}
+
+test "glob and grep can scope an added root while relative paths keep their base" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.tmp.dir.createDirPath(testing.io, "primary/nested");
+    try fixture.tmp.dir.createDirPath(testing.io, "extra");
+    try fixture.writeFile("extra/found.zig", "const found = true;\n");
+    const primary = try std.fs.path.join(testing.allocator, &.{ fixture.root, "primary", "nested" });
+    defer testing.allocator.free(primary);
+    const extra = try std.fs.path.join(testing.allocator, &.{ fixture.root, "extra" });
+    defer testing.allocator.free(extra);
+    var ctx = fixture.context();
+    ctx.project_root = primary;
+    ctx.additional_roots = &.{extra};
+    const args = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"path\":\"../../extra\",\"pattern\":\"**/*.zig\"}", .{});
+    defer args.deinit();
+    const matches = try globTool(ctx, .{ .arguments = args.value });
+    defer testing.allocator.free(matches.content);
+    try testing.expect(!matches.is_error);
+    try testing.expectEqualStrings("found.zig\n", matches.content);
+    const grep_args = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"path\":\"../../extra\",\"pattern\":\"const found\"}", .{});
+    defer grep_args.deinit();
+    const result = try grep(ctx, .{ .arguments = grep_args.value });
+    defer testing.allocator.free(result.content);
+    try testing.expect(!result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.content, "found.zig") != null);
 }

@@ -44,6 +44,7 @@ hook_runtime: Hooks.Runtime,
 hook_inline: Hooks.Set,
 hook_home: ?[]const u8,
 hook_state_path: ?[]const u8,
+hook_config_path: []const u8,
 runner: subagent.Runner,
 loop: Loop,
 
@@ -121,6 +122,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.hook_inline = config.hooks;
     self.hook_home = options.home;
     self.hook_state_path = config.hook_state_path;
+    self.hook_config_path = config.path;
     var hook_store = try HookStore.Store.init(allocator, io, config.hook_state_path);
     defer hook_store.deinit();
     const discovered_hooks = try HookStore.discover(self.arena.allocator(), io, config.hooks, self.project.root, options.home, config.hook_timeout_ms, hook_store);
@@ -142,6 +144,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     }
     self.loop.auto_approve_safe = config.auto_approve_safe_commands;
     self.loop.approvals = config.approvals;
+    self.loop.backend = options.backend;
+    self.loop.model_policy = config.model_requests;
     if (config.max_turn_ms) |ms| self.loop.max_turn_ms = ms;
     if (config.max_stall_ms) |ms| self.loop.max_stall_ms = ms;
     if (config.max_turn_tokens) |tokens| self.loop.max_turn_tokens = tokens;
@@ -154,6 +158,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     if (options.db) |db| {
         try self.loop.attachDatabase(db, self.project.name(), self.project.cwd, options.provider.model);
     }
+    try self.loop.hook_watch.configure(allocator, io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills);
+    try self.loop.trackModel("initial");
     return self;
 }
 
@@ -162,10 +168,42 @@ pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore
     if (!self.loop.isBusy()) {
         var store = try HookStore.Store.init(allocator, self.hooks.io, self.hook_state_path);
         defer store.deinit();
-        self.hooks.set = try HookStore.discover(self.arena.allocator(), self.hooks.io, self.hook_inline, self.project.root, self.hook_home, self.hooks.timeout_ms, store);
+        const discovered = try HookStore.discover(self.arena.allocator(), self.hooks.io, self.hook_inline, self.project.root, self.hook_home, self.hooks.timeout_ms, store);
+        for (try changedHookSources(self.arena.allocator(), self.hooks.set, discovered)) |changed_source| {
+            const path = if (std.mem.eql(u8, changed_source, "config")) self.hook_config_path else changed_source;
+            const source = if (std.mem.startsWith(u8, path, self.project.root) and (path.len == self.project.root.len or path[self.project.root.len] == '/')) "project_settings" else "user_settings";
+            var result = try self.hooks.evaluate(allocator, try self.loop.exportHookInput(.{ .event = .config_change, .source = source, .file_path = path }));
+            defer result.deinit(allocator);
+            if (result.blocked != null or result.stop) {
+                self.loop.say("Hook configuration change blocked: {s}", .{result.blocked orelse "stopped by hook"});
+                return error.HookBlocked;
+            }
+        }
+        self.hooks.set = discovered;
     }
     try HookStore.change(self.arena.allocator(), self.hooks.io, &self.hooks.set, self.hook_state_path, action, id);
+    if (!self.loop.isBusy()) try self.loop.hook_watch.configure(self.allocator, self.hooks.io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills);
     return HookStore.report(allocator, self.hooks.set, self.hooks.timeout_ms, action == .review, &self.hook_runtime);
+}
+
+fn changedHookSources(allocator: std.mem.Allocator, left: Hooks.Set, right: Hooks.Set) ![][]const u8 {
+    var sources: std.ArrayList([]const u8) = .empty;
+    if (left.config_change.len == 0) return sources.toOwnedSlice(allocator);
+    for ([_]Hooks.Set{ left, right }, [_]Hooks.Set{ right, left }) |before, after| {
+        inline for (std.meta.fields(Hooks.Set)) |field| {
+            for (@field(before, field.name)) |hook| {
+                const unchanged = for (@field(after, field.name)) |other| {
+                    if (std.mem.eql(u8, hook.id, other.id)) break true;
+                } else false;
+                if (unchanged) continue;
+                const seen = for (sources.items) |source| {
+                    if (std.mem.eql(u8, source, hook.source)) break true;
+                } else false;
+                if (!seen) try sources.append(allocator, hook.source);
+            }
+        }
+    }
+    return sources.toOwnedSlice(allocator);
 }
 
 fn callHookMcp(raw: *anyopaque, allocator: std.mem.Allocator, hook: Hooks.Hook, arguments: []const u8, timeout_ms: u64, stop: ?*const std.atomic.Value(bool)) ![]const u8 {
@@ -279,4 +317,41 @@ test "main-session shutdown emits one bounded command cleanup" {
     try testing.expectEqualStrings("SessionEnd", parsed.value.object.get("hook_event_name").?.string);
     try testing.expectEqualStrings("shutdown", parsed.value.object.get("reason").?.string);
     try testing.expect(lines.next() == null);
+}
+
+test "trusted current config policy blocks replacement definitions before adoption" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.createDirPath(io, ".synth");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data =
+        \\{"ConfigChange":[{"hooks":[{"type":"command","command":"cat >> changes; echo locked >&2; exit 2"}]}]}
+    });
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const trust_path = try std.fs.path.join(a, &.{ cwd, "trust.json" });
+    defer a.free(trust_path);
+    var config: Config = .{ .arena = .init(a), .hook_state_path = trust_path };
+    defer config.arena.deinit();
+    var backend: Backend = .init(.ollama, .{ .allocator = a, .io = io, .host = "http://127.0.0.1:9", .label = "test" });
+    defer backend.deinit();
+    const stack = try create(a, io, .{ .config = &config, .provider = backend.provider(), .cwd = cwd });
+    defer stack.destroy();
+    const id = try a.dupe(u8, stack.hooks.set.config_change[0].id);
+    defer a.free(id);
+    a.free(try stack.manageHooks(a, .trust, id));
+    try tmp.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data =
+        \\{"PreToolUse":[{"command":"touch must-not-run"}]}
+    });
+    try std.testing.expectError(error.HookBlocked, stack.manageHooks(a, .list, ""));
+    try std.testing.expectEqualStrings(id, stack.hooks.set.config_change[0].id);
+    try std.testing.expectEqual(@as(usize, 0), stack.hooks.set.pre_tool_use.len);
+    const trace = try tmp.dir.readFileAlloc(io, "changes", a, .limited(16 * 1024));
+    defer a.free(trace);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, trace, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("project_settings", parsed.value.object.get("source").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, parsed.value.object.get("file_path").?.string, "/.synth/hooks.json"));
 }

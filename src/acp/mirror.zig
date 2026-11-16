@@ -785,6 +785,8 @@ fn keepStatus(self: *Mirror, status: synth.Status) !void {
     kept.title = try arena.dupe(u8, status.title);
     kept.handle = try arena.dupe(u8, status.handle);
     kept.root = try arena.dupe(u8, status.root);
+    kept.cwd = try arena.dupe(u8, status.cwd);
+    kept.additional_roots = try dupeAll(arena, status.additional_roots);
     kept.project = try arena.dupe(u8, status.project);
     kept.branch = try arena.dupe(u8, status.branch);
     kept.agent = try arena.dupe(u8, status.agent);
@@ -1271,6 +1273,14 @@ pub fn rename(self: *Mirror, name: []const u8) !void {
 /// Start a turn on one of the agent's skills, as typed: `/id args`.
 pub fn runSkill(self: *Mirror, line: []const u8) !void {
     try self.submit(line, .{});
+}
+
+pub fn changeDirectory(self: *Mirror, path: []const u8) !void {
+    try self.send(synth.method.change_directory, synth.Directory{ .sessionId = self.status.handle, .path = path }, .{ .command = "Changing directory" });
+}
+
+pub fn addDirectory(self: *Mirror, path: []const u8) !void {
+    try self.send(synth.method.add_directory, synth.Directory{ .sessionId = self.status.handle, .path = path }, .{ .command = "Adding directory" });
 }
 
 /// Hand decisions on calls to `mode`. The status says when it took.
@@ -1941,6 +1951,8 @@ test "a mirror offers the agent's skills, and running one sends the agent's inst
         .data = "---\ndescription: Cut a release\n---\nTag it and push.\n",
     });
 
+    fixture.config.hook_state_path = try std.fs.path.join(fixture.arena.allocator(), &.{ fixture.project, "..", "hook-trust.json" });
+    fixture.config.hooks.user_prompt_expansion = &.{.{ .command = "cat > skill-expansion.json" }};
     const mirror = try openFresh(fixture, &convo);
     defer mirror.close();
     try testing.expectEqual(@as(usize, 1), mirror.skills.len);
@@ -1948,11 +1960,25 @@ test "a mirror offers the agent's skills, and running one sends the agent's inst
     try testing.expectEqualStrings("Cut a release", mirror.skills[0].description);
     try testing.expect(mirror.skill_paths.len > 0);
 
+    try mirror.hooks(.review, "");
+    const review = try pollForAnswer(mirror);
+    defer review.deinit(testing.allocator);
+    try mirror.hooks(.trust, review.hooks[0..64]);
+    const trusted = try pollForAnswer(mirror);
+    defer trusted.deinit(testing.allocator);
     try mirror.runSkill("/release 2.1");
     try pollUntil(mirror, awaitingApproval);
     const asked = convo.messages.items[0];
     try testing.expectEqualStrings("/release 2.1", asked.text);
     try testing.expect(std.mem.indexOf(u8, asked.attachments[0].content, "Tag it and push.") != null);
+    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "project/skill-expansion.json", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(payload);
+    const expanded = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
+    defer expanded.deinit();
+    try testing.expectEqualStrings("UserPromptExpansion", expanded.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("release", expanded.value.object.get("command_name").?.string);
+    try testing.expectEqualStrings("2.1", expanded.value.object.get("command_args").?.string);
+    try testing.expect(std.mem.indexOf(u8, expanded.value.object.get("expanded_prompt").?.string, "Tag it and push.") != null);
 }
 
 fn planning(mirror: *Mirror) bool {
@@ -2105,4 +2131,40 @@ test "hook review and trust flow through the same ACP interface as the TUI" {
     try mirror.submit("blocked before persistence", .{});
     try pollUntil(mirror, finishedAndAnswered);
     try testing.expectEqual(messages_before, convo.messages.items.len);
+}
+
+test "directory APIs and slash commands update session status without a model request" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    try fixture.tmp.dir.createDirPath(testing.io, "project/sub");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "project/sub/here.txt", .data = "here" });
+    try fixture.tmp.dir.createDirPath(testing.io, "extra");
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+    const Ready = struct {
+        fn sub(m: *Mirror) bool {
+            return !m.isBusy() and std.mem.endsWith(u8, m.status.cwd, "/sub");
+        }
+        fn extra(m: *Mirror) bool {
+            return !m.isBusy() and m.status.additional_roots.len == 1;
+        }
+        fn primary(m: *Mirror) bool {
+            return !m.isBusy() and std.mem.eql(u8, m.status.cwd, m.status.project);
+        }
+    };
+    try mirror.changeDirectory("sub");
+    try pollUntil(mirror, Ready.sub);
+    try mirror.listFiles();
+    const listed = try pollForAnswer(mirror);
+    defer listed.deinit(testing.allocator);
+    try testing.expectEqualStrings("here.txt", listed.files[0]);
+    try mirror.addDirectory("../../extra");
+    try pollUntil(mirror, Ready.extra);
+    try mirror.submit("/cd ..", .{});
+    try pollUntil(mirror, Ready.primary);
+    try mirror.submit("/add-dir ../extra", .{});
+    try pollUntil(mirror, Ready.extra);
+    try testing.expectEqual(@as(usize, 0), convo.messages.items.len);
 }

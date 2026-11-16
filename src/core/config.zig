@@ -8,6 +8,8 @@ const pkg = @import("pkg");
 const Hooks = @import("hooks.zig");
 const Database = @import("database.zig");
 
+pub const ModelPolicy = @import("model_policy.zig");
+
 const Config = @This();
 
 /// `$XDG_CONFIG_HOME/<name>/config.json`, or `~/.config/<name>/config.json`. A
@@ -112,6 +114,7 @@ think: bool = true,
 auto_approve_safe_commands: bool = true,
 /// Who decides a call that would otherwise stop for approval.
 approvals: Approvals = .ask,
+model_requests: ModelPolicy.Policy = .{},
 /// How long one turn may run, and what it may spend, before the loop gives up
 /// on it. Zero turns either off. Null means the built-in default: what a
 /// runaway turn costs is the loop's business, not this file's.
@@ -168,6 +171,7 @@ const File = struct {
     think: ?bool = null,
     auto_approve_safe_commands: ?bool = null,
     approvals: ?Approvals = null,
+    model_requests: ?std.json.Value = null,
     debug_log: ?[]const u8 = null,
     max_turn_ms: ?i64 = null,
     max_turn_tokens: ?u64 = null,
@@ -297,6 +301,11 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.max_stall_ms) |value| self.max_stall_ms = value;
     if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
+    if (parsed.model_requests) |value| {
+        const encoded = try std.json.Stringify.valueAlloc(arena, value, .{});
+        self.model_requests = try std.json.parseFromSliceLeaky(ModelPolicy.Policy, arena, encoded, .{});
+        try self.model_requests.validate();
+    }
     if (parsed.hooks) |value| self.hooks = try Hooks.parse(arena, value, path);
     if (parsed.hook_timeout_ms) |value| {
         try Hooks.validTimeout(value);

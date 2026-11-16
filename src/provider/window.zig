@@ -10,7 +10,7 @@ const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
 
 pub fn requestBudget(limit: u32, turn: Provider.Turn) usize {
-    return requestBudgetForOutput(limit, turn, 0);
+    return requestBudgetForOutput(limit, turn, turn.settings.max_output_tokens orelse 0);
 }
 
 pub fn requestBudgetForOutput(limit: u32, turn: Provider.Turn, output_tokens: u32) usize {

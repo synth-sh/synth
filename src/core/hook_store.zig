@@ -166,6 +166,11 @@ pub fn report(allocator: std.mem.Allocator, set: Hooks.Set, timeout_ms: u64, rev
             try writer.writer.print("{s}\n  {s}  {s}  {s}  {s}  {s} timeout={d}ms\n  source: {s}\n  matcher: {s}\n", .{
                 hook.id, event.name(), if (hook.legacy) "legacy serial" else if (hook.async) "background" else "grouped sync", if (hook.trusted) "trusted" else "NEEDS REVIEW", if (hook.enabled) "enabled" else "disabled", @tagName(hook.type), Hooks.effectiveTimeout(event, timeout_ms, hook), hook.source, hook.matcher,
             });
+            if (hook.when) |filter| {
+                try writer.writer.writeAll("  when: ");
+                try std.json.Stringify.value(filter, .{ .emit_null_optional_fields = false }, &writer.writer);
+                try writer.writer.writeByte('\n');
+            }
             if (review) {
                 try writer.writer.writeAll("  definition: ");
                 try std.json.Stringify.value(hook, .{}, &writer.writer);
@@ -183,6 +188,7 @@ pub fn report(allocator: std.mem.Allocator, set: Hooks.Set, timeout_ms: u64, rev
             try writer.writer.print("  recent: {s} {s} {s} {d}ms\n", .{ &record.id, record.event.name(), record.status, record.duration_ms });
             try writer.writer.print("    session={s} turn={s} call={s}\n", .{ std.mem.trimEnd(u8, &record.session_id, "\x00"), std.mem.trimEnd(u8, &record.turn_id, "\x00"), std.mem.trimEnd(u8, &record.call_id, "\x00") });
             try writer.writer.print("    agent={s} request={d} attempt={d}\n", .{ std.mem.trimEnd(u8, &record.agent_id, "\x00"), record.request_id, record.attempt });
+            try writer.writer.print("    scope={s} purpose={s}\n", .{ @tagName(record.agent_scope), @tagName(record.request_purpose) });
             if (record.error_name.len > 0) try writer.writer.print("    error: {s}\n", .{record.error_name});
             if (record.exit_code) |code| try writer.writer.print("    exit: {d}\n", .{code});
         }
@@ -215,4 +221,25 @@ test "discovery is additive and unrelated sources keep stable ids" {
     try std.testing.expect(!std.mem.eql(u8, set.pre_tool_use[2].id, set.pre_tool_use[3].id));
     const more = try discover(a, std.testing.io, .{ .pre_tool_use = &.{ .{ .command = "inline" }, .{ .command = "another" } } }, root, home, 30000, store);
     try std.testing.expectEqualStrings(set.pre_tool_use[2].id, more.pre_tool_use[3].id);
+}
+
+test "changing a routing filter invalidates trust and inspection shows the route" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var store = try Store.init(std.testing.allocator, std.testing.io, null);
+    defer store.deinit();
+    const original = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true" }} }, root, null, 30000, store);
+    try store.put(original.pre_tool_use[0].id, .{ .trusted = true });
+    const unchanged = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true" }} }, root, null, 30000, store);
+    try std.testing.expect(unchanged.pre_tool_use[0].trusted);
+    const routed = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true", .when = .{ .agent_scope = .subagent } }} }, root, null, 30000, store);
+    try std.testing.expect(!routed.pre_tool_use[0].trusted);
+    try std.testing.expect(!std.mem.eql(u8, original.pre_tool_use[0].id, routed.pre_tool_use[0].id));
+    const listed = try report(std.testing.allocator, routed, 30000, false, null);
+    defer std.testing.allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "when: {\"agent_scope\":\"subagent\"}") != null);
 }

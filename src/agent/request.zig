@@ -12,6 +12,10 @@ const Request = @This();
 allocator: std.mem.Allocator,
 io: std.Io,
 provider: Provider,
+provider_mutex: std.Io.Mutex = .init,
+owned_backend: ?*@import("../provider/backend.zig").Spawned = null,
+prepared_conversation: ?Conversation = null,
+started_ms: i64 = 0,
 conversation: *Conversation,
 /// Owned copy of the turn's strings: the loop is free to rebuild its prompt or
 /// switch agents while this is in flight.
@@ -21,6 +25,12 @@ attempt_number: std.atomic.Value(u32) = .init(0),
 thoughts: Thought.Stream,
 /// The answer as it arrives, for the UI to render before the turn lands.
 content: Thought.Stream,
+display_pending: std.ArrayList(u8) = .empty,
+display_index: usize = 0,
+display_bytes: usize = 0,
+display_failed: bool = false,
+display_id: [64]u8 = @splat(0),
+display_id_len: usize = 0,
 
 future: std.Io.Future(void) = undefined,
 /// Whether the future has been awaited and freed. Awaiting twice is undefined,
@@ -56,10 +66,15 @@ pub fn start(
         .provider = provider,
         .conversation = conversation,
         .turn = .{
+            .backend = turn.backend,
+            .model_policy = turn.model_policy,
+            .settings = turn.settings,
             .system = try allocator.dupe(u8, turn.system),
             .tools_json = try allocator.dupe(u8, turn.tools_json),
             .instruction = try allocator.dupe(u8, turn.instruction),
             .compacting = turn.compacting,
+            .display_messages = turn.display_messages,
+            .stream_display = turn.stream_display,
             .hooks = turn.hooks,
             .hook_input = turn.hook_input,
         },
@@ -74,8 +89,18 @@ pub fn start(
         self.content.deinit();
     }
 
+    self.started_ms = tool.monotonicMilliseconds(io);
+    if (turn.backend) |backend| {
+        self.owned_backend = try backend.spawn(allocator);
+        self.provider = self.owned_backend.?.provider();
+    }
+    errdefer if (self.owned_backend) |owned| owned.deinit();
     self.turn.hook_input = try turn.hook_input.dupe(self.hook_arena.allocator());
+    self.turn.hook_input.model = try self.hook_arena.allocator().dupe(u8, provider.model);
+    self.turn.hook_input.provider = try self.hook_arena.allocator().dupe(u8, provider.name);
+    if (turn.compacting) self.turn.hook_input.request_purpose = .compaction;
     self.turn.attempts = &self.attempt_number;
+    self.display_id_len = (try std.fmt.bufPrint(&self.display_id, "{s}-{d}", .{ turn.hook_input.agent_id, turn.hook_input.request_id })).len;
     self.future = try io.concurrent(run, .{self});
     return self;
 }
@@ -91,11 +116,17 @@ pub fn isFinished(self: *Request) bool {
 /// a worker parked in a socket read, which no flag ever does.
 pub fn requestStop(self: *Request) void {
     self.stop.store(true, .release);
+    self.provider_mutex.lockUncancelable(self.io);
+    defer self.provider_mutex.unlock(self.io);
     if (self.provider.abort) |abort| abort(self.provider.userdata);
 }
 
 /// Non-blocking check for the owning thread. True once nothing has arrived for
 /// `limit_ms`; without it the kernel retransmits for a quarter of an hour.
+pub fn expired(self: *Request, limit_ms: u32) bool {
+    return tool.monotonicMilliseconds(self.io) - self.started_ms >= limit_ms;
+}
+
 pub fn stalled(self: *Request, limit_ms: i64) bool {
     if (limit_ms <= 0) return false;
     if (self.isFinished()) return false;
@@ -125,8 +156,11 @@ pub fn destroy(self: *Request) void {
     const allocator = self.allocator;
     self.thoughts.deinit();
     self.content.deinit();
+    self.display_pending.deinit(allocator);
     if (self.reply) |*reply| reply.deinit(allocator);
     self.freeTurn();
+    if (self.prepared_conversation) |*convo| convo.deinit();
+    if (self.owned_backend) |owned| owned.deinit();
     allocator.destroy(self);
 }
 
@@ -137,8 +171,94 @@ fn freeTurn(self: *Request) void {
     self.allocator.free(self.turn.instruction);
 }
 
+fn onRetry(ptr: *anyopaque, attempt: usize, delay: u64) ?u64 {
+    const self: *Request = @ptrCast(@alignCast(ptr));
+    self.turn.hook_input.attempt = @intCast(attempt);
+    self.turn.hook_input.retry_delay_ms = delay;
+    self.turn.hook_input.retry_allowed = true;
+    const result = self.requestHook(.model_retry) catch return null;
+    if (result.retry_allowed == false) return null;
+    return @min(result.retry_delay_ms orelse delay, 60_000);
+}
+
+fn requestHook(self: *Request, event: @import("../core/hooks.zig").Event) !@import("../core/hooks.zig").Result {
+    var runner = (self.turn.hooks orelse return .{}).*;
+    runner.stop = &self.stop;
+    var input = self.turn.hook_input;
+    input.event = event;
+    input.model = self.provider.model;
+    input.provider = self.provider.name;
+    const result = try runner.evaluate(self.hook_arena.allocator(), input);
+    if (result.message) |message| if (runner.runtime) |runtime| try runtime.notice(message);
+    return result;
+}
+
+fn prepare(self: *Request) !void {
+    const a = self.hook_arena.allocator();
+    const purpose = self.turn.hook_input.request_purpose;
+    self.turn.hook_input.route = self.turn.model_policy.selected(purpose) orelse "";
+    const resolution = try self.requestHook(.model_resolve);
+    if (resolution.model_route) |id| {
+        if (id.len == 0) return error.ModelRouteDenied;
+        self.turn.hook_input.route = id;
+    }
+    if (self.turn.hook_input.route.len > 0) {
+        const route = try self.turn.model_policy.route(self.turn.hook_input.route, purpose);
+        const owned = self.owned_backend orelse return error.ModelRoutingUnavailable;
+        self.provider_mutex.lockUncancelable(self.io);
+        defer self.provider_mutex.unlock(self.io);
+        try owned.configure(route);
+        self.provider = owned.provider();
+        self.turn.settings.merge(route.settings);
+    } else if (self.turn.model_policy.restrict_routes) return error.ModelRouteDenied;
+    self.turn.hook_input.model = try a.dupe(u8, self.provider.model);
+    self.turn.hook_input.provider = try a.dupe(u8, self.provider.name);
+    self.turn.hook_input.request_settings = try std.json.Stringify.valueAlloc(a, self.turn.settings, .{ .emit_null_optional_fields = false });
+    const settings = try self.requestHook(.model_settings);
+    if (settings.settings) |encoded| self.turn.settings.merge(try std.json.parseFromSliceLeaky(@import("../core/model_policy.zig").Settings, a, encoded, .{}));
+    try self.turn.settings.validate();
+    self.turn.hook_input.request_settings = try std.json.Stringify.valueAlloc(a, self.turn.settings, .{ .emit_null_optional_fields = false });
+    if (self.owned_backend) |owned| {
+        self.provider_mutex.lockUncancelable(self.io);
+        defer self.provider_mutex.unlock(self.io);
+        try owned.settings(self.turn.settings);
+        self.provider = owned.provider();
+    } else if (self.turn.settings.reasoning_effort != null) return error.UnsupportedModelSettings;
+    if (self.turn.hooks) |runner| {
+        var input = self.turn.hook_input;
+        input.event = .model_context;
+        if (!runner.hasMatching(a, input, false)) return;
+        self.turn.hook_input.request_context = try std.json.Stringify.valueAlloc(a, self.conversation.messages.items, .{ .emit_null_optional_fields = false });
+        const context = try self.requestHook(.model_context);
+        if (context.context_edits) |encoded| {
+            if (purpose == .approval_judge) return error.ReviewerContextImmutable;
+            const Edit = struct { seq: u64, text: []const u8 };
+            const edits = try std.json.parseFromSliceLeaky([]const Edit, a, encoded, .{});
+            self.prepared_conversation = .init(self.allocator);
+            const prepared = &self.prepared_conversation.?;
+            for (self.conversation.messages.items) |msg| try prepared.adoptMessage(try msg.clone(self.allocator));
+            for (edits) |edit| {
+                for (prepared.messages.items) |*msg| {
+                    if (msg.seq != edit.seq) continue;
+                    const copy = try self.allocator.dupe(u8, edit.text);
+                    self.allocator.free(msg.text);
+                    msg.text = copy;
+                    msg.origin = .hook;
+                    break;
+                } else return error.InvalidContextEdit;
+            }
+        }
+    }
+}
+
 fn run(self: *Request) void {
     defer self.done.store(true, .release);
+    defer self.finishDisplay();
+
+    self.prepare() catch |err| {
+        self.failed = err;
+        return;
+    };
 
     var attempt: ?Provider.Attempt = if (self.provider.observes_attempts) null else Provider.Attempt.begin(self.turn, self.allocator, .{
         .userdata = self,
@@ -157,13 +277,14 @@ fn run(self: *Request) void {
     }
     self.reply = self.provider.respond(
         self.provider.userdata,
-        self.conversation,
+        if (self.prepared_conversation) |*convo| convo else self.conversation,
         self.turn,
         self.allocator,
         .{
             .userdata = self,
             .onThinking = onThinking,
             .onText = onText,
+            .onRetry = onRetry,
             .onThinkingDone = onThinkingDone,
             .stopped = stopped,
         },
@@ -184,7 +305,69 @@ fn onThinking(ptr: *anyopaque, bytes: []const u8) void {
 fn onText(ptr: *anyopaque, bytes: []const u8) void {
     const self: *Request = @ptrCast(@alignCast(ptr));
     self.markProgress();
-    self.content.append(bytes);
+    if (!self.displaysHooks()) {
+        self.content.append(bytes);
+        return;
+    }
+    self.display_bytes += bytes.len;
+    if (!self.turn.stream_display) return;
+    if (self.display_failed) {
+        self.content.append(bytes);
+        return;
+    }
+    self.display_pending.appendSlice(self.allocator, bytes) catch {
+        self.content.append(self.display_pending.items);
+        self.display_pending.clearRetainingCapacity();
+        self.content.append(bytes);
+        self.display_failed = true;
+        return;
+    };
+    if (std.mem.lastIndexOfScalar(u8, self.display_pending.items, '\n')) |last| {
+        self.displayBatch(self.display_pending.items[0 .. last + 1], false);
+        const remaining = self.display_pending.items.len - last - 1;
+        std.mem.copyForwards(u8, self.display_pending.items[0..remaining], self.display_pending.items[last + 1 ..]);
+        self.display_pending.shrinkRetainingCapacity(remaining);
+    }
+}
+
+pub fn displaysHooks(self: *const Request) bool {
+    if (!self.turn.display_messages) return false;
+    const runner = self.turn.hooks orelse return false;
+    var input = self.turn.hook_input;
+    input.event = .message_display;
+    const current = self.provider.current();
+    input.model = current.model;
+    input.provider = if (current.name.len > 0) current.name else self.provider.name;
+    return runner.hasMatching(self.allocator, input, true);
+}
+
+fn displayBatch(self: *Request, delta: []const u8, final: bool) void {
+    var runner = self.turn.hooks.?.*;
+    runner.stop = &self.stop;
+    var input = self.turn.hook_input;
+    input.event = .message_display;
+    const current = self.provider.current();
+    input.model = current.model;
+    input.provider = if (current.name.len > 0) current.name else self.provider.name;
+    input.message_id = self.display_id[0..self.display_id_len];
+    input.index = self.display_index;
+    input.final = final;
+    input.delta = delta;
+    self.display_index += 1;
+    var result = runner.evaluate(self.allocator, input) catch {
+        self.content.append(delta);
+        return;
+    };
+    defer result.deinit(self.allocator);
+    self.content.append(result.display_content orelse delta);
+}
+
+fn finishDisplay(self: *Request) void {
+    if (!self.displaysHooks() or self.display_failed) return;
+    const text = if (self.reply) |reply| reply.text else "";
+    if (!self.turn.stream_display or self.display_bytes == 0) {
+        if (text.len > 0) self.displayBatch(text, true);
+    } else self.displayBatch(self.display_pending.items, true);
 }
 
 /// Worker thread. Says the connection is still delivering.
@@ -202,4 +385,182 @@ fn onThinkingDone(ptr: *anyopaque) void {
 fn stopped(ptr: *anyopaque) bool {
     const self: *Request = @ptrCast(@alignCast(ptr));
     return self.stop.load(.acquire);
+}
+
+test "MessageDisplay streams complete lines and preserves provider reply text" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const Streaming = struct {
+        fn respond(_: *anyopaque, _: *Conversation, _: Provider.Turn, allocator: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
+            sink.?.onText(sink.?.userdata, "First\nsec");
+            sink.?.onText(sink.?.userdata, "ond\n");
+            return .{ .text = try allocator.dupe(u8, "First\nsecond\n") };
+        }
+    };
+    var marker: u8 = 0;
+    const provider: Provider = .{ .name = "streaming", .userdata = &marker, .respond = Streaming.respond };
+    const Hooks = @import("../core/hooks.zig");
+    const runner: Hooks.Runner = .{ .io = io, .root = root, .set = .{ .message_display = &.{.{ .legacy = false, .command = "cat >> displayed.jsonl; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"MessageDisplay\",\"displayContent\":\"shown\"}}'" }} } };
+    var convo = Conversation.init(a);
+    defer convo.deinit();
+    const request = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner, .display_messages = true, .hook_input = .{ .event = .pre_model_request, .agent_id = "agent", .request_id = 2 } });
+    defer request.destroy();
+    request.join();
+    try std.testing.expectEqualStrings("First\nsecond\n", request.reply.?.text);
+    const visible = try request.content.snapshot(a);
+    defer a.free(visible);
+    try std.testing.expectEqualStrings("shownshownshown", visible);
+    const trace = try tmp.dir.readFileAlloc(io, "displayed.jsonl", a, .limited(32 * 1024));
+    defer a.free(trace);
+    var lines = std.mem.tokenizeScalar(u8, trace, '\n');
+    const expected = [_][]const u8{ "First\n", "second\n", "" };
+    for (expected, 0..) |delta, index| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, lines.next().?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(delta, parsed.value.object.get("delta").?.string);
+        try std.testing.expectEqual(@as(i64, @intCast(index)), parsed.value.object.get("index").?.integer);
+        try std.testing.expectEqual(index == expected.len - 1, parsed.value.object.get("final").?.bool);
+        try std.testing.expectEqualStrings("agent-2", parsed.value.object.get("message_id").?.string);
+    }
+    try std.testing.expect(lines.next() == null);
+    try tmp.dir.deleteFile(io, "displayed.jsonl");
+    const headless = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner, .display_messages = true, .stream_display = false });
+    defer headless.destroy();
+    headless.join();
+    const once = try tmp.dir.readFileAlloc(io, "displayed.jsonl", a, .limited(16 * 1024));
+    defer a.free(once);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, once, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("final").?.bool);
+    try std.testing.expectEqualStrings("First\nsecond\n", parsed.value.object.get("delta").?.string);
+}
+
+test "MessageDisplay failure is fail-open and internal requests do not display" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Streaming = struct {
+        fn respond(_: *anyopaque, _: *Conversation, _: Provider.Turn, allocator: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
+            sink.?.onText(sink.?.userdata, "unchanged\n");
+            return .{ .text = try allocator.dupe(u8, "unchanged\n") };
+        }
+    };
+    var marker: u8 = 0;
+    const provider: Provider = .{ .name = "streaming", .userdata = &marker, .respond = Streaming.respond };
+    const Hooks = @import("../core/hooks.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const runner: Hooks.Runner = .{ .io = io, .root = root, .set = .{ .message_display = &.{.{ .legacy = false, .command = "touch displayed; printf malformed" }} } };
+    var convo = Conversation.init(a);
+    defer convo.deinit();
+    const request = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner, .display_messages = true });
+    defer request.destroy();
+    request.join();
+    const visible = try request.content.snapshot(a);
+    defer a.free(visible);
+    try std.testing.expectEqualStrings("unchanged\n", visible);
+    try tmp.dir.deleteFile(io, "displayed");
+    const internal = try start(a, io, provider, &convo, .{ .system = "internal", .hooks = &runner });
+    defer internal.destroy();
+    internal.join();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "displayed", .{}));
+}
+
+test "disabled display hooks must not buffer an unrelated stream" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Hooks = @import("../core/hooks.zig");
+    const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{ .message_display = &.{.{ .command = "true", .enabled = false }} } };
+    var marker: u8 = 0;
+    const Fake = struct {
+        fn respond(_: *anyopaque, _: *Conversation, _: Provider.Turn, _: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
+            return .{};
+        }
+    };
+    var conversation = Conversation.init(a);
+    defer conversation.deinit();
+    var request: Request = .{
+        .allocator = a,
+        .io = io,
+        .provider = .{ .name = "fake", .userdata = &marker, .respond = Fake.respond },
+        .conversation = &conversation,
+        .turn = .{ .system = "", .hooks = &runner, .display_messages = true },
+        .hook_arena = .init(a),
+        .thoughts = .init(a, io),
+        .content = .init(a, io),
+    };
+    defer request.hook_arena.deinit();
+    defer request.thoughts.deinit();
+    defer request.content.deinit();
+    defer request.display_pending.deinit(a);
+    onText(&request, "a paragraph without newline");
+    const shown = try request.content.snapshot(a);
+    defer a.free(shown);
+    try std.testing.expectEqualStrings("a paragraph without newline", shown);
+}
+
+test "context edits preserve canonical history and cannot rewrite reviewer evidence" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Hooks = @import("../core/hooks.zig");
+    const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{ .model_context = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelContext\",\"contextEdits\":[{\"seq\":42,\"text\":\"prepared\"}]}}'" }} } };
+    const Fake = struct {
+        fn respond(_: *anyopaque, convo: *Conversation, _: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
+            try std.testing.expectEqual(@as(u64, 42), convo.messages.items[0].seq);
+            try std.testing.expectEqual(Conversation.Origin.hook, convo.messages.items[0].origin);
+            return .{ .text = try allocator.dupe(u8, convo.messages.items[0].text) };
+        }
+    };
+    var marker: u8 = 0;
+    const provider: Provider = .{ .userdata = &marker, .name = "fake", .respond = Fake.respond };
+    var convo = Conversation.init(a);
+    defer convo.deinit();
+    convo.next_seq = 42;
+    _ = try convo.addUser("canonical human request", &.{}, &.{});
+    const request = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner });
+    defer request.destroy();
+    request.join();
+    try std.testing.expect(request.failed == null);
+    try std.testing.expectEqualStrings("prepared", request.reply.?.text);
+    try std.testing.expectEqualStrings("canonical human request", convo.messages.items[0].text);
+    try std.testing.expectEqual(Conversation.Origin.human, convo.messages.items[0].origin);
+    const reviewer = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner, .hook_input = .{ .event = .pre_model_request, .request_purpose = .approval_judge } });
+    defer reviewer.destroy();
+    reviewer.join();
+    try std.testing.expectEqual(error.ReviewerContextImmutable, reviewer.failed.?);
+}
+
+test "request settings and retry hooks enforce bounds before transport" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Hooks = @import("../core/hooks.zig");
+    const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{
+        .model_settings = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelSettings\",\"settings\":{\"temperature\":0.25,\"max_output_tokens\":128,\"attempts\":2}}}'" }},
+        .model_retry = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelRetry\",\"retryDelayMs\":7}}'" }},
+    } };
+    const Fake = struct {
+        fn respond(_: *anyopaque, _: *Conversation, turn: Provider.Turn, _: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
+            try std.testing.expectEqual(@as(?f32, 0.25), turn.settings.temperature);
+            try std.testing.expectEqual(@as(?u32, 128), turn.settings.max_output_tokens);
+            try std.testing.expectEqual(@as(?u64, 7), sink.?.retryDelay(1, 500));
+            return .{};
+        }
+    };
+    var marker: u8 = 0;
+    var convo = Conversation.init(a);
+    defer convo.deinit();
+    const provider: Provider = .{ .userdata = &marker, .name = "fake", .respond = Fake.respond };
+    const request = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner });
+    defer request.destroy();
+    request.join();
+    try std.testing.expect(request.failed == null);
+    const denied = try start(a, io, provider, &convo, .{ .system = "test", .model_policy = .{ .restrict_routes = true } });
+    defer denied.destroy();
+    denied.join();
+    try std.testing.expectEqual(error.ModelRouteDenied, denied.failed.?);
 }

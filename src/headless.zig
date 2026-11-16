@@ -75,8 +75,12 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     });
     defer backend.deinit();
 
-    try backend.start();
-    backend.ensureModel() catch {};
+    if (config.model_requests.agent != null) {
+        try backend.startWithoutProbe();
+    } else {
+        try backend.start();
+        backend.ensureModel() catch {};
+    }
 
     const stack = try Stack.create(allocator, io, .{
         .config = &config,
@@ -90,6 +94,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     });
     defer stack.destroy();
     const loop = &stack.loop;
+    loop.stream_display = false;
     const convo = &stack.convo;
     const runner = &stack.runner;
     if (!allow_mutating) loop.setApprovals(.ask);
@@ -197,8 +202,8 @@ fn report(out: *std.Io.Writer, convo: *Conversation, from: usize) !usize {
                     var buffer: [humanize.duration_bytes]u8 = undefined;
                     try out.print("{s}  · thought {s}{s}\n", .{ dim, humanize.duration(&buffer, ms), reset });
                 }
-                if (msg.text.len > 0) {
-                    try out.print("{s}▸ {s}{s} {s}\n", .{ bold, pkg.name, reset, msg.text });
+                if (msg.displayedText().len > 0) {
+                    try out.print("{s}▸ {s}{s} {s}\n", .{ bold, pkg.name, reset, msg.displayedText() });
                 }
                 for (msg.tool_calls) |call| {
                     const colour = switch (call.status) {

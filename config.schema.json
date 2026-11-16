@@ -31,7 +31,7 @@
                 "all"
             ],
             "default": "ask",
-            "description": "Who decides a call that would otherwise ask. 'ask' puts it to you. 'auto' has the session's model judge it, blocking what looks destructive, outside the project or outside the task, and hands decisions back to you after 3 blocks in a row or 20 in a session. 'all' runs everything, paths outside the project included: for a machine set aside for the agent. `PreToolUse` hooks still run under each."
+            "description": "Who decides a call that would otherwise ask. 'ask' puts it to you. 'auto' has the configured approval reviewer (the session model by default) judge it, blocking what looks destructive, outside the project or outside the task, and hands decisions back to you after 3 blocks in a row or 20 in a session. 'all' runs everything, paths outside the project included: for a machine set aside for the agent. `PreToolUse` hooks still run under each."
         },
         "debug_log": {
             "type": "string",
@@ -290,6 +290,266 @@
                             }
                         ]
                     }
+                },
+                "PostToolUseFailure": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PostToolBatch": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PermissionDenied": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "StopFailure": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "Notification": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "InstructionsLoaded": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "ConfigChange": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "FileChanged": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PreModelSwitch": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "PostModelSwitch": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "TaskCreated": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "TaskCompleted": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "UserPromptExpansion": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "MessageDisplay": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "CwdChanged": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "DirectoryAdded": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "ModelResolve": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "ModelContext": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "ModelSettings": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
+                },
+                "ModelRetry": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {
+                                "$ref": "#/$defs/hook"
+                            },
+                            {
+                                "$ref": "#/$defs/hookGroup"
+                            }
+                        ]
+                    }
                 }
             },
             "description": "Additive lifecycle hooks. Every definition needs explicit trust after upgrade or changes."
@@ -357,6 +617,45 @@
             "type": "string",
             "default": "Co-Authored-By: synth <noreply@getsynth.sh>",
             "description": "The trailer the model is asked to end its commit messages with, in a git project. An empty string asks for none."
+        },
+        "model_requests": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Purpose-based model routes and reviewer failure policy. Hooks may choose only named routes permitted for that purpose. Route credentials are explicit and never inherited.",
+            "properties": {
+                "routes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/modelRoute"
+                    }
+                },
+                "agent": {
+                    "type": "string"
+                },
+                "approval_judge": {
+                    "type": "string"
+                },
+                "compaction": {
+                    "type": "string"
+                },
+                "restrict_routes": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "reviewer_timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300000,
+                    "default": 30000
+                },
+                "reviewer_fallback": {
+                    "enum": [
+                        "ask",
+                        "deny"
+                    ],
+                    "default": "ask"
+                }
+            }
         }
     },
     "$defs": {
@@ -375,7 +674,7 @@
                 "command": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Shell command run from the project root."
+                    "description": "Shell command run from the session working directory."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -385,6 +684,9 @@
                 "transcript": {
                     "type": "boolean",
                     "default": false
+                },
+                "when": {
+                    "$ref": "#/$defs/hookWhen"
                 }
             }
         },
@@ -450,13 +752,16 @@
                 "matcher": {
                     "type": "string",
                     "default": "",
-                    "description": "Regex or * for tool events; ignored for other events."
+                    "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal filenames."
                 },
                 "hooks": {
                     "type": "array",
                     "items": {
                         "$ref": "#/$defs/hookHandler"
                     }
+                },
+                "when": {
+                    "$ref": "#/$defs/hookWhen"
                 }
             }
         },
@@ -540,7 +845,7 @@
                 "matcher": {
                     "type": "string",
                     "default": "",
-                    "description": "Regex or * for tool events; ignored for other events."
+                    "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal filenames."
                 },
                 "hooks": {
                     "type": "array",
@@ -558,6 +863,132 @@
                             }
                         ]
                     }
+                },
+                "when": {
+                    "$ref": "#/$defs/hookWhen"
+                }
+            }
+        },
+        "hookWhen": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": false,
+            "properties": {
+                "agent_scope": {
+                    "enum": [
+                        "main",
+                        "subagent"
+                    ]
+                },
+                "request_purpose": {
+                    "enum": [
+                        "agent",
+                        "approval_judge",
+                        "compaction"
+                    ]
+                },
+                "agent_type": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "model": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "provider": {
+                    "type": "string",
+                    "minLength": 1
+                }
+            },
+            "description": "All specified fields must match the harness metadata exactly. Omitted fields match every value."
+        },
+        "modelSettings": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "temperature": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 2
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1048576
+                },
+                "reasoning_effort": {
+                    "enum": [
+                        "none",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh"
+                    ]
+                },
+                "attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4
+                },
+                "retry_delay_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 60000
+                }
+            }
+        },
+        "modelRoute": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "id",
+                "provider",
+                "endpoint",
+                "model"
+            ],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "provider": {
+                    "enum": [
+                        "openai",
+                        "ollama"
+                    ]
+                },
+                "endpoint": {
+                    "type": "string",
+                    "format": "uri"
+                },
+                "model": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "api_key": {
+                    "type": "string"
+                },
+                "purposes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "enum": [
+                            "agent",
+                            "approval_judge",
+                            "compaction"
+                        ]
+                    }
+                },
+                "settings": {
+                    "$ref": "#/$defs/modelSettings"
+                },
+                "context_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1048576,
+                    "default": 0,
+                    "description": "Known route context window; zero uses the backend default or model table. Ollama also receives num_ctx."
                 }
             }
         }

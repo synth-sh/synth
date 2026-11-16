@@ -82,12 +82,14 @@ const Reporter = struct {
 };
 
 pub const Call = struct {
+    additional_roots: []const []const u8 = &.{},
     hook_input: Hooks.Invocation = .{ .event = .post_tool_use },
     /// The message that asked for it, by seq.
     seq: u64 = 0,
     index: usize,
     name: []const u8,
     arguments: []const u8,
+    approved_action: ?[]const u8 = null,
     /// Whether a person approved this call by hand, and so whether it may
     /// touch anything outside the project.
     allow_outside: bool = false,
@@ -120,12 +122,16 @@ pub fn start(
         allocator.free(calls);
     }
     for (approved, calls) |src, *dst| {
+        const roots = try hook_arena.allocator().alloc([]const u8, src.additional_roots.len);
+        for (src.additional_roots, roots) |root, *owned| owned.* = try hook_arena.allocator().dupe(u8, root);
         dst.* = .{
             .seq = src.seq,
+            .additional_roots = roots,
             .hook_input = try src.hook_input.dupe(hook_arena.allocator()),
             .index = src.index,
             .name = try allocator.dupe(u8, src.name),
             .arguments = try allocator.dupe(u8, src.arguments),
+            .approved_action = if (src.approved_action) |value| try hook_arena.allocator().dupe(u8, value) else null,
             .allow_outside = src.allow_outside,
         };
         built += 1;
@@ -306,6 +312,7 @@ fn runOne(self: *ToolRun, index: usize) void {
         .allocator = self.allocator,
         .io = self.io,
         .project_root = self.project_root,
+        .additional_roots = call.additional_roots,
         .reads = self.reads,
         .delegate = self.delegate,
         .files = self.handoff.files,
@@ -317,15 +324,27 @@ fn runOne(self: *ToolRun, index: usize) void {
         .call_index = call.index,
     };
 
-    const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| tool.Output.err(
-        std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ call.name, @errorName(err) }) catch self.allocator.dupe(u8, "tool failed") catch "",
-    );
+    const execution_started = tool.monotonicMilliseconds(self.io);
+    const output = execution: {
+        if (call.approved_action) |snapshot| {
+            var arena: std.heap.ArenaAllocator = .init(self.allocator);
+            defer arena.deinit();
+            @import("../core/action.zig").verify(self.io, arena.allocator(), self.project_root, call.name, call.arguments, snapshot) catch |err| {
+                break :execution tool.Output.err(std.fmt.allocPrint(self.allocator, "approved action could not be verified: {s}", .{@errorName(err)}) catch "");
+            };
+        }
+        break :execution self.registry.executeJson(ctx, call.name, call.arguments) catch |err| tool.Output.err(
+            std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ call.name, @errorName(err) }) catch self.allocator.dupe(u8, "tool failed") catch "",
+        );
+    };
     result.* = .{ .index = call.index, .content = output.content, .is_error = output.is_error };
     if (self.hooks) |configured| {
         var runner = configured.*;
         runner.stop = &self.stop;
         var input = call.hook_input;
-        input.event = .post_tool_use;
+        input.event = if (output.is_error) .post_tool_use_failure else .post_tool_use;
+        input.error_message = if (output.is_error) output.content else "";
+        input.duration_ms = tool.monotonicMilliseconds(self.io) - execution_started;
         input.tool_name = call.name;
         input.tool_input = call.arguments;
         input.tool_response = output.content;
@@ -648,4 +667,53 @@ test "post-tool hooks run for ordinary tool errors" {
     const payload = try tmp.dir.readFileAlloc(testing.io, "post.json", testing.allocator, .limited(4096));
     defer testing.allocator.free(payload);
     try testing.expect(std.mem.indexOf(u8, payload, "unknown tool") != null);
+}
+
+test "grouped post hooks distinguish success and failure while legacy hooks retain both" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    var registry = try Registry.init(a);
+    defer registry.deinit();
+    const ProbeResult = struct {
+        fn execute(ctx: tool.Context, input: tool.Input) !tool.Output {
+            const fail = input.arguments.object.get("fail").?.bool;
+            return .{ .content = try ctx.allocator.dupe(u8, if (fail) "failed probe" else "successful probe"), .is_error = fail };
+        }
+    };
+    try registry.register(.{ .name = "probe", .description = "probe", .schema = "{}", .handler = ProbeResult.execute, .read_only = true });
+    var reads = tool.ReadLog.init(a);
+    defer reads.deinit();
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{
+        .post_tool_use = &.{
+            .{ .command = "cat >> legacy.jsonl" },
+            .{ .legacy = false, .command = "cat >> success.jsonl" },
+        },
+        .post_tool_use_failure = &.{.{ .legacy = false, .command = "cat >> failure.jsonl" }},
+    } };
+    const calls = [_]Call{
+        .{ .index = 0, .name = "probe", .arguments = "{\"fail\":false}", .hook_input = .{ .event = .post_tool_use, .tool_call_id = "ok" } },
+        .{ .index = 1, .name = "probe", .arguments = "{\"fail\":true}", .hook_input = .{ .event = .post_tool_use, .tool_call_id = "bad" } },
+    };
+    const batch = try ToolRun.start(a, testing.io, &registry, root, &reads, null, .{}, &runner, &calls);
+    defer batch.destroy();
+    batch.join();
+    const success = try tmp.dir.readFileAlloc(testing.io, "success.jsonl", a, .limited(16 * 1024));
+    defer a.free(success);
+    const failure = try tmp.dir.readFileAlloc(testing.io, "failure.jsonl", a, .limited(16 * 1024));
+    defer a.free(failure);
+    const old = try tmp.dir.readFileAlloc(testing.io, "legacy.jsonl", a, .limited(16 * 1024));
+    defer a.free(old);
+    const ok = try std.json.parseFromSlice(std.json.Value, a, success, .{});
+    defer ok.deinit();
+    const bad = try std.json.parseFromSlice(std.json.Value, a, failure, .{});
+    defer bad.deinit();
+    try testing.expectEqualStrings("PostToolUse", ok.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("ok", ok.value.object.get("tool_call_id").?.string);
+    try testing.expectEqualStrings("PostToolUseFailure", bad.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("failed probe", bad.value.object.get("error").?.string);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, old, "hook_event_name"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, old, "\"PostToolUse\""));
 }

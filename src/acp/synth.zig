@@ -28,6 +28,8 @@ pub const Hello = struct {
 
 pub const method = struct {
     pub const hooks = "_synth/hooks";
+    pub const change_directory = "_synth/change_directory";
+    pub const add_directory = "_synth/add_directory";
     /// Agent to client: everything about the session, after it is set up.
     pub const snapshot = "_synth/snapshot";
     pub const appended = "_synth/appended";
@@ -82,6 +84,8 @@ pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
     arguments: []const u8,
+    prepared_action: ?[]const u8 = null,
+    approved_action: ?[]const u8 = null,
     status: Conversation.ToolCall.Status,
     /// The preview the agent holds; `load_tool_result` fetches the rest.
     result: ?[]const u8 = null,
@@ -100,6 +104,7 @@ pub const Attachment = struct {
 pub const Message = struct {
     seq: u64,
     role: Conversation.Role,
+    origin: Conversation.Origin = .unknown,
     text: []const u8,
     thinking: ?[]const u8 = null,
     thinking_ms: ?u64 = null,
@@ -116,6 +121,8 @@ pub const Message = struct {
             .id = call.id,
             .name = call.name,
             .arguments = call.arguments,
+            .prepared_action = call.prepared_action,
+            .approved_action = call.approved_action,
             .status = call.status,
             .result = call.result,
             .result_bytes = call.result_bytes,
@@ -130,7 +137,8 @@ pub const Message = struct {
         return .{
             .seq = msg.seq,
             .role = msg.role,
-            .text = msg.text,
+            .origin = msg.origin,
+            .text = msg.displayedText(),
             .thinking = msg.thinking,
             .thinking_ms = msg.thinking_ms,
             .thinking_bytes = msg.thinking_bytes,
@@ -152,6 +160,8 @@ pub const Message = struct {
             .id = call.id,
             .name = call.name,
             .arguments = call.arguments,
+            .prepared_action = call.prepared_action,
+            .approved_action = call.approved_action,
             .status = call.status,
             .result = call.result,
             .result_bytes = call.result_bytes,
@@ -166,6 +176,7 @@ pub const Message = struct {
         const view: Conversation.Message = .{
             .seq = self.seq,
             .role = self.role,
+            .origin = self.origin,
             .text = self.text,
             .thinking = self.thinking,
             .thinking_ms = self.thinking_ms,
@@ -181,7 +192,11 @@ pub const Message = struct {
 
 /// Everything about a session that is not its transcript, sent whole whenever
 /// any of it changes.
+pub const Directory = struct { sessionId: []const u8, path: []const u8 };
+
 pub const Status = struct {
+    cwd: []const u8 = "",
+    additional_roots: []const []const u8 = &.{},
     state: Loop.State = .idle,
     /// What the session says it is doing: `Loop.label`.
     label: []const u8 = "",
@@ -424,3 +439,12 @@ pub const Hooks = struct {
     action: @import("../core/hook_store.zig").Action = .list,
     id: []const u8 = "",
 };
+
+test "ACP sends display text while retaining canonical conversation text" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const original: Conversation.Message = .{ .role = .assistant, .text = "canonical", .display_text = "visible" };
+    const wire = try Message.from(arena.allocator(), &original);
+    try testing.expectEqualStrings("visible", wire.text);
+    try testing.expectEqualStrings("canonical", original.text);
+}

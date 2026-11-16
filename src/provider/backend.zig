@@ -114,6 +114,15 @@ pub fn start(self: *Backend) !void {
     }
 }
 
+pub fn startWithoutProbe(self: *Backend) !void {
+    switch (self.client) {
+        .ollama => |*client| try client.startWithoutProbe(),
+        .openai => |*client| try client.startWithoutProbe(),
+        .chatgpt => |*client| try client.startLike(client),
+        .copilot => |*client| try client.start(),
+    }
+}
+
 pub fn deinit(self: *Backend) void {
     switch (self.client) {
         inline else => |*client| client.deinit(),
@@ -136,6 +145,67 @@ pub const Spawned = struct {
         self.backend.deinit();
         self.arena.deinit();
         allocator.destroy(self);
+    }
+
+    pub fn configure(self: *Spawned, route: @import("../core/model_policy.zig").Route) !void {
+        const a = self.arena.allocator();
+        var options = self.backend.options;
+        options.host = try a.dupe(u8, route.endpoint);
+        options.label = try a.dupe(u8, route.id);
+        options.model = try a.dupe(u8, route.model);
+        if (route.context_limit > 0) options.num_ctx = route.context_limit;
+        options.api_key = if (route.api_key) |key| try a.dupe(u8, key) else null;
+        self.backend.deinit();
+        self.backend = .init(switch (route.provider) {
+            .openai => .openai,
+            .ollama => .ollama,
+        }, options);
+        switch (self.backend.client) {
+            .openai => |*client| {
+                try client.startWithoutProbe();
+                if (route.context_limit > 0) client.context_limit = route.context_limit;
+            },
+            .ollama => |*client| {
+                try client.startWithoutProbe();
+                client.context_limit = route.context_limit;
+            },
+            else => unreachable,
+        }
+    }
+
+    pub fn settings(self: *Spawned, value: @import("../core/model_policy.zig").Settings) !void {
+        try value.validate();
+        switch (self.backend.client) {
+            .chatgpt, .copilot => if (value.temperature != null or value.max_output_tokens != null) return error.UnsupportedModelSettings,
+            else => {},
+        }
+        if (value.reasoning_effort) |effort| if (self.backend.client != .openai) {
+            const selected_provider = self.backend.provider();
+            const choices = selected_provider.efforts orelse return error.UnsupportedModelSettings;
+            const supported = choices(selected_provider.userdata, selected_provider.model);
+            var found = false;
+            for (supported.levels) |level| if (std.mem.eql(u8, level, effort)) {
+                found = true;
+            };
+            if (!found) return error.UnsupportedModelSettings;
+            if (selected_provider.set_effort) |set| set(selected_provider.userdata, effort) else return error.UnsupportedModelSettings;
+        };
+        switch (self.backend.client) {
+            .copilot => |*client| {
+                if (value.attempts) |n| client.inner.retries.attempts = n;
+                if (value.retry_delay_ms) |n| {
+                    client.inner.retries.base_ms = n;
+                    client.inner.retries.max_ms = n;
+                }
+            },
+            inline else => |*client| {
+                if (value.attempts) |n| client.retries.attempts = n;
+                if (value.retry_delay_ms) |n| {
+                    client.retries.base_ms = n;
+                    client.retries.max_ms = n;
+                }
+            },
+        }
     }
 
     pub fn provider(self: *Spawned) Provider {
@@ -448,4 +518,21 @@ test "an ollama tag matches loosely, an openai id exactly" {
     try testing.expect(local.sameModel("qwen3:latest", "qwen3"));
     try testing.expect(!hosted.sameModel("gpt-4o-2024-08-06", "gpt-4o"));
     try testing.expect(hosted.sameModel("gpt-4o", "gpt-4o"));
+}
+
+test "named routes isolate credentials models and retry settings" {
+    const a = std.testing.allocator;
+    var base: Backend = .init(.openai, .{ .allocator = a, .io = std.testing.io, .host = "http://127.0.0.1:9/v1", .label = "primary", .model = "main", .api_key = "primary-secret" });
+    defer base.deinit();
+    try base.startWithoutProbe();
+    const review = try base.spawn(a);
+    defer review.deinit();
+    try review.configure(.{ .id = "local-review", .provider = .openai, .endpoint = "http://127.0.0.1:8/v1", .model = "decision", .context_limit = 8192 });
+    try review.settings(.{ .attempts = 1, .retry_delay_ms = 7 });
+    try std.testing.expect(review.backend.currentKey() == null);
+    try std.testing.expectEqualStrings("decision", review.backend.model());
+    try std.testing.expectEqual(@as(u32, 8192), review.provider().context_limit);
+    try std.testing.expectEqual(@as(usize, 1), review.backend.client.openai.retries.attempts);
+    try std.testing.expectEqualStrings("main", base.model());
+    try std.testing.expectEqualStrings("primary-secret", base.currentKey().?);
 }

@@ -102,6 +102,7 @@ pub fn startLike(self: *ChatGPTProvider, other: *const ChatGPTProvider) !void {
     self.supports_reasoning_summary = other.supports_reasoning_summary;
     self.effort_buffer = other.effort_buffer;
     self.effort_len = other.effort_len;
+    self.retries = other.retries;
 }
 
 pub fn deinit(self: *ChatGPTProvider) void {
@@ -447,7 +448,10 @@ fn respond(
     var attempt: usize = 1;
     var refreshed = false;
     while (true) {
-        var hook_attempt = Provider.Attempt.begin(turn, allocator, sink);
+        var attempt_turn = turn;
+        attempt_turn.hook_input.model = self.model;
+        attempt_turn.hook_input.provider = self.provider().name;
+        var hook_attempt = Provider.Attempt.begin(attempt_turn, allocator, sink);
         defer hook_attempt.finish();
         errdefer |err| hook_attempt.error_message = @errorName(err);
         if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
@@ -493,10 +497,15 @@ fn respond(
             hook_attempt.error_message = @errorName(refusal.toError(response.head.status));
             hook_attempt.finish();
 
-            if (response.head.status == .unauthorized and !refreshed) {
-                try store.forceRefresh();
-                refreshed = true;
-                continue;
+            if (response.head.status == .unauthorized and !refreshed and attempt < self.retries.attempts) {
+                const wait = if (sink) |s| s.retryDelay(attempt, 0) else @as(?u64, 0);
+                if (wait) |delay| {
+                    try std.Io.sleep(self.io, .fromMilliseconds(@intCast(delay)), .awake);
+                    try store.forceRefresh();
+                    refreshed = true;
+                    attempt += 1;
+                    continue;
+                }
             }
             if (refusal.isTemporary() and self.waitAndRetry(response.head.status, attempt, retry_after, sink)) {
                 attempt += 1;
@@ -547,7 +556,8 @@ fn waitAndRetry(
     if (retry.tooLong(self.retries, retry_after_ms)) return false;
     if (stopped(sink)) return false;
 
-    const wait = retry.waitMs(self.retries, attempt, retry_after_ms);
+    const proposed = retry.waitMs(self.retries, attempt, retry_after_ms);
+    const wait = if (sink) |s| s.retryDelay(attempt, proposed) orelse return false else proposed;
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
     return !stopped(sink);
 }

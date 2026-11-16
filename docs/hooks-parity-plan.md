@@ -1,5 +1,9 @@
 # Codex hooks audit and synth parity plan
 
+The subsequent [Claude Code trigger expansion](claude-hooks-trigger-parity.md)
+extends this baseline from 14 to 30 synth events. This audit records the original
+Codex implementation scope; use [Hooks](hooks.md) for current behavior.
+
 Bring synth to functional parity with Codex's local lifecycle hooks while keeping existing hook scripts usable. Start by closing execution gaps, then add structured results, lifecycle coverage, trust, background execution, MCP handlers, and inspection. Keep one hook runtime shared by the TUI, headless mode, ACP, and subagents.
 
 The local runtime implementation is documented in [Hooks](hooks.md). The audit

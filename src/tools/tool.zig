@@ -6,9 +6,10 @@ const std = @import("std");
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    /// Absolute path every relative path is resolved against, and the boundary
-    /// no tool may read or write outside of.
+    /// Base for relative paths and shell execution. Additional roots extend
+    /// the file boundary without changing this directory.
     project_root: []const u8,
+    additional_roots: []const []const u8 = &.{},
     /// Files this session has read, keyed to the mtime seen at read time, so
     /// edits can be refused when the file changed underneath the model.
     reads: *ReadLog,
@@ -336,7 +337,7 @@ pub const ReadLog = struct {
     }
 };
 
-/// Resolve `path` against the project root, refusing anything that escapes it
+/// Resolve `path` against the working directory, enforcing the permitted roots
 /// unless this call was approved by hand.
 pub fn resolvePath(ctx: Context, path: []const u8) ![]u8 {
     const joined = if (std.fs.path.isAbsolute(path))
@@ -348,14 +349,19 @@ pub fn resolvePath(ctx: Context, path: []const u8) ![]u8 {
     const resolved = try std.fs.path.resolve(ctx.allocator, &.{joined});
     errdefer ctx.allocator.free(resolved);
 
-    if (!ctx.allow_outside and !isInside(ctx.project_root, resolved)) return error.PathOutsideProject;
+    if (!ctx.allow_outside and !isInside(ctx.project_root, resolved)) {
+        const admitted = for (ctx.additional_roots) |root| {
+            if (isInside(root, resolved)) break true;
+        } else false;
+        if (!admitted) return error.PathOutsideProject;
+    }
     return resolved;
 }
 
 fn isInside(root: []const u8, path: []const u8) bool {
     if (!std.mem.startsWith(u8, path, root)) return false;
     if (path.len == root.len) return true;
-    return path[root.len] == std.fs.path.sep;
+    return std.mem.endsWith(u8, root, std.fs.path.sep_str) or path[root.len] == std.fs.path.sep;
 }
 
 test "resolvePath keeps paths inside the project" {
@@ -413,4 +419,17 @@ test "an approved call may reach outside the project" {
     const up = try resolvePath(ctx, "../sibling/file.zig");
     defer std.testing.allocator.free(up);
     try std.testing.expectEqualStrings("/home/user/sibling/file.zig", up);
+}
+
+test "additional roots admit their files without admitting a shared prefix" {
+    var reads = ReadLog.init(std.testing.allocator);
+    defer reads.deinit();
+    const ctx: Context = .{ .allocator = std.testing.allocator, .io = std.testing.io, .project_root = "/repo/sub", .additional_roots = &.{ "/repo", "/sibling" }, .reads = &reads };
+    const allowed = try resolvePath(ctx, "/sibling/file.zig");
+    defer std.testing.allocator.free(allowed);
+    const primary = try resolvePath(ctx, "../main.zig");
+    defer std.testing.allocator.free(primary);
+    try std.testing.expectEqualStrings("/repo/main.zig", primary);
+    try std.testing.expectError(error.PathOutsideProject, resolvePath(ctx, "/sibling-other/secret"));
+    try std.testing.expectError(error.PathOutsideProject, resolvePath(ctx, "/sibling/../secret"));
 }
