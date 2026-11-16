@@ -370,7 +370,6 @@ pub const ToggleMcp = struct { sessionId: []const u8, name: []const u8 };
 pub const ListModels = struct { sessionId: []const u8, recent: u32 = 5 };
 pub const LoadToolResult = struct { sessionId: []const u8, seq: u64, call: u32 };
 pub const LoadImage = struct { sessionId: []const u8, seq: u64, index: u32 };
-
 pub const LoadAttachment = struct { sessionId: []const u8, seq: u64, index: u32 };
 pub const LoadThinking = struct { sessionId: []const u8, seq: u64 };
 pub const Subagent = struct { sessionId: []const u8, seq: u64, call: u32 };
