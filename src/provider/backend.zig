@@ -251,7 +251,7 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     return child;
 }
 
-pub fn rememberTransport(self: *Backend, child: *const Spawned) void {
+pub fn rememberTransport(self: *Backend, child: *const Spawned, purpose: @import("../core/model_policy.zig").Purpose) void {
     switch (self.client) {
         .openai => |*parent| {
             if (child.backend.client != .openai) return;
@@ -266,7 +266,7 @@ pub fn rememberTransport(self: *Backend, child: *const Spawned) void {
             if (same_target) parent.runtime_limit = learned.runtime_limit;
         },
         .chatgpt => |*parent| {
-            if (child.backend.client != .chatgpt) return;
+            if (purpose != .agent or child.backend.client != .chatgpt) return;
             const learned = &child.backend.client.chatgpt;
             if (parent.store == learned.store and std.mem.eql(u8, parent.model, learned.model)) {
                 parent.cache_key = learned.cache_key;
@@ -588,7 +588,7 @@ test "completed request children preserve loaded context and conversation cache 
     const child = try ollama.spawn(a);
     defer child.deinit();
     child.backend.client.ollama.runtime_limit = 4096;
-    ollama.rememberTransport(child);
+    ollama.rememberTransport(child, .agent);
     try std.testing.expectEqual(@as(u32, 4096), ollama.current().context_limit);
     var chat: Backend = .init(.chatgpt, .{ .allocator = a, .io = std.testing.io, .host = "", .label = "test", .model = "remote" });
     defer chat.deinit();
@@ -596,7 +596,7 @@ test "completed request children preserve loaded context and conversation cache 
     defer turn.deinit();
     turn.backend.client.chatgpt.cache_key = ("a" ** 32).*;
     turn.backend.client.chatgpt.last_message_count = 3;
-    chat.rememberTransport(turn);
+    chat.rememberTransport(turn, .agent);
     const next = try chat.spawn(a);
     defer next.deinit();
     try std.testing.expectEqualStrings("a" ** 32, &next.backend.client.chatgpt.cache_key.?);
@@ -611,8 +611,25 @@ test "a Copilot transport repair survives the next request client" {
     const repaired = try parent.spawn(a);
     defer repaired.deinit();
     repaired.backend.client.copilot.inner.send_stream_options = false;
-    parent.rememberTransport(repaired);
+    parent.rememberTransport(repaired, .agent);
     const next = try parent.spawn(a);
     defer next.deinit();
     try std.testing.expect(!next.backend.client.copilot.inner.send_stream_options);
+}
+
+test "decision review cannot replace the agent conversation cache identity" {
+    const a = std.testing.allocator;
+    var parent: Backend = .init(.chatgpt, .{ .allocator = a, .io = std.testing.io, .host = "", .label = "test", .model = "model" });
+    defer parent.deinit();
+    parent.client.chatgpt.cache_key = ("a" ** 32).*;
+    parent.client.chatgpt.last_message_count = 5;
+    const reviewer = try parent.spawn(a);
+    defer reviewer.deinit();
+    reviewer.backend.client.chatgpt.cache_key = ("b" ** 32).*;
+    reviewer.backend.client.chatgpt.last_message_count = 2;
+    parent.rememberTransport(reviewer, .approval_judge);
+    const next = try parent.spawn(a);
+    defer next.deinit();
+    try std.testing.expectEqualStrings("a" ** 32, &next.backend.client.chatgpt.cache_key.?);
+    try std.testing.expectEqual(@as(u64, 5), next.backend.client.chatgpt.last_message_count);
 }

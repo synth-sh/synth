@@ -93,11 +93,6 @@ pub fn start(
     }
 
     self.started_ms = tool.monotonicMilliseconds(io);
-    if (turn.backend) |backend| {
-        self.owned_backend = try backend.spawn(allocator);
-        self.provider = self.owned_backend.?.provider();
-    }
-    errdefer if (self.owned_backend) |owned| owned.deinit();
     self.turn.hook_input = try turn.hook_input.dupe(self.hook_arena.allocator());
     self.turn.hook_input.model = try self.hook_arena.allocator().dupe(u8, provider.model);
     self.turn.hook_input.provider = try self.hook_arena.allocator().dupe(u8, provider.name);
@@ -109,6 +104,17 @@ pub fn start(
     errdefer if (self.turn.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(self.turn.hook_input.transcript_path);
     self.future = try io.concurrent(run, .{self});
     return self;
+}
+
+pub fn ownBackend(self: *Request) !*@import("../provider/backend.zig").Spawned {
+    if (self.owned_backend) |owned| return owned;
+    const backend = self.turn.backend orelse return error.ModelRoutingUnavailable;
+    const owned = try backend.spawn(self.allocator);
+    self.provider_mutex.lockUncancelable(self.io);
+    defer self.provider_mutex.unlock(self.io);
+    self.owned_backend = owned;
+    self.provider = owned.provider();
+    return owned;
 }
 
 /// Non-blocking check for the owning thread.
@@ -142,7 +148,7 @@ pub fn join(self: *Request) void {
     if (self.reaped) return;
     self.reaped = true;
     self.future.await(self.io);
-    if (self.turn.backend) |backend| if (self.owned_backend) |child| backend.rememberTransport(child);
+    if (self.turn.backend) |backend| if (self.owned_backend) |child| backend.rememberTransport(child, self.turn.hook_input.request_purpose);
 }
 
 /// Interrupt the turn and wait for it to unwind.

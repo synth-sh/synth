@@ -44,7 +44,7 @@ pub fn prepare(self: *Request) !void {
     }
     if (self.turn.hook_input.route.len > 0) {
         const route = try self.turn.model_policy.route(self.turn.hook_input.route, purpose);
-        const owned = self.owned_backend orelse return error.ModelRoutingUnavailable;
+        const owned = try self.ownBackend();
         {
             self.provider_mutex.lockUncancelable(self.io);
             defer self.provider_mutex.unlock(self.io);
@@ -68,6 +68,11 @@ pub fn prepare(self: *Request) !void {
     if (settings.settings) |encoded| self.turn.settings.merge(try std.json.parseFromSliceLeaky(@import("../core/model_policy.zig").Settings, a, encoded, .{}));
     try self.turn.settings.validate();
     self.turn.hook_input.request_settings = try std.json.Stringify.valueAlloc(a, self.turn.settings, .{ .emit_null_optional_fields = false });
+    var needs_isolation = purpose != .agent;
+    inline for (std.meta.fields(@import("../core/model_policy.zig").Settings)) |field| {
+        if (@field(self.turn.settings, field.name) != null) needs_isolation = true;
+    }
+    if (needs_isolation and self.turn.backend != null) _ = try self.ownBackend();
     if (self.owned_backend) |owned| {
         self.provider_mutex.lockUncancelable(self.io);
         defer self.provider_mutex.unlock(self.io);

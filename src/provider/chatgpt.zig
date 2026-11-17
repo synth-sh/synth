@@ -563,10 +563,6 @@ fn waitAndRetry(
         .error_message = self.rejection orelse "",
     });
 }
-fn stopped(sink: ?Provider.Sink) bool {
-    const s = sink orelse return false;
-    return s.stopped(s.userdata);
-}
 
 /// ChatGPT routes a request to the servers holding its cache by the
 /// `session-id` header, not by `prompt_cache_key` alone, as Codex notes:
