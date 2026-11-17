@@ -44,11 +44,20 @@ fn logOutsideOllama(
 }
 
 pub fn main(init: std.process.Init) !void {
-    const command = try cli.parse(init, init.arena.allocator());
+    const command = cli.parse(init, init.arena.allocator()) catch |err| switch (err) {
+        error.UsageReported => std.process.exit(2),
+        else => |e| return e,
+    };
     switch (command) {
         .help => |topic| try writeLine(init.io, cli.usageFor(topic)),
         .version => try writeLine(init.io, pkg.name ++ " " ++ pkg.version ++ "\n"),
-        .tui => |options| if (try runTui(init, options)) |left| try tui_drive.sayFarewell(init.io, null, left),
+        .tui => |options| {
+            const left = runTui(init, options) catch |err| switch (err) {
+                error.UsageReported => std.process.exit(2),
+                else => |e| return e,
+            };
+            if (left) |l| try tui_drive.sayFarewell(init.io, null, l);
+        },
         .run => |options| try headless.run(init, options.message, options.allow),
         .prompt => try prompt_dump.dump(init),
         .acp => |options| try if (options.host) acp.run(init, options.editor) else router.front(init),
@@ -75,7 +84,7 @@ fn writeLine(io: std.Io, text: []const u8) !void {
 /// to.
 fn runTui(init: std.process.Init, options: cli.Command.Tui) !?tui_drive.Left {
     const io = init.io;
-    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, options.project orelse ".", init.arena.allocator());
+    const root = try projectRoot(init, options.project orelse ".");
 
     const target: Mirror.Target = if (options.session) |handle|
         .{ .load = .{ .handle = handle, .cwd = root } }
@@ -86,6 +95,18 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?tui_drive.Left {
     const connection = try Connection.spawn(init.gpa, io, root);
     const left = try tui_drive.drive(init, connection, Connection.here, target, .{ .model = options.model }) orelse return null;
     return if (left.spoken or left.detached) left else null;
+}
+
+fn projectRoot(init: std.process.Init, project: []const u8) ![]const u8 {
+    const io = init.io;
+    const dir = std.Io.Dir.cwd().openDir(io, project, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => try cli.reject(io, null, "'{s}' is not a command or a directory", .{project}),
+        else => |e| return e,
+    };
+    defer dir.close(io);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try dir.realPath(io, &buffer);
+    return init.arena.allocator().dupe(u8, buffer[0..len]);
 }
 
 test {

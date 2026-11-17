@@ -143,17 +143,14 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
     defer iter.deinit();
     _ = iter.next();
 
-    if (try misplacedFlag(init)) return error.InvalidArgument;
+    if (try misplacedFlag(init)) return error.UsageReported;
 
     var diag: clap.Diagnostic = .{};
     var res = clap.parseEx(clap.Help, &main_params, clap.parsers.default, &iter, .{
         .diagnostic = &diag,
         .allocator = init.gpa,
         .terminating_positional = 0,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
-        return err;
-    };
+    }) catch |err| return clapFailed(init.io, null, &diag, err);
     defer res.deinit();
 
     if (res.args.help != 0) return .{ .help = null };
@@ -178,10 +175,10 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
             if (std.mem.eql(u8, word, "skills")) return .skills;
             if (std.mem.eql(u8, word, "acp")) {
                 const flag = iter.next() orelse return .{ .acp = .{} };
-                if (!std.mem.eql(u8, flag, "--host")) return error.UnknownAcpOption;
+                if (!std.mem.eql(u8, flag, "--host")) try reject(init.io, null, "unknown option for acp: '{s}'", .{flag});
                 const role = iter.next() orelse return .{ .acp = .{ .host = true } };
                 if (std.mem.eql(u8, role, "--editor")) return .{ .acp = .{ .host = true, .editor = true } };
-                return error.UnknownAcpOption;
+                try reject(init.io, null, "unknown option for acp: '{s}'", .{role});
             }
             if (std.mem.eql(u8, word, "remote")) return parseRemote(init, allocator, &iter);
             return .prompt;
@@ -220,6 +217,27 @@ fn misplacedFlag(init: std.process.Init) !bool {
     return false;
 }
 
+/// Explain a bad command line on stderr, with the usage of the subcommand it
+/// was meant for. The error it ends in tells `main` the user has been told.
+pub fn reject(io: std.Io, topic: ?Topic, comptime format: []const u8, args: anytype) !noreturn {
+    var buffer: [1024]u8 = undefined;
+    var out = std.Io.File.stderr().writer(io, &buffer);
+    try out.interface.print(format ++ "\n\n", args);
+    try out.interface.writeAll(usageFor(topic));
+    try out.interface.flush();
+    return error.UsageReported;
+}
+
+fn clapFailed(io: std.Io, topic: ?Topic, diag: *const clap.Diagnostic, err: anyerror) error{ UsageReported, WriteFailed } {
+    var buffer: [1024]u8 = undefined;
+    var out = std.Io.File.stderr().writer(io, &buffer);
+    diag.report(&out.interface, err) catch return error.WriteFailed;
+    out.interface.writeAll("\n") catch return error.WriteFailed;
+    out.interface.writeAll(usageFor(topic)) catch return error.WriteFailed;
+    out.interface.flush() catch return error.WriteFailed;
+    return error.UsageReported;
+}
+
 fn parseMcp(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -229,27 +247,25 @@ fn parseMcp(
     var res = clap.parseEx(clap.Help, &mcp_params, clap.parsers.default, iter, .{
         .diagnostic = &diag,
         .allocator = init.gpa,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
-        return err;
-    };
+    }) catch |err| return clapFailed(init.io, .mcp, &diag, err);
     defer res.deinit();
 
     if (res.args.help != 0) return .{ .help = .mcp };
 
     const verb = res.positionals[0] orelse return .{ .mcp = .list };
-    if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .mcp = .list };
+    const Verb = enum { list, ls, auth, login, logout, debug, enable, disable };
+    const known_verb = std.meta.stringToEnum(Verb, verb) orelse try reject(init.io, .mcp, "unknown mcp command: '{s}'", .{verb});
+    if (known_verb == .list or known_verb == .ls) return .{ .mcp = .list };
 
-    const name = res.positionals[1] orelse return error.MissingServerName;
-    const owned = try allocator.dupe(u8, name);
-
-    if (std.mem.eql(u8, verb, "auth") or std.mem.eql(u8, verb, "login")) return .{ .mcp = .{ .auth = owned } };
-    if (std.mem.eql(u8, verb, "logout")) return .{ .mcp = .{ .logout = owned } };
-    if (std.mem.eql(u8, verb, "debug")) return .{ .mcp = .{ .debug = owned } };
-    if (std.mem.eql(u8, verb, "enable")) return .{ .mcp = .{ .enable = owned } };
-    if (std.mem.eql(u8, verb, "disable")) return .{ .mcp = .{ .disable = owned } };
-
-    return error.UnknownSubcommand;
+    const name = try allocator.dupe(u8, res.positionals[1] orelse try reject(init.io, .mcp, "mcp {s} needs a server name", .{verb}));
+    return .{ .mcp = switch (known_verb) {
+        .list, .ls => unreachable,
+        .auth, .login => .{ .auth = name },
+        .logout => .{ .logout = name },
+        .debug => .{ .debug = name },
+        .enable => .{ .enable = name },
+        .disable => .{ .disable = name },
+    } };
 }
 
 fn parseRemote(
@@ -261,23 +277,24 @@ fn parseRemote(
     var res = clap.parseEx(clap.Help, &remote_params, clap.parsers.default, iter, .{
         .diagnostic = &diag,
         .allocator = init.gpa,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
-        return err;
-    };
+    }) catch |err| return clapFailed(init.io, .remote, &diag, err);
     defer res.deinit();
 
     if (res.args.help != 0) return .{ .help = .remote };
 
     const verb = res.positionals[0] orelse return .{ .help = .remote };
-    if (std.mem.eql(u8, verb, "bridge")) return .{ .remote = .bridge };
+    const Verb = enum { list, ls, connect, new, bridge };
+    const known_verb = std.meta.stringToEnum(Verb, verb) orelse try reject(init.io, .remote, "unknown remote command: '{s}'", .{verb});
+    if (known_verb == .bridge) return .{ .remote = .bridge };
 
-    const host = try allocator.dupe(u8, res.positionals[1] orelse return error.MissingHost);
+    const host = try allocator.dupe(u8, res.positionals[1] orelse try reject(init.io, .remote, "remote {s} needs a host", .{verb}));
     const target = try dupeOptional(allocator, res.positionals[2]);
-    if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .remote = .{ .list = host } };
-    if (std.mem.eql(u8, verb, "connect")) return .{ .remote = .{ .connect = .{ .host = host, .session = target } } };
-    if (std.mem.eql(u8, verb, "new")) return .{ .remote = .{ .new = .{ .host = host, .dir = target orelse "~" } } };
-    return error.UnknownRemoteCommand;
+    return .{ .remote = switch (known_verb) {
+        .bridge => unreachable,
+        .list, .ls => .{ .list = host },
+        .connect => .{ .connect = .{ .host = host, .session = target } },
+        .new => .{ .new = .{ .host = host, .dir = target orelse "~" } },
+    } };
 }
 
 fn parseSession(
@@ -289,28 +306,24 @@ fn parseSession(
     var res = clap.parseEx(clap.Help, &session_params, clap.parsers.default, iter, .{
         .diagnostic = &diag,
         .allocator = init.gpa,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
-        return err;
-    };
+    }) catch |err| return clapFailed(init.io, .session, &diag, err);
     defer res.deinit();
 
     if (res.args.help != 0) return .{ .help = .session };
 
     const verb = res.positionals[0] orelse return .{ .session = .list };
-    if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .session = .list };
+    const Verb = enum { list, ls, show, rm, delete, search, grep };
+    const known_verb = std.meta.stringToEnum(Verb, verb) orelse try reject(init.io, .session, "unknown session command: '{s}'", .{verb});
+    if (known_verb == .list or known_verb == .ls) return .{ .session = .list };
 
-    const handle = res.positionals[1] orelse return error.MissingSessionHandle;
-    if (std.mem.eql(u8, verb, "show")) {
-        return .{ .session = .{ .show = try allocator.dupe(u8, handle) } };
-    }
-    if (std.mem.eql(u8, verb, "rm") or std.mem.eql(u8, verb, "delete")) {
-        return .{ .session = .{ .remove = try allocator.dupe(u8, handle) } };
-    }
-    if (std.mem.eql(u8, verb, "search") or std.mem.eql(u8, verb, "grep")) {
-        return .{ .session = .{ .search = try allocator.dupe(u8, handle) } };
-    }
-    return error.UnknownSessionCommand;
+    const argument = if (known_verb == .search or known_verb == .grep) "the text to search for" else "a session handle";
+    const handle = try allocator.dupe(u8, res.positionals[1] orelse try reject(init.io, .session, "session {s} needs {s}", .{ verb, argument }));
+    return .{ .session = switch (known_verb) {
+        .list, .ls => unreachable,
+        .show => .{ .show = handle },
+        .rm, .delete => .{ .remove = handle },
+        .search, .grep => .{ .search = handle },
+    } };
 }
 
 fn parseDb(init: std.process.Init, iter: *std.process.Args.Iterator) !Command {
@@ -318,10 +331,7 @@ fn parseDb(init: std.process.Init, iter: *std.process.Args.Iterator) !Command {
     var res = clap.parseEx(clap.Help, &db_params, clap.parsers.default, iter, .{
         .diagnostic = &diag,
         .allocator = init.gpa,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
-        return err;
-    };
+    }) catch |err| return clapFailed(init.io, .db, &diag, err);
     defer res.deinit();
 
     if (res.args.help != 0) return .{ .help = .db };
@@ -331,9 +341,9 @@ fn parseDb(init: std.process.Init, iter: *std.process.Args.Iterator) !Command {
     if (std.mem.eql(u8, verb, "vacuum")) return .{ .db = .vacuum };
     if (std.mem.eql(u8, verb, "prune")) {
         const days = res.positionals[1] orelse return .{ .db = .{ .prune = null } };
-        return .{ .db = .{ .prune = std.fmt.parseInt(u32, days, 10) catch return error.BadPruneDays } };
+        return .{ .db = .{ .prune = std.fmt.parseInt(u32, days, 10) catch try reject(init.io, .db, "db prune takes a whole number of days, not '{s}'", .{days}) } };
     }
-    return error.UnknownDbCommand;
+    try reject(init.io, .db, "unknown db command: '{s}'", .{verb});
 }
 
 fn parseRun(
@@ -345,16 +355,13 @@ fn parseRun(
     var res = clap.parseEx(clap.Help, &run_params, clap.parsers.default, iter, .{
         .diagnostic = &diag,
         .allocator = init.gpa,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
-        return err;
-    };
+    }) catch |err| return clapFailed(init.io, .run, &diag, err);
     defer res.deinit();
 
     if (res.args.help != 0) return .{ .help = .run };
 
     const words = res.positionals[0];
-    if (words.len == 0) return error.MissingPrompt;
+    if (words.len == 0) try reject(init.io, .run, "run needs a message", .{});
 
     return .{
         .run = .{
