@@ -1354,9 +1354,7 @@ fn pollOtherHooks(self: *Loop) !bool {
             self.hook_flow.notice = reason;
         } else {
             try self.acceptHookResult(&dispatch.result);
-            const submitted = try self.conversation.addUser(pending.prompt, pending.attachments, pending.images);
-            if (self.parent != null) submitted.origin = .agent else try self.recordHuman(pending.prompt, false);
-            try self.persistMessage(self.conversation.messages.items.len - 1);
+            try self.recordUserPrompt(pending.prompt, pending.asExtras());
         }
         try self.ask();
         return true;
@@ -7184,4 +7182,23 @@ test "explicit hook asks require a human across modes stages and later batch cal
         try testing.expectEqualStrings(if (case.second) "fake-2" else "fake-1", loop.pendingCall().?.id);
         try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "requires-approval", .{}));
     }
+}
+
+test "steering with prompt hooks resolves mentions and retains human provenance" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "mentioned.txt", .data = "steered file content" });
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_submit = &.{.{ .command = "true" }} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try testing.expect(try loop.steer("also read @mentioned.txt", .{ .images = &.{"aW1hZ2U="} }));
+    try settle(&loop);
+    const steered = for (fixture.convo.messages.items) |msg| {
+        if (std.mem.eql(u8, msg.text, "also read @mentioned.txt")) break msg;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(Conversation.Origin.human, steered.origin);
+    try testing.expectEqualStrings("steered file content", steered.attachments[0].content);
+    try testing.expectEqualStrings("aW1hZ2U=", steered.images[0]);
 }
