@@ -78,62 +78,15 @@ that changed files, shows what going back to before one would put back, flags
 anything changed since by other means, and restores it. Files changed through
 the shell are not tracked, and the transcript stays as it was.
 
-## Hook review
+## Hooks and workspace
 
-Use `/hooks` to list lifecycle hooks and their trust/enable state, source,
-matcher, timeout, mode, and recent results. `/hooks review` shows their exact
-definitions. After reviewing one, `/hooks trust <id>` permits it to execute;
-`/hooks revoke <id>` removes trust, and `/hooks disable <id>` or
-`/hooks enable <id>` changes enablement separately. Trust changes require an
-idle session and an explicit user operation. These operations also exist as
-`synth hooks ...` for headless use and through ACP's `_synth/hooks` request.
+`/hooks review` shows configured hooks. Use `/hooks trust <id>` to approve a
+reviewed declaration, or `/hooks disable <id>` to continue without it. See
+[Hooks](hooks.md) for configuration and controls.
 
-Existing hooks need review after upgrade. A pending review is shown before a
-prompt can reach the model. Definition changes invalidate its old trust id.
-See [Hooks](hooks.md) for lifecycle behavior and configuration examples.
+`/cd <path>` changes the session working directory; `/cd` shows it. File access
+permissions stay unchanged. `/add-dir <path>` explicitly permits another file
+root. Both commands require an idle session and accept paths containing spaces.
 
-
-## Session directories
-
-`/cd <path>` changes where subsequent relative tool paths and shell commands
-resolve. `/cd` shows the current directory. The model has a `cd` tool for the
-same persistent change; it must run in its own tool batch. A `cd` inside a
-`bash` command affects only that shell subprocess.
-
-`/add-dir <path>` adds another directory to the session's permitted file roots.
-Read-only file tools can access that root without an outside-project prompt;
-mutating tools still follow the usual approval policy. Absolute and relative
-paths are accepted, including spaces; paths are resolved physically and must
-name an existing directory. Duplicate roots and paths inside an existing root
-are ignored. Both commands require an idle session.
-
-A user-requested `/cd` permits the new cwd as a file root while it is active.
-An agent-requested `cd` outside the permitted roots needs normal approval.
-The original project stays accessible, and explicitly added roots remain
-accessible across cwd changes. Directory state belongs to the running session;
-a fresh process or reopened saved session starts from its normal project root.
-These commands do not change another session or reload hooks, skills, or
-instructions from the destination. Use absolute paths in hook declarations
-when scripts must remain anchored to the original checkout.
-
-Successful transitions emit `CwdChanged` or `DirectoryAdded` after the new state
-is effective. Hooks cannot veto those transitions; ordinary pre-tool policy
-can still deny a model's `cd` call.
-
-
-## Routing security hooks
-
-Hooks apply to the main agent and its task children. Use a
-[`when` filter](hooks.md#targeted-routing) to select `agent_scope: "subagent"`,
-a specific role/model/provider, or `request_purpose: "approval_judge"` for the
-automatic judge's model requests. Ordinary requests use `agent`; summarization
-requests use `compaction`. Scope and purpose appear in recent hook records.
-Mandatory policy hooks can remain unfiltered so they cover every model and
-agent. Local models do not need special hook support: synth dispatches policy
-hooks before tool execution, and existing approvals still apply.
-
-Configure a separate local decision model, review timeout, and `ask` or `deny`
-fallback under [model_requests](configuration.md#purpose-based-models-and-approval-review).
-With `deny` fallback, repeated denials stop the turn. Review uses verified human
-intent and immutable execution evidence; hook text and summaries cannot supply
-authorization.
+Hook policies can target the main agent, subagents, particular models, or
+request purposes such as approval review and compaction.
