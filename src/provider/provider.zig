@@ -222,8 +222,15 @@ pub fn errorType(err: anyerror, details: []const u8) []const u8 {
         error.BillingError => return "billing_error",
         else => {},
     }
-    inline for (.{ .{ "HTTP 429", "rate_limit" }, .{ "HTTP 401", "authentication_failed" }, .{ "HTTP 403", "authentication_failed" }, .{ "HTTP 500", "server_error" }, .{ "HTTP 502", "server_error" }, .{ "HTTP 503", "server_error" } }) |entry| {
-        if (containsIgnoreCase(details, entry[0])) return entry[1];
+    var words = std.mem.tokenizeAny(u8, details, " \t\r\n:");
+    while (words.next()) |word| {
+        if (word.len != 3) continue;
+        const code = std.fmt.parseInt(u16, word, 10) catch continue;
+        if (code < 400 or code >= 600) continue;
+        const status: std.http.Status = @enumFromInt(code);
+        const phrase = status.phrase() orelse continue;
+        const rest = std.mem.trimStart(u8, words.rest(), " \t");
+        if (std.ascii.startsWithIgnoreCase(rest, phrase)) return @import("retry.zig").errorType(status);
     }
     return "unknown";
 }
@@ -341,6 +348,9 @@ test "a TGI length refusal reads as an overflow, a quota refusal does not" {
 test "error classification does not mistake token counts for HTTP failures" {
     const testing = std.testing;
     try testing.expectEqualStrings("unknown", errorType(error.HttpError, "context service rejected 1500 tokens"));
-    try testing.expectEqualStrings("invalid_request", errorType(error.ContextTooLarge, "HTTP 503"));
-    try testing.expectEqualStrings("server_error", errorType(error.HttpError, "HTTP 503: unavailable"));
+    try testing.expectEqualStrings("invalid_request", errorType(error.ContextTooLarge, "503 Service Unavailable"));
+    try testing.expectEqualStrings("rate_limit", errorType(error.HttpError, "429 Too Many Requests: wait"));
+    try testing.expectEqualStrings("authentication_failed", errorType(error.HttpError, "401 Unauthorized: expired"));
+    try testing.expectEqualStrings("unknown", errorType(error.HttpError, "1500 Internal Server Error tokens"));
+    try testing.expectEqualStrings("server_error", errorType(error.HttpError, "Example rejected the request: 503 Service Unavailable: overloaded"));
 }
