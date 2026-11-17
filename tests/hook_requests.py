@@ -131,6 +131,11 @@ def expect(result, text):
 
 
 def main():
+    for arguments in (('hooks', 'frobnicate'), ('hooks', 'trust'), ('hooks', 'list', 'extra', 'extra')):
+        result = subprocess.run([str(BINARY), *arguments], capture_output=True, text=True)
+        assert result.returncode == 2, (arguments, result.returncode, result.stderr)
+        assert 'Usage:' in result.stderr and 'stack trace' not in result.stderr.lower(), result.stderr
+    print('PASS hook CLI usage errors exit 2 with usage')
     with session('untrusted', lambda *_: chat('must-not-run'), events=('PreToolUse',), trust=False) as (_, result, requests, _):
         assert result.returncode != 0 and not requests
         expect(result, 'review')

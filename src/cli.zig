@@ -164,8 +164,13 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
                 const verb = iter.next() orelse return .{ .hooks = .{} };
                 if (std.mem.eql(u8, verb, "--help") or std.mem.eql(u8, verb, "-h")) return .{ .help = .hooks };
                 const id = iter.next() orelse "";
-                if (iter.next() != null) return error.UnexpectedArgument;
-                const command = try @import("core/hook_store.zig").parseCommand(try std.fmt.allocPrint(allocator, "hooks {s} {s}", .{ verb, id }));
+                if (iter.next() != null) try reject(init.io, .hooks, "too many arguments for hooks", .{});
+                const line = try std.fmt.allocPrint(allocator, "hooks {s} {s}", .{ verb, id });
+                const command = @import("core/hook_store.zig").parseCommand(line) catch |err| switch (err) {
+                    error.UnknownSubcommand => try reject(init.io, .hooks, "unknown hooks command: '{s}'", .{verb}),
+                    error.MissingHookId => try reject(init.io, .hooks, "hooks {s} needs a hook id", .{verb}),
+                    else => return err,
+                };
                 return .{ .hooks = .{ .action = command.action, .id = command.id } };
             }
             if (std.mem.eql(u8, word, "mcp")) return parseMcp(init, allocator, &iter);
