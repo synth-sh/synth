@@ -418,7 +418,7 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         try session.publish(arena, true);
     } else if (eql(u8, method, m.add_directory)) {
         const asked = try rpc.parse(synth.Directory, arena, params);
-        session.stack.loop.addDirectory(asked.path, "slash_command") catch |err| {
+        session.stack.loop.addDirectory(asked.path, @tagName(asked.source)) catch |err| {
             self.noticeFmt(.warning, "Cannot add directory {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
             return err;
         };

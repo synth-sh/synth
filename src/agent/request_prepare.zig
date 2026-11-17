@@ -45,10 +45,20 @@ pub fn prepare(self: *Request) !void {
     if (self.turn.hook_input.route.len > 0) {
         const route = try self.turn.model_policy.route(self.turn.hook_input.route, purpose);
         const owned = self.owned_backend orelse return error.ModelRoutingUnavailable;
-        self.provider_mutex.lockUncancelable(self.io);
-        defer self.provider_mutex.unlock(self.io);
-        try owned.configure(route);
-        self.provider = owned.provider();
+        {
+            self.provider_mutex.lockUncancelable(self.io);
+            defer self.provider_mutex.unlock(self.io);
+            try owned.configure(route);
+            self.provider = owned.provider();
+        }
+        if (self.stop.load(.acquire)) return error.Cancelled;
+        owned.probe(route);
+        if (self.stop.load(.acquire)) return error.Cancelled;
+        {
+            self.provider_mutex.lockUncancelable(self.io);
+            defer self.provider_mutex.unlock(self.io);
+            self.provider = owned.provider();
+        }
         self.turn.settings.merge(route.settings);
     } else if (self.turn.model_policy.restrict_routes) return error.ModelRouteDenied;
     self.turn.hook_input.model = try a.dupe(u8, self.provider.model);

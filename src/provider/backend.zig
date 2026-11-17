@@ -171,10 +171,17 @@ pub const Spawned = struct {
                 if (route.context_limit > 0) client.context_limit = route.context_limit;
             },
             .ollama => |*client| {
-                try client.start();
+                try client.startWithoutProbe();
                 if (route.context_limit > 0) client.context_limit = route.context_limit;
             },
             else => unreachable,
+        }
+    }
+
+    pub fn probe(self: *Spawned, route: @import("../core/model_policy.zig").Route) void {
+        if (self.backend.client == .ollama) {
+            self.backend.client.ollama.probe();
+            if (route.context_limit > 0) self.backend.client.ollama.context_limit = route.context_limit;
         }
     }
 
@@ -252,12 +259,25 @@ pub fn rememberTransport(self: *Backend, child: *const Spawned) void {
             const same_target = std.mem.eql(u8, parent.host, learned.host) and std.mem.eql(u8, parent.model, learned.model) and parent.wire == learned.wire;
             if (same_target) parent.send_stream_options = parent.send_stream_options and learned.send_stream_options;
         },
+        .ollama => |*parent| {
+            if (child.backend.client != .ollama) return;
+            const learned = &child.backend.client.ollama;
+            const same_target = std.mem.eql(u8, parent.host, learned.host) and std.mem.eql(u8, parent.model, learned.model) and parent.num_ctx == learned.num_ctx;
+            if (same_target) parent.runtime_limit = learned.runtime_limit;
+        },
+        .chatgpt => |*parent| {
+            if (child.backend.client != .chatgpt) return;
+            const learned = &child.backend.client.chatgpt;
+            if (parent.store == learned.store and std.mem.eql(u8, parent.model, learned.model)) {
+                parent.cache_key = learned.cache_key;
+                parent.last_message_count = learned.last_message_count;
+            }
+        },
         .copilot => |*parent| {
             if (child.backend.client != .copilot) return;
             const learned = &child.backend.client.copilot;
             if (parent.started and learned.started and std.mem.eql(u8, parent.model, learned.model)) parent.inner.send_stream_options = parent.inner.send_stream_options and learned.inner.send_stream_options;
         },
-        else => {},
     }
 }
 
@@ -557,4 +577,28 @@ test "named routes isolate credentials models and retry settings" {
     try std.testing.expectEqual(@as(usize, 1), review.backend.client.openai.retries.attempts);
     try std.testing.expectEqualStrings("main", base.model());
     try std.testing.expectEqualStrings("primary-secret", base.currentKey().?);
+}
+
+test "completed request children preserve loaded context and conversation cache state" {
+    const a = std.testing.allocator;
+    var ollama: Backend = .init(.ollama, .{ .allocator = a, .io = std.testing.io, .host = "http://localhost:11434", .label = "test", .model = "local", .num_ctx = 0 });
+    defer ollama.deinit();
+    try ollama.startWithoutProbe();
+    ollama.client.ollama.context_limit = 262144;
+    const child = try ollama.spawn(a);
+    defer child.deinit();
+    child.backend.client.ollama.runtime_limit = 4096;
+    ollama.rememberTransport(child);
+    try std.testing.expectEqual(@as(u32, 4096), ollama.current().context_limit);
+    var chat: Backend = .init(.chatgpt, .{ .allocator = a, .io = std.testing.io, .host = "", .label = "test", .model = "remote" });
+    defer chat.deinit();
+    const turn = try chat.spawn(a);
+    defer turn.deinit();
+    turn.backend.client.chatgpt.cache_key = ("a" ** 32).*;
+    turn.backend.client.chatgpt.last_message_count = 3;
+    chat.rememberTransport(turn);
+    const next = try chat.spawn(a);
+    defer next.deinit();
+    try std.testing.expectEqualStrings("a" ** 32, &next.backend.client.chatgpt.cache_key.?);
+    try std.testing.expectEqual(@as(usize, 3), next.backend.client.chatgpt.last_message_count);
 }

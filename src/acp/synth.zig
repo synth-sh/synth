@@ -192,7 +192,7 @@ pub const Message = struct {
 
 /// Everything about a session that is not its transcript, sent whole whenever
 /// any of it changes.
-pub const Directory = struct { sessionId: []const u8, path: []const u8 };
+pub const Directory = struct { sessionId: []const u8, path: []const u8, source: enum { register_repo_root, slash_command } = .register_repo_root };
 
 pub const Status = struct {
     cwd: []const u8 = "",

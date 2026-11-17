@@ -104,6 +104,8 @@ pub fn startLike(self: *ChatGPTProvider, other: *const ChatGPTProvider) !void {
     self.effort_buffer = other.effort_buffer;
     self.effort_len = other.effort_len;
     self.retries = other.retries;
+    self.cache_key = other.cache_key;
+    self.last_message_count = other.last_message_count;
 }
 
 pub fn deinit(self: *ChatGPTProvider) void {
@@ -463,8 +465,9 @@ fn respond(
         const token = try store.accessToken(arena);
         const authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
         var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = hook_attempt.turn.hook_input, .url = responses_url, .protocol = "responses", .stop = turn.stop };
+        const request_body = try self.buildRequest(arena, convo, turn);
         const extra_headers = self.requestHeaders();
-        const prepared = try http.request(arena, try self.buildRequest(arena, convo, turn), .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" }, .content_type = .{ .override = "application/json" } }, &extra_headers);
+        const prepared = try http.request(arena, request_body, .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" }, .content_type = .{ .override = "application/json" } }, &extra_headers);
         const body = prepared.body;
         // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
@@ -1082,4 +1085,37 @@ test "a note posted mid-turn does not cut a tool call off from its result" {
     const last = input[input.len - 1].object;
     try testing.expectEqualStrings("function_call_output", last.get("type").?.string);
     try testing.expectEqualStrings("a b c", last.get("output").?.string);
+}
+
+test "a fresh authenticated turn initializes cache identity before transport hooks" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "chatgpt.json", .data = "{\"access_token\":\"test-token\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_at\":9000000000}" });
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const Hooks = @import("../core/hooks.zig");
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .http_request = &.{.{ .command = "cat > prepared; exit 2" }} } };
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "hello");
+    const selected = chat.provider();
+    try testing.expectError(error.HookBlocked, selected.respond(selected.userdata, &convo, .{ .system = "s", .hooks = &runner }, testing.allocator, null));
+    const payload = try tmp.dir.readFileAlloc(testing.io, "prepared", testing.allocator, .limited(128 * 1024));
+    defer testing.allocator.free(payload);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), payload, .{});
+    const http = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input.object.get("http").?.string, .{});
+    const key = http.object.get("body").?.object.get("prompt_cache_key").?.string;
+    try testing.expectEqualStrings(key, http.object.get("headers").?.object.get("session-id").?.string);
+    var child = testProvider(store);
+    defer child.deinit();
+    try child.startLike(&chat);
+    try convo.add(.assistant, "continuing");
+    const next = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try child.buildRequest(arena.allocator(), &convo, .{ .system = "s" }), .{});
+    try testing.expectEqualStrings(key, next.object.get("prompt_cache_key").?.string);
 }

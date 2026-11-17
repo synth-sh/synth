@@ -246,6 +246,7 @@ fn named(servers: []const mcp_tools.Server, name: []const u8) bool {
 pub fn destroy(self: *Stack) void {
     // Ordered: the loop joins workers writing to the runner; MCP tools point into the host.
     const end_input = (self.loop.exportHookInput(.{ .event = .session_end }) catch self.loop.hookInput(.{ .event = .session_end })).dupe(self.arena.allocator()) catch Hooks.Invocation{ .event = .session_end };
+    self.hook_runtime.retainSnapshot(end_input.transcript_path);
     self.loop.deinit();
     self.runner.deinit();
     self.hook_runtime.cancelBackground();
@@ -253,6 +254,7 @@ pub fn destroy(self: *Stack) void {
     end_runner.deadline_ms = std.Io.Clock.now(.awake, self.hooks.io).toMilliseconds() + Hooks.cleanup_timeout_ms;
     var end_result = end_runner.evaluate(self.allocator, end_input) catch null;
     if (end_result) |*result| result.deinit(self.allocator);
+    self.hook_runtime.releaseSnapshot(end_input.transcript_path);
     self.hook_runtime.deinit();
     self.convo.deinit();
     self.reads.deinit();
@@ -354,4 +356,24 @@ test "trusted current config policy blocks replacement definitions before adopti
     defer parsed.deinit();
     try std.testing.expectEqualStrings("project_settings", parsed.value.object.get("source").?.string);
     try std.testing.expect(std.mem.endsWith(u8, parsed.value.object.get("file_path").?.string, "/.synth/hooks.json"));
+}
+
+test "shutdown hooks can read their final transcript snapshot" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, ".git");
+    const cwd = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(cwd);
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.arena.deinit();
+    var backend: Backend = .init(.ollama, .{ .allocator = testing.allocator, .io = testing.io, .host = "http://127.0.0.1:9", .label = "test" });
+    defer backend.deinit();
+    const stack = try create(testing.allocator, testing.io, .{ .config = &config, .provider = backend.provider(), .cwd = cwd });
+    try stack.convo.add(.user, "final history");
+    stack.hooks.set.session_end = &.{.{ .transcript = true, .command = "python3 -c 'import json,sys; p=json.load(sys.stdin); open(\"archived\",\"w\").write(open(p[\"transcript_path\"]).read())'" }};
+    stack.destroy();
+    const archived = try tmp.dir.readFileAlloc(testing.io, "archived", testing.allocator, .limited(4096));
+    defer testing.allocator.free(archived);
+    try testing.expect(std.mem.indexOf(u8, archived, "final history") != null);
 }

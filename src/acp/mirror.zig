@@ -1282,7 +1282,7 @@ pub fn changeDirectory(self: *Mirror, path: []const u8) !void {
 }
 
 pub fn addDirectory(self: *Mirror, path: []const u8) !void {
-    try self.send(synth.method.add_directory, synth.Directory{ .sessionId = self.status.handle, .path = path }, .{ .command = "Adding directory" });
+    try self.send(synth.method.add_directory, synth.Directory{ .sessionId = self.status.handle, .path = path, .source = .slash_command }, .{ .command = "Adding directory" });
 }
 
 /// Hand decisions on calls to `mode`. The status says when it took.

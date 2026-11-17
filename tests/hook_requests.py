@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import time
 
 BINARY = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "zig-out/bin/synth"
 
@@ -28,7 +29,7 @@ def tool(name, arguments):
 
 
 @contextlib.contextmanager
-def session(name, respond, logic="", events=(), protocol="chat", attempts=2, extra_hooks=None, trust=True, route_policy=True):
+def session(name, respond, logic="", events=(), protocol="chat", attempts=2, extra_hooks=None, trust=True, route_policy=True, configure=None, on_show=None):
     requests = []
     errors = []
 
@@ -51,12 +52,17 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
         def do_POST(self):
             if self.path.endswith("/api/show"):
                 value = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                assert value["model"] in ("agent-model", "selected-model")
+                assert value["model"] in ("agent-model", "selected-model", "review-model")
+                if on_show:
+                    on_show(value)
                 body = json.dumps({"capabilities": ["completion", "tools"], "model_info": {"llama.context_length": 16384}}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
             packet = {"path": self.path, "headers": dict(self.headers), "raw_headers": list(self.headers.items()), "body": json.loads(self.rfile.read(int(self.headers["Content-Length"])))}
             suffix = "/api/chat" if protocol == "ollama" else "/v1/messages" if protocol == "messages" else "/v1/responses" if protocol == "responses" else "/v1/chat/completions"
@@ -86,6 +92,8 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             config = {"think": protocol == "ollama", "approvals": "auto", "auto_approve_safe_commands": False, "skill_paths": [], "model_requests": {"restrict_routes": True, "agent": "agent", "approval_judge": "review", "compaction": "agent", "reviewer_fallback": "deny", "reviewer_timeout_ms": 2000, "routes": routes}}
             if not route_policy:
                 config.pop('model_requests')
+            if configure:
+                configure(config, url)
             (root / "config.json").write_text(json.dumps(config))
             (root / "adapter.py").write_text("import json,sys\ndef fail(kind,value,tb):\n import traceback; traceback.print_exception(kind,value,tb); sys.exit(2)\nsys.excepthook=fail\np=json.load(sys.stdin)\ne=p['hook_event_name']\nwith open('events.jsonl','a') as f: f.write(json.dumps(p)+'\\n')\nout={}\n" + logic + "\nprint(json.dumps({'hookSpecificOutput':{'hookEventName':e,**out}}))\n")
             command = f"python3 {shlex.quote(str(root / 'adapter.py'))}"
@@ -304,6 +312,26 @@ if p['request_purpose']=='approval_judge' and e=='HttpRequest':
         assert not (root/'allowed.txt').exists()
         assert not any('/review/' in packet['path'] for packet in requests)
     print('PASS reviewer request evidence stays immutable through transport adapters')
+
+    started_probe, release_probe = threading.Event(), threading.Event()
+    def configure_review(config, url):
+        config['model_requests']['reviewer_timeout_ms'] = 100
+        route = config['model_requests']['routes'][2]
+        route.update(provider='ollama', endpoint=f'{url}/review', context_limit=0)
+    def stalled_probe(value):
+        assert value['model'] == 'review-model'
+        started_probe.set()
+        release_probe.wait(5)
+    began = time.monotonic()
+    try:
+        with session('cancel-probe', proposed, configure=configure_review, on_show=stalled_probe) as (root, result, requests, _):
+            assert started_probe.is_set()
+            assert time.monotonic() - began < 2, (result.stdout, result.stderr)
+            assert not (root / 'allowed.txt').exists()
+            assert not any('/review/' in packet['path'] for packet in requests)
+    finally:
+        release_probe.set()
+    print('PASS decision-model deadline cancels a stalled Ollama capability probe')
 
 
 if __name__ == '__main__':

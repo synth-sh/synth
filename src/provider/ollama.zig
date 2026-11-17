@@ -129,7 +129,7 @@ pub fn startLike(self: *OllamaProvider, other: *const OllamaProvider) !void {
 }
 
 /// Read what this model can do and how much it can hold.
-fn probe(self: *OllamaProvider) void {
+pub fn probe(self: *OllamaProvider) void {
     var response = self.client.show(.{ .model = self.model }) catch return self.learnCapabilities(null);
     defer response.deinit();
     self.learnCapabilities(response.body() catch null);

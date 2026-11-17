@@ -74,6 +74,7 @@ See [Hooks](hooks.md) for sources, events, grouped handlers, and migration.
 ACP clients can change session directories through `_synth/change_directory`
 or register a permitted root through `_synth/add_directory`. Both requests take
 `{"sessionId":"…","path":"…"}` and require an idle session. Root registration
-emits `DirectoryAdded` with `source: "register_repo_root"`. Status updates expose
+emits `DirectoryAdded` with `source: "register_repo_root"`.
+The TUI sends `source: "slash_command"`. Status updates expose
 `cwd` and `additional_roots`; `root` and `project` retain their session identity
-and original project meaning. See [Session directories](usage.md#session-directories).
+and original project meaning. See [Session directories](usage.md#hooks-and-workspace).
