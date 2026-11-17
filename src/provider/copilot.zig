@@ -94,6 +94,7 @@ pub fn startLike(self: *Copilot, other: *const Copilot) !void {
         self.models = try parseModels(arena, self.listing);
         try self.applyModel();
     }
+    self.inner.send_stream_options = other.inner.send_stream_options;
 }
 
 pub fn deinit(self: *Copilot) void {

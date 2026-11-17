@@ -602,3 +602,17 @@ test "completed request children preserve loaded context and conversation cache 
     try std.testing.expectEqualStrings("a" ** 32, &next.backend.client.chatgpt.cache_key.?);
     try std.testing.expectEqual(@as(usize, 3), next.backend.client.chatgpt.last_message_count);
 }
+
+test "a Copilot transport repair survives the next request client" {
+    const a = std.testing.allocator;
+    var parent: Backend = .init(.copilot, .{ .allocator = a, .io = std.testing.io, .host = "https://api.example", .label = "Copilot", .model = "gpt-4o", .api_key = "test-key" });
+    defer parent.deinit();
+    try parent.startWithoutProbe();
+    const repaired = try parent.spawn(a);
+    defer repaired.deinit();
+    repaired.backend.client.copilot.inner.send_stream_options = false;
+    parent.rememberTransport(repaired);
+    const next = try parent.spawn(a);
+    defer next.deinit();
+    try std.testing.expect(!next.backend.client.copilot.inner.send_stream_options);
+}

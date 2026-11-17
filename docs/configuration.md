@@ -194,7 +194,7 @@ sessions with unknown message provenance need a fresh human request for automati
 review. Ordinary read-only and configured standing allowances still follow the
 existing approval rules.
 
-See [model customization hooks](hooks.md#model-request-customization) for request
+See [model customization hooks](hooks.md#model-requests) for request
 context, generation settings, and bounded retry controls.
 
 A route may set `context_limit` (0–1048576 tokens). Zero uses the backend
