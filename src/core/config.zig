@@ -270,8 +270,8 @@ pub fn load(
     errdefer self.arena.deinit();
 
     self.database_path = try self.arena.allocator().dupe(u8, db_path);
-    self.path = try self.arena.allocator().dupe(u8, path);
-    try self.applyFile(io, path);
+    self.path = try std.fs.path.resolve(self.arena.allocator(), &.{path});
+    try self.applyFile(io, self.path);
     try self.applyEnv(env);
     self.hook_state_path = privateDataPath(self.arena.allocator(), env, "hook-trust.json") catch null;
 
@@ -588,4 +588,22 @@ test "lifecycle hooks are read from the file" {
     try testing.expectEqualStrings("bash", config.hooks.pre_tool_use[0].matcher);
     try testing.expectEqualStrings("./check.sh", config.hooks.pre_tool_use[0].command);
     try testing.expectEqual(@as(u64, 5000), config.hook_timeout_ms);
+}
+
+test "configured hooks keep their source after the caller reuses the path" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"hooks\":{\"PreToolUse\":[{\"command\":\"true\"}]}}" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "config.json" });
+    defer a.free(path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var config = try load(a, std.testing.io, &env, path, ":memory:");
+    defer config.deinit();
+    @memset(path, 'x');
+    try std.testing.expectEqualStrings(config.path, config.hooks.pre_tool_use[0].source);
+    try std.testing.expect(std.mem.endsWith(u8, config.hooks.pre_tool_use[0].source, "/config.json"));
 }
