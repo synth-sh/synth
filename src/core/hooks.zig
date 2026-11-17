@@ -9,6 +9,9 @@ const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
 pub const default_timeout_ms: u64 = 30_000;
 pub const cleanup_timeout_ms: i64 = 3000;
+const max_timeout_ms: u64 = 86_400_000;
+const milliseconds_per_second: u64 = 1000;
+const background_limit: usize = 64;
 const posix_signals = switch (builtin.os.tag) {
     .windows, .wasi => false,
     else => true,
@@ -256,7 +259,7 @@ pub fn effectiveTimeout(event: Event, fallback: u64, hook: Hook) u64 {
 }
 
 pub fn validTimeout(value: u64) !void {
-    if (value == 0 or value > 86_400_000) return error.InvalidHookTimeout;
+    if (value == 0 or value > max_timeout_ms) return error.InvalidHookTimeout;
 }
 
 pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []const u8) !Set {
@@ -302,7 +305,17 @@ fn parseDeclaration(a: std.mem.Allocator, value: std.json.Value, event: Event, s
 
 fn parseHandler(a: std.mem.Allocator, value: std.json.Value, declaration: Declaration, legacy: bool) !Hook {
     try validateDefinition(value, legacy);
-    const encoded = try std.json.Stringify.valueAlloc(a, value, .{});
+    var normalized = value;
+    if (value.object.get("timeout")) |seconds| {
+        if (seconds != .integer or seconds.integer <= 0 or seconds.integer > max_timeout_ms / milliseconds_per_second or value.object.contains("timeout_ms")) return error.InvalidHookTimeout;
+        normalized = .{ .object = .empty };
+        var fields = value.object.iterator();
+        while (fields.next()) |field| {
+            if (!std.mem.eql(u8, field.key_ptr.*, "timeout")) try normalized.object.put(a, field.key_ptr.*, field.value_ptr.*);
+        }
+        try normalized.object.put(a, "timeout_ms", .{ .integer = seconds.integer * milliseconds_per_second });
+    }
+    const encoded = try std.json.Stringify.valueAlloc(a, normalized, .{});
     var hook = try std.json.parseFromSliceLeaky(Hook, a, encoded, .{});
     hook.source = declaration.source;
     hook.matcher = declaration.matcher;
@@ -341,11 +354,11 @@ fn validateDefinition(value: std.json.Value, legacy: bool) !void {
             if (std.mem.eql(u8, key, "command")) return error.InvalidHookDefinition;
         } else if (std.mem.eql(u8, key, "server") or std.mem.eql(u8, key, "tool") or std.mem.eql(u8, key, "arguments")) return error.InvalidHookDefinition;
         if (legacy) {
-            if (std.mem.eql(u8, key, "matcher") or std.mem.eql(u8, key, "command") or std.mem.eql(u8, key, "timeout_ms") or std.mem.eql(u8, key, "transcript") or std.mem.eql(u8, key, "stream") or std.mem.eql(u8, key, "when")) continue;
+            if (std.mem.eql(u8, key, "matcher") or std.mem.eql(u8, key, "command") or (std.mem.eql(u8, key, "timeout_ms") or std.mem.eql(u8, key, "timeout")) or std.mem.eql(u8, key, "transcript") or std.mem.eql(u8, key, "stream") or std.mem.eql(u8, key, "when")) continue;
             return error.InvalidHookDefinition;
         }
         var valid = false;
-        inline for (.{ "type", "command", "timeout_ms", "async", "stream", "server", "tool", "arguments", "transcript" }) |allowed| {
+        inline for (.{ "type", "command", "timeout_ms", "timeout", "async", "stream", "server", "tool", "arguments", "transcript" }) |allowed| {
             if (std.mem.eql(u8, key, allowed)) valid = true;
         }
         if (!valid) return error.InvalidHookDefinition;
@@ -522,7 +535,7 @@ pub const Runtime = struct {
             job.join();
             try self.collect(job);
         }
-        if (self.background.items.len >= 64) return error.BackgroundHookLimit;
+        if (self.background.items.len >= background_limit) return error.BackgroundHookLimit;
         var session_runner = runner;
         session_runner.stop = &self.stop;
         const job = try Job.start(self.allocator, session_runner, hook, invocation);
@@ -972,10 +985,7 @@ pub const Runner = struct {
             }
         }
         if (failure) |err| {
-            const strict = invocation.event.requestStage() or invocation.event == .permission_evaluate or switch (invocation.event) {
-                .session_start, .user_prompt_submit, .pre_tool_use, .permission_request, .pre_compact, .post_compact, .post_tool_batch, .task_created, .task_completed, .pre_model_switch, .user_prompt_expansion, .config_change => true,
-                else => false,
-            };
+            const strict = !invocation.event.observational() and invocation.event != .post_tool_use;
             if (strict or err == error.OutOfMemory) return err;
             var diagnostic: Result = .{ .message = try std.fmt.allocPrint(allocator, "{s} hook failed: {s}", .{ invocation.event.name(), @errorName(err) }) };
             defer diagnostic.deinit(allocator);
@@ -1097,8 +1107,12 @@ pub const Runner = struct {
         defer allocator.free(payload);
 
         if (self.givenUp()) return error.Cancelled;
+        const project_env = try std.fmt.allocPrint(allocator, "SYNTH_PROJECT_DIR={s}", .{self.root});
+        defer allocator.free(project_env);
+        const compatibility_env = try std.fmt.allocPrint(allocator, "CLAUDE_PROJECT_DIR={s}", .{self.root});
+        defer allocator.free(compatibility_env);
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{ "bash", "-lc", command },
+            .argv = &.{ "env", "-u", "BASH_ENV", project_env, compatibility_env, "bash", "-c", command },
             .cwd = .{ .dir = dir },
             .stdin = .pipe,
             .stdout = .pipe,
@@ -2055,4 +2069,29 @@ test "a transcript snapshot survives its owner until the last hook reader finish
     file.close(std.testing.io);
     dispatch.destroy();
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, path, .{}));
+}
+
+test "missing or unexecutable completion policies fail closed" {
+    const a = std.testing.allocator;
+    inline for (.{ Event.stop, Event.subagent_stop }) |event| {
+        for ([_][]const u8{ "exit 126", "synth-no-such-hook-command" }) |command| {
+            var set: Set = .{};
+            @field(set, @tagName(event)) = &.{.{ .command = command }};
+            const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = set };
+            try std.testing.expectError(error.HookCommandUnavailable, runner.evaluate(a, .{ .event = event }));
+        }
+    }
+}
+
+test "command hooks normalize timeout seconds and provide project environment" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"PreToolUse\":[{\"hooks\":[{\"command\":\"test \\\"$SYNTH_PROJECT_DIR\\\" = \\\"$CLAUDE_PROJECT_DIR\\\" && printf {}\",\"timeout\":2}]}]}", .{});
+    const set = try parse(a, value, "policy.json");
+    try std.testing.expectEqual(@as(?u64, 2000), set.pre_tool_use[0].timeout_ms);
+    const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = set };
+    var result = try runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.blocked == null);
 }

@@ -1206,7 +1206,12 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
     }
     if (self.hook_flow.continuation() == .finish_turn) {
         try self.acceptHookResult(&dispatch.result);
-        if (dispatch.failed) |err| self.say("Completion hook failed: {s}", .{@errorName(err)});
+        if (dispatch.failed) |err| {
+            self.last_error = err;
+            self.say("Completion hook failed: {s}", .{@errorName(err)});
+            self.finish(.failed);
+            return true;
+        }
         if (dispatch.takeBlocked()) |reason| {
             defer self.allocator.free(reason);
             if (!dispatch.result.stop) {
@@ -7267,4 +7272,19 @@ test "a referenced hook script requires human approval before editing" {
     try testing.expectEqualStrings("cat >/dev/null\n", original);
     try loop.decide(.deny);
     try settle(&loop);
+}
+
+test "an unavailable completion policy does not report a successful turn" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .stop = &.{.{ .command = "synth-no-such-hook-command" }} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(Outcome.failed, loop.outcome.?);
+    const notice = loop.takeHookNotice().?;
+    defer testing.allocator.free(notice);
+    try testing.expect(std.mem.indexOf(u8, notice, "HookCommandUnavailable") != null);
 }

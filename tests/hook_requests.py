@@ -86,6 +86,7 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             (root / ".git").mkdir()
             (root / ".synth").mkdir()
             (root / "home").mkdir()
+            (root / "home/.bash_profile").write_text("echo unexpected-login-output\n")
             (root / "seed.txt").write_text("seed data")
             url = f"http://127.0.0.1:{server.server_port}"
             routes = [{"id": identifier, "provider": "ollama" if protocol == "ollama" and identifier != "review" else "openai", "endpoint": f"{url}/{identifier}" + ("" if protocol == "ollama" and identifier != "review" else "/v1"), "model": f"{identifier}-model", "protocol": "chat" if protocol == "ollama" or identifier == "review" else protocol, "context_limit": 16384, "api_key": f"{identifier}-secret", "purposes": ["approval_judge"] if identifier == "review" else ["agent", "compaction"], "settings": {"attempts": attempts, "retry_delay_ms": 0}} for identifier in ("agent", "selected", "review")]
