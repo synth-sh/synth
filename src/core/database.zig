@@ -645,24 +645,18 @@ pub fn recordAuthorization(self: *Database, session: i64, seq: u64, text: []cons
 }
 
 pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) ![]Conversation.Message {
-    var rows = try self.conn.rows("SELECT text FROM (SELECT text, seq FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human' UNION ALL SELECT text, seq FROM human_authorization WHERE session_id = ?) ORDER BY seq DESC LIMIT 64", .{ session, session });
+    var rows = try self.conn.rows(
+        \\SELECT text, decision FROM (
+        \\SELECT text, seq, 0 AS decision FROM (SELECT text, seq FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human' ORDER BY seq DESC LIMIT 64)
+        \\UNION ALL
+        \\SELECT text, seq, 1 AS decision FROM (SELECT text, seq FROM human_authorization WHERE session_id = ? ORDER BY seq DESC LIMIT 64)
+        \\) ORDER BY seq ASC
+    , .{ session, session });
     defer rows.deinit();
-    var messages: std.ArrayList(Conversation.Message) = .empty;
-    errdefer {
-        for (messages.items) |*msg| msg.deinit(allocator);
-        messages.deinit(allocator);
-    }
-    var bytes: usize = 0;
-    while (rows.next()) |row| {
-        const text = row.text(0);
-        if (bytes + text.len > 12 * 1024 and messages.items.len > 0) break;
-        const owned = try allocator.dupe(u8, text);
-        errdefer allocator.free(owned);
-        try messages.append(allocator, .{ .role = .user, .origin = .human, .text = owned });
-        bytes += text.len;
-    }
-    std.mem.reverse(Conversation.Message, messages.items);
-    return messages.toOwnedSlice(allocator);
+    var intent: @import("human_intent.zig") = .{};
+    defer intent.deinit(allocator);
+    while (rows.next()) |row| try intent.record(allocator, row.text(0), row.int(1) != 0);
+    return intent.take(allocator);
 }
 
 /// Append a heavy body (reasoning or tool result) to a message.

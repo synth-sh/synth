@@ -7,7 +7,7 @@
 //! Every MCP tool needs approval before it runs. The protocol has a
 //! `readOnlyHint` annotation, and the spec is explicit that a server's
 //! description of its own behaviour is untrusted - so a hint from something we
-//! just launched is not grounds for skipping the gate.
+//! just launched is not grounds for skipping the guard.
 
 const std = @import("std");
 const testing = std.testing;
@@ -986,7 +986,7 @@ test "a server's tools are registered, called, and cleaned up" {
     try testing.expectEqual(@as(usize, 0), host.failures.items.len);
 
     const registered = registry.get("mcp__files__read_file") orelse return error.TestUnexpectedResult;
-    // A server's own claim about itself is not grounds for skipping the gate.
+    // A server's own claim about itself is not grounds for skipping the guard.
     try testing.expect(!registered.read_only);
     try testing.expect(std.mem.indexOf(u8, registered.description, "files MCP server") != null);
 
@@ -1406,7 +1406,7 @@ test "hook MCP execution reuses a connected server without recursive scheduling"
     const a = testing.allocator;
     const argv = comptime scriptedServer(&.{
         &.{"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersions\":[\"2026-07-28\"]}}"},
-        &.{"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"gate\",\"description\":\"Policy\",\"inputSchema\":{\"type\":\"object\"}}]}}"},
+        &.{"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"guard\",\"description\":\"Policy\",\"inputSchema\":{\"type\":\"object\"}}]}}"},
         &.{"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"elicitation/create\",\"params\":{\"message\":\"Confirm\",\"requestedSchema\":{\"type\":\"object\"}}}"},
         &.{"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"decision\\\":\\\"block\\\",\\\"reason\\\":\\\"remote policy\\\"}\"}]}}"},
         &.{"{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"invalid-json\"}]}}"},
@@ -1442,14 +1442,14 @@ test "hook MCP execution reuses a connected server without recursive scheduling"
     var executor: Executor = .{ .host = &host, .reads = &reads };
     var runtime: Hooks.Runtime = .{ .allocator = a, .io = testing.io };
     defer runtime.deinit();
-    const hook: Hooks.Hook = .{ .legacy = false, .type = .mcp_tool, .arguments = .{ .object = .empty }, .server = "policy", .tool = "gate", .source = "test server", .timeout_ms = 50 };
+    const hook: Hooks.Hook = .{ .legacy = false, .type = .mcp_tool, .arguments = .{ .object = .empty }, .server = "policy", .tool = "guard", .source = "test server", .timeout_ms = 50 };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = ".", .runtime = &runtime, .mcp_executor = .{ .userdata = &executor, .call = Executor.execute }, .set = .{ .pre_tool_use = &.{hook} } };
     var result = try runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash" });
     defer result.deinit(a);
     try testing.expect(std.mem.indexOf(u8, result.blocked.?, "remote policy") != null);
     try testing.expect(std.mem.indexOf(u8, result.blocked.?, "external MCP tool") != null);
     try testing.expectEqual(@as(usize, 2), runtime.records_len);
-    try testing.expectError(error.HookMcpServerUnavailable, host.callConnected(.{ .allocator = a, .io = testing.io, .project_root = ".", .reads = &reads }, "missing", "gate", "{}"));
+    try testing.expectError(error.HookMcpServerUnavailable, host.callConnected(.{ .allocator = a, .io = testing.io, .project_root = ".", .reads = &reads }, "missing", "guard", "{}"));
     try testing.expectError(error.SyntaxError, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash" }));
     const started = tool.monotonicMilliseconds(testing.io);
     try testing.expectError(error.HookMcpCallFailed, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash" }));

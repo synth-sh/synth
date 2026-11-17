@@ -440,11 +440,11 @@ pub const Hooks = struct {
     id: []const u8 = "",
 };
 
-test "ACP sends display text while retaining canonical conversation text" {
+test "ACP sends display text while retaining reference conversation text" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const original: Conversation.Message = .{ .role = .assistant, .text = "canonical", .display_text = "visible" };
+    const original: Conversation.Message = .{ .role = .assistant, .text = "reference", .display_text = "visible" };
     const wire = try Message.from(arena.allocator(), &original);
     try testing.expectEqualStrings("visible", wire.text);
-    try testing.expectEqualStrings("canonical", original.text);
+    try testing.expectEqualStrings("reference", original.text);
 }

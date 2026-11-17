@@ -10,12 +10,13 @@ pub const Context = struct {
     /// the file boundary without changing this directory.
     project_root: []const u8,
     additional_roots: []const []const u8 = &.{},
+    permitted_root: ?[]const u8 = null,
     /// Files this session has read, keyed to the mtime seen at read time, so
     /// edits can be refused when the file changed underneath the model.
     reads: *ReadLog,
     /// How a tool starts a nested agent. Null where there is no loop behind the
     /// call - a test, a one-off run - and the tool that needs it says so rather
-    /// than pretending to have delegated.
+    /// than pretending to have delechecked.
     delegate: ?Delegate = null,
     /// Set when the caller has given up on this batch of calls. A tool that
     /// runs long must check it, or cancelling a turn waits for the tool rather
@@ -45,7 +46,7 @@ pub const Context = struct {
     /// Whether this call may touch paths outside the project.
     ///
     /// True only for a call a person approved by hand. A call that skipped the
-    /// gate - a read-only tool, a safe command, a standing allowance - stays
+    /// guard - a read-only tool, a safe command, a standing allowance - stays
     /// inside the root, so a path the approval layer did not think to inspect
     /// is refused rather than quietly allowed.
     allow_outside: bool = false,
@@ -349,7 +350,7 @@ pub fn resolvePath(ctx: Context, path: []const u8) ![]u8 {
     const resolved = try std.fs.path.resolve(ctx.allocator, &.{joined});
     errdefer ctx.allocator.free(resolved);
 
-    if (!ctx.allow_outside and !isInside(ctx.project_root, resolved)) {
+    if (!ctx.allow_outside and !isInside(ctx.permitted_root orelse ctx.project_root, resolved)) {
         const admitted = for (ctx.additional_roots) |root| {
             if (isInside(root, resolved)) break true;
         } else false;
@@ -358,11 +359,7 @@ pub fn resolvePath(ctx: Context, path: []const u8) ![]u8 {
     return resolved;
 }
 
-fn isInside(root: []const u8, path: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, root)) return false;
-    if (path.len == root.len) return true;
-    return std.mem.endsWith(u8, root, std.fs.path.sep_str) or path[root.len] == std.fs.path.sep;
-}
+const isInside = @import("../core/paths.zig").inside;
 
 test "resolvePath keeps paths inside the project" {
     var reads: ReadLog = .init(std.testing.allocator);

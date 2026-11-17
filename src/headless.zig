@@ -163,6 +163,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         defer allocator.free(notice);
         try out.print("{s}hook notice{s} {s}\n", .{ red, reset, notice });
         try out.flush();
+        if (loop.steps == 0) return error.HookRejected;
         return;
     }
     _ = try report(out, convo, printed);

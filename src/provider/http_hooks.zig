@@ -1,7 +1,7 @@
 const std = @import("std");
 const Hooks = @import("../core/hooks.zig");
 
-pub const Patch = @import("../core/hook_result.zig").HttpPatch;
+const Patch = @import("../core/hook_result.zig").HttpPatch;
 
 pub const Request = struct {
     body: []u8,
@@ -29,7 +29,7 @@ pub const Exchange = struct {
     index: usize = 0,
     hook_failed: bool = false,
 
-    pub fn enabled(self: Exchange, a: std.mem.Allocator, event: Hooks.Event) bool {
+    fn enabled(self: Exchange, a: std.mem.Allocator, event: Hooks.Event) bool {
         const runner = self.runner orelse return false;
         var input = self.input;
         input.event = event;
@@ -40,6 +40,11 @@ pub const Exchange = struct {
         var runner = (self.runner orelse return null).*;
         runner.stop = self.stop;
         var input = self.input;
+        if (std.mem.eql(u8, phase, "event")) {
+            var handlers: std.ArrayList(Hooks.Hook) = .empty;
+            for (runner.set.http_response) |hook| if (hook.stream) try handlers.append(a, hook);
+            runner.set.http_response = handlers.items;
+        }
         input.event = if (std.mem.eql(u8, phase, "request")) .http_request else .http_response;
         inline for (.{ "request_context", "request_system", "request_instruction", "request_tools", "request_routes" }) |field| @field(input, field) = "";
         if (!runner.hasMatching(a, input, false)) return null;
@@ -117,6 +122,16 @@ pub const Exchange = struct {
         errdefer self.hook_failed = true;
         defer self.index += 1;
         if (!self.enabled(a, .http_response)) return body;
+        if (streaming) {
+            var input = self.input;
+            input.event = .http_response;
+            const runner = self.runner orelse return body;
+            var selected = false;
+            for (runner.set.http_response) |hook| {
+                if (hook.stream and hook.enabled and hook.trusted and (hook.when == null or hook.when.?.accepts(input))) selected = true;
+            }
+            if (!selected) return body;
+        }
         const input = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch std.json.Value{ .string = body };
         const patch = try self.evaluate(a, if (streaming) "event" else "body", input, self.head.headers) orelse return body;
         if (patch.headers != null or patch.status != null) return error.InvalidHttpHookOutput;

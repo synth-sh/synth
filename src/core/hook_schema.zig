@@ -4,7 +4,17 @@ pub fn validate(schema: std.json.Value, value: std.json.Value) !void {
     if (schema != .object) return error.InvalidToolSchema;
     if (schema.object.get("type")) |kind| {
         if (kind != .string) return error.InvalidToolSchema;
-        const valid = if (std.mem.eql(u8, kind.string, "object")) value == .object else if (std.mem.eql(u8, kind.string, "array")) value == .array else if (std.mem.eql(u8, kind.string, "string")) value == .string else if (std.mem.eql(u8, kind.string, "boolean")) value == .bool else if (std.mem.eql(u8, kind.string, "integer")) value == .integer else if (std.mem.eql(u8, kind.string, "number")) value == .integer or value == .float else if (std.mem.eql(u8, kind.string, "null")) value == .null else return error.UnsupportedToolSchema;
+        const Kind = enum { object, array, string, boolean, integer, number, null };
+        const parsed = std.meta.stringToEnum(Kind, kind.string) orelse return error.UnsupportedToolSchema;
+        const valid = switch (parsed) {
+            .object => value == .object,
+            .array => value == .array,
+            .string => value == .string,
+            .boolean => value == .bool,
+            .integer => value == .integer,
+            .number => value == .integer or value == .float,
+            .null => value == .null,
+        };
         if (!valid) return error.InvalidToolInput;
     }
     if (schema.object.get("enum")) |choices| {

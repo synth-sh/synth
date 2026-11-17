@@ -1,5 +1,17 @@
 const std = @import("std");
 
+pub const max_temperature: f32 = 2;
+pub const max_probability: f32 = 1;
+pub const max_tokens: u32 = 1_048_576;
+pub const max_penalty: f32 = 2;
+pub const max_stops = 16;
+pub const max_stop_bytes = 4096;
+pub const max_attempts = 4;
+pub const max_retry_delay_ms = @import("../provider/retry.zig").max_delay_ms;
+pub const default_review_ms = 30_000;
+pub const max_review_ms = 300_000;
+pub const effort_levels = [_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh" };
+
 pub const Purpose = enum { agent, approval_judge, compaction };
 pub const Fallback = enum { ask, deny };
 
@@ -17,21 +29,21 @@ pub const Settings = struct {
     retry_delay_ms: ?u32 = null,
 
     pub fn validate(self: Settings) !void {
-        if (self.temperature) |v| if (!std.math.isFinite(v) or v < 0 or v > 2) return error.InvalidModelSettings;
-        if (self.top_p) |v| if (!std.math.isFinite(v) or v <= 0 or v > 1) return error.InvalidModelSettings;
-        if (self.top_k) |v| if (v == 0 or v > 1_048_576) return error.InvalidModelSettings;
+        if (self.temperature) |v| if (!std.math.isFinite(v) or v < 0 or v > max_temperature) return error.InvalidModelSettings;
+        if (self.top_p) |v| if (!std.math.isFinite(v) or v <= 0 or v > max_probability) return error.InvalidModelSettings;
+        if (self.top_k) |v| if (v == 0 or v > max_tokens) return error.InvalidModelSettings;
         inline for (.{ "frequency_penalty", "presence_penalty" }) |field| if (@field(self, field)) |v| {
-            if (!std.math.isFinite(v) or v < -2 or v > 2) return error.InvalidModelSettings;
+            if (!std.math.isFinite(v) or v < -max_penalty or v > max_penalty) return error.InvalidModelSettings;
         };
         if (self.stop) |values| {
-            if (values.len == 0 or values.len > 16) return error.InvalidModelSettings;
-            for (values) |value| if (value.len == 0 or value.len > 4096) return error.InvalidModelSettings;
+            if (values.len == 0 or values.len > max_stops) return error.InvalidModelSettings;
+            for (values) |value| if (value.len == 0 or value.len > max_stop_bytes) return error.InvalidModelSettings;
         }
-        if (self.max_output_tokens) |v| if (v == 0 or v > 1_048_576) return error.InvalidModelSettings;
-        if (self.attempts) |v| if (v == 0 or v > 4) return error.InvalidModelSettings;
-        if (self.retry_delay_ms) |v| if (v > 60_000) return error.InvalidModelSettings;
+        if (self.max_output_tokens) |v| if (v == 0 or v > max_tokens) return error.InvalidModelSettings;
+        if (self.attempts) |v| if (v == 0 or v > max_attempts) return error.InvalidModelSettings;
+        if (self.retry_delay_ms) |v| if (v > max_retry_delay_ms) return error.InvalidModelSettings;
         if (self.reasoning_effort) |v| {
-            for ([_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh" }) |allowed| {
+            for (effort_levels) |allowed| {
                 if (std.mem.eql(u8, v, allowed)) break;
             } else return error.InvalidModelSettings;
         }
@@ -62,7 +74,7 @@ pub const Policy = struct {
     approval_judge: ?[]const u8 = null,
     compaction: ?[]const u8 = null,
     restrict_routes: bool = false,
-    reviewer_timeout_ms: u32 = 30_000,
+    reviewer_timeout_ms: u32 = default_review_ms,
     reviewer_fallback: Fallback = .ask,
 
     pub fn selected(self: Policy, purpose: Purpose) ?[]const u8 {
@@ -83,9 +95,9 @@ pub const Policy = struct {
     }
 
     pub fn validate(self: Policy) !void {
-        if (self.reviewer_timeout_ms == 0 or self.reviewer_timeout_ms > 300_000) return error.InvalidReviewerTimeout;
+        if (self.reviewer_timeout_ms == 0 or self.reviewer_timeout_ms > max_review_ms) return error.InvalidReviewerTimeout;
         for (self.routes, 0..) |value, i| {
-            if (value.id.len == 0 or value.model.len == 0 or value.purposes.len == 0 or value.context_limit > 1_048_576) return error.InvalidModelRoute;
+            if (value.id.len == 0 or value.model.len == 0 or value.purposes.len == 0 or value.context_limit > max_tokens) return error.InvalidModelRoute;
             const uri = std.Uri.parse(value.endpoint) catch return error.InvalidModelRoute;
             if ((!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) or uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidModelRoute;
             for (self.routes[0..i]) |earlier| if (std.mem.eql(u8, earlier.id, value.id)) return error.DuplicateModelRoute;

@@ -593,10 +593,8 @@ fn respond(
             self.captureRejection(head.status, why);
             hook_attempt.error_message = if (Provider.mentionsOverflow(why)) "ContextTooLarge" else "HttpError";
             hook_attempt.finish();
-            if (attempt < self.retries.attempts and self.retryWithout(why)) {
-                const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = "http_error", .error_message = why }) else @as(?u64, 0);
-                if (wait) |delay| {
-                    try std.Io.sleep(self.io, .fromMilliseconds(@intCast(delay)), .awake);
+            if (self.retryWithout(why)) {
+                if (retry.pause(self.io, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = retry.errorType(head.status), .error_message = why })) {
                     self.clearRejection();
                     attempt += 1;
                     continue;
@@ -693,22 +691,15 @@ fn waitAndRetry(
     sink: ?Provider.Sink,
 ) bool {
     if (attempt >= self.retries.attempts) return false;
-    const eligible = retry.transient(status) and !retry.tooLong(self.retries, retry_after_ms);
-
-    if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
-    }
-
-    const proposed = retry.waitMs(self.retries, attempt, retry_after_ms);
-    const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = eligible, .delay_ms = proposed, .status = @intFromEnum(status), .error_type = "http_error", .error_message = self.rejection orelse "" }) orelse return false else if (eligible) proposed else return false;
-    std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
-
-    if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
-    }
-    return true;
+    return retry.pause(self.io, sink, .{
+        .attempt = attempt,
+        .allowed = retry.transient(status) and !retry.tooLong(self.retries, retry_after_ms),
+        .delay_ms = retry.waitMs(self.retries, attempt, retry_after_ms),
+        .status = @intFromEnum(status),
+        .error_type = retry.errorType(status),
+        .error_message = self.rejection orelse "",
+    });
 }
-
 /// One header off a reply, before a body reader invalidates it.
 pub fn headerValue(head: std.http.Client.Response.Head, name: []const u8) ?[]const u8 {
     var it = head.iterateHeaders();

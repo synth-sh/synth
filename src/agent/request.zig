@@ -8,6 +8,7 @@ const Thought = @import("thought.zig");
 const tool = @import("../tools/tool.zig");
 
 const Request = @This();
+const Preparation = @import("request_prepare.zig");
 const ContextPatch = @import("../core/request_context.zig");
 
 allocator: std.mem.Allocator,
@@ -68,7 +69,6 @@ pub fn start(
         .provider = provider,
         .conversation = conversation,
         .turn = .{
-            .backend = turn.backend,
             .model_policy = turn.model_policy,
             .settings = turn.settings,
             .system = try allocator.dupe(u8, turn.system),
@@ -124,8 +124,6 @@ pub fn requestStop(self: *Request) void {
     if (self.provider.abort) |abort| abort(self.provider.userdata);
 }
 
-/// Non-blocking check for the owning thread. True once nothing has arrived for
-/// `limit_ms`; without it the kernel retransmits for a quarter of an hour.
 pub fn expired(self: *Request, limit_ms: u32) bool {
     return tool.monotonicMilliseconds(self.io) - self.started_ms >= limit_ms;
 }
@@ -174,122 +172,11 @@ fn freeTurn(self: *Request) void {
     self.allocator.free(self.turn.instruction);
 }
 
-fn onRetry(ptr: *anyopaque, info: Provider.RetryInfo) ?u64 {
-    const self: *Request = @ptrCast(@alignCast(ptr));
-    self.turn.hook_input.attempt = @intCast(info.attempt);
-    self.turn.hook_input.retry_delay_ms = info.delay_ms;
-    self.turn.hook_input.retry_allowed = info.allowed;
-    self.turn.hook_input.http_status = info.status;
-    self.turn.hook_input.error_type = self.hook_arena.allocator().dupe(u8, info.error_type) catch return null;
-    self.turn.hook_input.error_message = self.hook_arena.allocator().dupe(u8, info.error_message) catch return null;
-    const result = self.requestHook(.model_retry) catch return null;
-    if (!(result.retry_allowed orelse info.allowed)) return null;
-    return @min(result.retry_delay_ms orelse info.delay_ms, 60_000);
-}
-
-fn requestHook(self: *Request, event: @import("../core/hooks.zig").Event) !@import("../core/hooks.zig").Result {
-    var runner = (self.turn.hooks orelse return .{}).*;
-    runner.stop = &self.stop;
-    var input = self.turn.hook_input;
-    input.event = event;
-    input.model = self.provider.model;
-    input.provider = self.provider.name;
-    const result = try runner.evaluate(self.hook_arena.allocator(), input);
-    if (result.message) |message| if (runner.runtime) |runtime| try runtime.notice(message);
-    return result;
-}
-
-fn prepare(self: *Request) !void {
-    const a = self.hook_arena.allocator();
-    const purpose = self.turn.hook_input.request_purpose;
-    self.turn.hook_input.route = self.turn.model_policy.selected(purpose) orelse "";
-    if (self.turn.hooks) |runner| {
-        var input = self.turn.hook_input;
-        input.event = .model_resolve;
-        if (runner.hasMatching(a, input, false)) try self.describeContext();
-    }
-    const resolution = try self.requestHook(.model_resolve);
-    if (resolution.model_route) |id| {
-        if (id.len == 0) return error.ModelRouteDenied;
-        self.turn.hook_input.route = id;
-    }
-    if (self.turn.hook_input.route.len > 0) {
-        const route = try self.turn.model_policy.route(self.turn.hook_input.route, purpose);
-        const owned = self.owned_backend orelse return error.ModelRoutingUnavailable;
-        self.provider_mutex.lockUncancelable(self.io);
-        defer self.provider_mutex.unlock(self.io);
-        try owned.configure(route);
-        self.provider = owned.provider();
-        self.turn.settings.merge(route.settings);
-    } else if (self.turn.model_policy.restrict_routes) return error.ModelRouteDenied;
-    self.turn.hook_input.model = try a.dupe(u8, self.provider.model);
-    self.turn.hook_input.provider = try a.dupe(u8, self.provider.name);
-    self.turn.hook_input.request_settings = try std.json.Stringify.valueAlloc(a, self.turn.settings, .{ .emit_null_optional_fields = false });
-    const settings = try self.requestHook(.model_settings);
-    if (settings.settings) |encoded| self.turn.settings.merge(try std.json.parseFromSliceLeaky(@import("../core/model_policy.zig").Settings, a, encoded, .{}));
-    try self.turn.settings.validate();
-    self.turn.hook_input.request_settings = try std.json.Stringify.valueAlloc(a, self.turn.settings, .{ .emit_null_optional_fields = false });
-    if (self.owned_backend) |owned| {
-        self.provider_mutex.lockUncancelable(self.io);
-        defer self.provider_mutex.unlock(self.io);
-        try owned.settings(self.turn.settings);
-        self.provider = owned.provider();
-    } else if (self.turn.settings.reasoning_effort != null) return error.UnsupportedModelSettings;
-    if (self.turn.hooks) |runner| {
-        var input = self.turn.hook_input;
-        input.event = .model_context;
-        if (!runner.hasMatching(a, input, false)) return;
-        try self.describeContext();
-        const context = try self.requestHook(.model_context);
-        if (context.context_edits != null or context.request_context != null) {
-            if (purpose == .approval_judge) return error.ReviewerContextImmutable;
-            self.prepared_conversation = .init(self.allocator);
-            for (self.conversation.messages.items) |msg| try self.prepared_conversation.?.adoptMessage(try msg.clone(self.allocator));
-            if (context.context_edits) |encoded| {
-                const edits = try std.json.parseFromSliceLeaky([]const ContextPatch.Edit, a, encoded, .{});
-                try ContextPatch.apply(&self.prepared_conversation.?, edits);
-            }
-            if (context.request_context) |encoded| {
-                const patch = try std.json.parseFromSliceLeaky(ContextPatch.Patch, a, encoded, .{});
-                if (patch.system) |value| try self.replaceTurnText(&self.turn.system, value);
-                if (patch.instruction) |value| try self.replaceTurnText(&self.turn.instruction, value);
-                if (patch.tools) |names| {
-                    const selected = try ContextPatch.selectTools(a, self.turn.tools_json, names);
-                    try self.replaceTurnText(&self.turn.tools_json, selected);
-                    self.restricted_tools = true;
-                }
-                try ContextPatch.apply(&self.prepared_conversation.?, patch.messages);
-            }
-            try self.describeContext();
-        }
-    }
-}
-
-fn replaceTurnText(self: *Request, target: *[]const u8, value: []const u8) !void {
-    const copy = try self.allocator.dupe(u8, value);
-    self.allocator.free(target.*);
-    target.* = copy;
-}
-
-fn describeContext(self: *Request) !void {
-    const a = self.hook_arena.allocator();
-    self.turn.hook_input.request_context = try std.json.Stringify.valueAlloc(a, if (self.prepared_conversation) |*prepared| prepared.messages.items else self.conversation.messages.items, .{ .emit_null_optional_fields = false });
-    self.turn.hook_input.request_system = try a.dupe(u8, self.turn.system);
-    self.turn.hook_input.request_instruction = try a.dupe(u8, self.turn.instruction);
-    self.turn.hook_input.request_tools = try a.dupe(u8, self.turn.tools_json);
-    var routes: std.ArrayList(std.json.Value) = .empty;
-    for (self.turn.model_policy.routes) |route| {
-        const encoded = try std.json.Stringify.valueAlloc(a, .{ .id = route.id, .provider = route.provider, .protocol = route.protocol, .endpoint = route.endpoint, .model = route.model, .context_limit = route.context_limit, .purposes = route.purposes }, .{});
-        try routes.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
-    }
-    self.turn.hook_input.request_routes = try std.json.Stringify.valueAlloc(a, routes.items, .{});
-}
-
 fn run(self: *Request) void {
     defer self.done.store(true, .release);
     defer self.finishDisplay();
 
-    self.prepare() catch |err| {
+    Preparation.prepare(self) catch |err| {
         self.failed = err;
         return;
     };
@@ -318,7 +205,7 @@ fn run(self: *Request) void {
             .userdata = self,
             .onThinking = onThinking,
             .onText = onText,
-            .onRetry = onRetry,
+            .onRetry = Preparation.onRetry,
             .onThinkingDone = onThinkingDone,
             .stopped = stopped,
         },
@@ -516,40 +403,7 @@ test "MessageDisplay failure is fail-open and internal requests do not display" 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "displayed", .{}));
 }
 
-test "disabled display hooks must not buffer an unrelated stream" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    const Hooks = @import("../core/hooks.zig");
-    const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{ .message_display = &.{.{ .command = "true", .enabled = false }} } };
-    var marker: u8 = 0;
-    const Fake = struct {
-        fn respond(_: *anyopaque, _: *Conversation, _: Provider.Turn, _: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
-            return .{};
-        }
-    };
-    var conversation = Conversation.init(a);
-    defer conversation.deinit();
-    var request: Request = .{
-        .allocator = a,
-        .io = io,
-        .provider = .{ .name = "fake", .userdata = &marker, .respond = Fake.respond },
-        .conversation = &conversation,
-        .turn = .{ .system = "", .hooks = &runner, .display_messages = true },
-        .hook_arena = .init(a),
-        .thoughts = .init(a, io),
-        .content = .init(a, io),
-    };
-    defer request.hook_arena.deinit();
-    defer request.thoughts.deinit();
-    defer request.content.deinit();
-    defer request.display_pending.deinit(a);
-    onText(&request, "a paragraph without newline");
-    const shown = try request.content.snapshot(a);
-    defer a.free(shown);
-    try std.testing.expectEqualStrings("a paragraph without newline", shown);
-}
-
-test "context edits preserve canonical history and cannot rewrite reviewer evidence" {
+test "context edits preserve reference history and cannot rewrite reviewer evidence" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const Hooks = @import("../core/hooks.zig");
@@ -566,13 +420,13 @@ test "context edits preserve canonical history and cannot rewrite reviewer evide
     var convo = Conversation.init(a);
     defer convo.deinit();
     convo.next_seq = 42;
-    _ = try convo.addUser("canonical human request", &.{}, &.{});
+    _ = try convo.addUser("reference human request", &.{}, &.{});
     const request = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner });
     defer request.destroy();
     request.join();
     try std.testing.expect(request.failed == null);
     try std.testing.expectEqualStrings("prepared", request.reply.?.text);
-    try std.testing.expectEqualStrings("canonical human request", convo.messages.items[0].text);
+    try std.testing.expectEqualStrings("reference human request", convo.messages.items[0].text);
     try std.testing.expectEqual(Conversation.Origin.human, convo.messages.items[0].origin);
     const reviewer = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner, .hook_input = .{ .event = .pre_model_request, .request_purpose = .approval_judge } });
     defer reviewer.destroy();

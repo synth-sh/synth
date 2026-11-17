@@ -125,7 +125,7 @@ test "request tool selection cannot add tools and context cannot split tool exch
     try std.testing.expectError(error.IncompleteContextExchange, apply(&conversation, &.{.{ .seq = 0, .omit = true }}));
 }
 
-test "edited request messages clear replay state without changing canonical messages" {
+test "edited request messages clear replay state without changing reference messages" {
     const a = std.testing.allocator;
     var original = Conversation.init(a);
     defer original.deinit();

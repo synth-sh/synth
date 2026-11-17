@@ -1,21 +1,6 @@
 const std = @import("std");
 
-pub fn resolve(io: std.Io, a: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]const u8 {
-    const lexical = try std.fs.path.resolve(a, &.{ cwd, path });
-    var existing: []const u8 = lexical;
-    while (true) {
-        if (std.Io.Dir.cwd().realPathFileAlloc(io, existing, a)) |real| {
-            return std.fs.path.join(a, &.{ real, lexical[existing.len..] });
-        } else |err| switch (err) {
-            error.FileNotFound => {
-                var buffer: [std.fs.max_path_bytes]u8 = undefined;
-                if (std.Io.Dir.cwd().readLink(io, existing, &buffer)) |_| return error.UnresolvedActionTarget else |_| {}
-            },
-            else => return err,
-        }
-        existing = std.fs.path.dirname(existing) orelse return error.UnresolvedActionTarget;
-    }
-}
+pub const resolve = @import("paths.zig").resolve;
 
 pub fn verify(io: std.Io, a: std.mem.Allocator, cwd: []const u8, name: []const u8, arguments: []const u8, snapshot: []const u8) !void {
     const Action = struct { tool: []const u8, arguments: std.json.Value, cwd: []const u8, resolved_targets: []const []const u8 };

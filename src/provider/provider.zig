@@ -83,7 +83,7 @@ pub const Attempt = struct {
     allocator: std.mem.Allocator,
     turn: Turn,
     sink: ?Sink,
-    status: []const u8 = "failed",
+    status: enum { failed, completed, cancelled } = .failed,
     finished: bool = false,
     error_message: []const u8 = "",
     usage: Usage = .{},
@@ -95,14 +95,14 @@ pub const Attempt = struct {
         return attempt;
     }
     pub fn complete(self: *Attempt, usage: Usage) void {
-        self.status = "completed";
+        self.status = .completed;
         self.usage = usage;
     }
     pub fn finish(self: *Attempt) void {
         if (self.finished) return;
         self.finished = true;
         if (self.sink) |sink| {
-            if (sink.stopped(sink.userdata)) self.status = "cancelled";
+            if (sink.stopped(sink.userdata)) self.status = .cancelled;
         }
         self.emit(.post_model_request);
     }
@@ -110,7 +110,7 @@ pub const Attempt = struct {
         const configured = self.turn.hooks orelse return;
         var runner = configured.*;
         runner.stop = null;
-        const cleaning_up = event == .post_model_request and std.mem.eql(u8, self.status, "cancelled");
+        const cleaning_up = event == .post_model_request and self.status == .cancelled;
         const protection = if (cleaning_up) runner.io.swapCancelProtection(.blocked) else null;
         defer if (protection) |previous| {
             _ = runner.io.swapCancelProtection(previous);
@@ -121,7 +121,7 @@ pub const Attempt = struct {
         }
         var invocation = self.turn.hook_input;
         invocation.event = event;
-        invocation.status = if (event == .post_model_request) self.status else "";
+        invocation.status = if (event == .post_model_request) @tagName(self.status) else "";
         invocation.error_message = self.error_message;
         invocation.input_tokens = self.usage.prompt_tokens;
         invocation.output_tokens = self.usage.completion_tokens;
@@ -213,13 +213,18 @@ pub fn mentionsOverflow(why: []const u8) bool {
 }
 
 pub fn errorType(err: anyerror, details: []const u8) []const u8 {
-    const name = @errorName(err);
-    inline for (.{ .{ "rate_limit", "rate limit", "RateLimit" }, .{ "authentication_failed", "unauthorized", "Unauthorized" }, .{ "model_not_found", "model not found", "ModelNotFound" }, .{ "overloaded", "overloaded", "Overloaded" }, .{ "billing_error", "billing", "BillingError" }, .{ "invalid_request", "context", "ContextTooLarge" } }) |entry| {
-        if (containsIgnoreCase(details, entry[1]) or containsIgnoreCase(name, entry[2])) return entry[0];
+    switch (err) {
+        error.ContextTooLarge => return "invalid_request",
+        error.RateLimit => return "rate_limit",
+        error.Unauthorized, error.NotSignedIn => return "authentication_failed",
+        error.ModelNotFound => return "model_not_found",
+        error.Overloaded => return "overloaded",
+        error.BillingError => return "billing_error",
+        else => {},
     }
-    if (containsIgnoreCase(details, "429")) return "rate_limit";
-    if (containsIgnoreCase(details, "401") or containsIgnoreCase(details, "403")) return "authentication_failed";
-    if (containsIgnoreCase(details, "500") or containsIgnoreCase(details, "502") or containsIgnoreCase(details, "503")) return "server_error";
+    inline for (.{ .{ "HTTP 429", "rate_limit" }, .{ "HTTP 401", "authentication_failed" }, .{ "HTTP 403", "authentication_failed" }, .{ "HTTP 500", "server_error" }, .{ "HTTP 502", "server_error" }, .{ "HTTP 503", "server_error" } }) |entry| {
+        if (containsIgnoreCase(details, entry[0])) return entry[1];
+    }
     return "unknown";
 }
 
@@ -291,8 +296,6 @@ pub const Reply = struct {
     }
 };
 
-/// Where a provider pushes partial output as it arrives. Every callback runs on
-/// the worker thread, so implementations must be thread safe.
 pub const RetryInfo = struct {
     attempt: usize,
     allowed: bool,
@@ -302,6 +305,7 @@ pub const RetryInfo = struct {
     error_message: []const u8 = "",
 };
 
+/// Callbacks run on the provider worker thread.
 pub const Sink = struct {
     onRetry: ?*const fn (*anyopaque, RetryInfo) ?u64 = null,
 
@@ -332,4 +336,11 @@ test "a TGI length refusal reads as an overflow, a quota refusal does not" {
     const testing = std.testing;
     try testing.expect(mentionsOverflow("Input validation error: `inputs` must have less than 2048 tokens. Given: 4194"));
     try testing.expect(!mentionsOverflow("You exceeded your current quota, please check your plan and billing details."));
+}
+
+test "error classification does not mistake token counts for HTTP failures" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("unknown", errorType(error.HttpError, "context service rejected 1500 tokens"));
+    try testing.expectEqualStrings("invalid_request", errorType(error.ContextTooLarge, "HTTP 503"));
+    try testing.expectEqualStrings("server_error", errorType(error.HttpError, "HTTP 503: unavailable"));
 }

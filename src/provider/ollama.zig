@@ -509,22 +509,15 @@ fn waitAndRetry(
     sink: ?Provider.Sink,
 ) bool {
     if (attempt >= self.retries.attempts) return false;
-    const eligible = retry.transient(self.last_status) or retry.transientText(why);
-
-    if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
-    }
-
-    const proposed = retry.waitMs(self.retries, attempt, null);
-    const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = eligible, .delay_ms = proposed, .status = @intFromEnum(self.last_status), .error_type = "http_error", .error_message = why }) orelse return false else if (eligible) proposed else return false;
-    std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
-
-    if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
-    }
-    return true;
+    return retry.pause(self.io, sink, .{
+        .attempt = attempt,
+        .allowed = retry.transient(self.last_status) or retry.transientText(why),
+        .delay_ms = retry.waitMs(self.retries, attempt, null),
+        .status = @intFromEnum(self.last_status),
+        .error_type = retry.errorType(self.last_status),
+        .error_message = why,
+    });
 }
-
 fn isOverflow(why: []const u8) bool {
     return Provider.mentionsOverflow(why);
 }
@@ -742,7 +735,6 @@ fn respond(
     var messages: []Ollama.Message = undefined;
     var sends: usize = 1;
     var stream = while (true) {
-        if (hook_attempt) |*attempt| attempt.finish();
         var attempt_turn = turn;
         attempt_turn.hook_input.model = self.model;
         attempt_turn.hook_input.provider = self.provider().name;
@@ -1175,7 +1167,7 @@ test "an error body is reduced to the sentence the server wrote" {
         ),
     );
 
-    try testing.expectEqualStrings("502 Bad Gateway", complaint(testing.allocator, "  502 Bad Gateway\n"));
+    try testing.expectEqualStrings("502 Bad Guardway", complaint(testing.allocator, "  502 Bad Guardway\n"));
     try testing.expectEqualStrings("{\"detail\":\"nope\"}", complaint(testing.allocator, "{\"detail\":\"nope\"}"));
     try testing.expectEqualStrings("", complaint(testing.allocator, "   \n"));
 }

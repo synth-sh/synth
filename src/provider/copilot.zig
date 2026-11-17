@@ -239,7 +239,7 @@ pub fn current(self: *Copilot) Provider.Current {
 
 pub fn provider(self: *Copilot) Provider {
     const now = self.current();
-    return .{ .name = now.name, .model = now.model, .context_limit = now.context_limit, .vision = now.vision, .userdata = self, .respond = respond, .list_models = listErased, .set_model = setErased, .refresh = refreshErased, .describe_error = describeErased, .abort = abortErased };
+    return .{ .name = now.name, .model = now.model, .context_limit = now.context_limit, .vision = now.vision, .userdata = self, .observes_attempts = true, .respond = respond, .list_models = listErased, .set_model = setErased, .refresh = refreshErased, .describe_error = describeErased, .abort = abortErased };
 }
 
 fn respond(ptr: *anyopaque, convo: *Conversation, turn: Provider.Turn, allocator: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {

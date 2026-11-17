@@ -60,10 +60,11 @@ pub const Store = struct {
     }
 };
 
-pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, root: []const u8, home: ?[]const u8, timeout_ms: u64, store: Store) !Hooks.Set {
+pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, root: []const u8, home: ?[]const u8, store: Store) !Hooks.Set {
     var set: Hooks.Set = .{};
     try set.append(arena, inline_set);
-    if (home) |user_home| try loadFile(arena, io, &set, try std.fs.path.join(arena, &.{ user_home, ".synth", "hooks.json" }));
+    const user_source = if (home) |dir| try std.fs.path.join(arena, &.{ dir, ".synth", "hooks.json" }) else null;
+    if (user_source) |path| try loadFile(arena, io, &set, path);
     try loadFile(arena, io, &set, try std.fs.path.join(arena, &.{ root, ".synth", "hooks.json" }));
     inline for (std.meta.fields(Hooks.Set)) |field| {
         const definitions = try arena.dupe(Hooks.Hook, @field(set, field.name));
@@ -73,7 +74,8 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
             for (definitions[0..index]) |earlier| {
                 if (std.mem.eql(u8, earlier.source, hook.source)) source_index += 1;
             }
-            const encoded = try std.json.Stringify.valueAlloc(arena, .{ root, event.name(), source_index, Hooks.effectiveTimeout(event, timeout_ms, hook.*), hook.* }, .{});
+            const user_hook = if (user_source) |path| std.mem.eql(u8, path, hook.source) else false;
+            const encoded = try std.json.Stringify.valueAlloc(arena, .{ if (user_hook) "" else root, event.name(), source_index, hook.* }, .{});
             var hash: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
             hook.id = try arena.dupe(u8, &std.fmt.bytesToHex(hash, .lower));
@@ -106,20 +108,32 @@ test "trust is invalidated by definition changes and project identity" {
     var store = try Store.init(std.testing.allocator, std.testing.io, null);
     defer store.deinit();
     const set: Hooks.Set = .{ .pre_tool_use = &.{.{ .command = "true" }} };
-    const initial = try discover(a, std.testing.io, set, root, null, Hooks.default_timeout_ms, store);
+    const initial = try discover(a, std.testing.io, set, root, null, store);
     try std.testing.expect(!initial.pre_tool_use[0].trusted);
     try store.put(initial.pre_tool_use[0].id, .{ .trusted = true });
-    const trusted = try discover(a, std.testing.io, set, root, null, Hooks.default_timeout_ms, store);
+    const trusted = try discover(a, std.testing.io, set, root, null, store);
     try std.testing.expect(trusted.pre_tool_use[0].trusted);
-    const changed = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "false" }} }, root, null, Hooks.default_timeout_ms, store);
+    const changed = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "false" }} }, root, null, store);
     try std.testing.expect(!changed.pre_tool_use[0].trusted);
-    const moved = try discover(a, std.testing.io, set, try std.fs.path.join(a, &.{ root, "elsewhere" }), null, Hooks.default_timeout_ms, store);
+    const moved = try discover(a, std.testing.io, set, try std.fs.path.join(a, &.{ root, "elsewhere" }), null, store);
     try std.testing.expect(!moved.pre_tool_use[0].trusted);
-    const timeout_changed = try discover(a, std.testing.io, set, root, null, Hooks.default_timeout_ms + 1, store);
+    const timeout_changed = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true", .timeout_ms = 1000 }} }, root, null, store);
     try std.testing.expect(!timeout_changed.pre_tool_use[0].trusted);
     try store.put(initial.pre_tool_use[0].id, .{ .trusted = true, .disabled = true });
-    const disabled = try discover(a, std.testing.io, set, root, null, Hooks.default_timeout_ms, store);
+    const disabled = try discover(a, std.testing.io, set, root, null, store);
     try std.testing.expect(!disabled.pre_tool_use[0].enabled);
+}
+
+pub const Command = struct { action: Action, id: []const u8 };
+
+pub fn parseCommand(line: []const u8) !Command {
+    var words = std.mem.tokenizeAny(u8, line, " \t\r\n");
+    _ = words.next();
+    const action = std.meta.stringToEnum(Action, words.next() orelse "list") orelse return error.UnknownSubcommand;
+    const id = words.next() orelse "";
+    if (words.next() != null) return error.UnexpectedArgument;
+    if (action != .list and action != .review and id.len == 0) return error.MissingHookId;
+    return .{ .action = action, .id = id };
 }
 
 pub const Action = enum { list, review, trust, revoke, enable, disable };
@@ -129,12 +143,22 @@ pub fn change(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: ?[]co
     const filename = path orelse return error.HookTrustStoreUnavailable;
     var store = try Store.init(arena, io, filename);
     defer store.deinit();
+    if (id.len < 8) return error.HookIdTooShort;
+    var selected: ?[]const u8 = null;
+    inline for (std.meta.fields(Hooks.Set)) |field| {
+        for (@field(set.*, field.name)) |hook| {
+            if (!std.mem.startsWith(u8, hook.id, id)) continue;
+            if (selected != null) return error.AmbiguousHookId;
+            selected = hook.id;
+        }
+    }
+    const full_id = selected orelse return error.HookNotFound;
     var found = false;
     var updated = set.*;
     inline for (std.meta.fields(Hooks.Set)) |field| {
         const definitions = try arena.dupe(Hooks.Hook, @field(set, field.name));
         for (definitions) |*hook| {
-            if (!std.mem.eql(u8, hook.id, id)) continue;
+            if (!std.mem.eql(u8, hook.id, full_id)) continue;
             found = true;
             var state = store.get(hook.id);
             switch (action) {
@@ -213,13 +237,13 @@ test "discovery is additive and unrelated sources keep stable ids" {
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", a);
     var store = try Store.init(std.testing.allocator, std.testing.io, null);
     defer store.deinit();
-    const set = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "inline" }} }, root, home, 30000, store);
+    const set = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "inline" }} }, root, home, store);
     try std.testing.expectEqual(@as(usize, 4), set.pre_tool_use.len);
     try std.testing.expectEqualStrings("inline", set.pre_tool_use[0].command);
     try std.testing.expectEqualStrings("user", set.pre_tool_use[1].command);
     try std.testing.expectEqualStrings("project", set.pre_tool_use[2].command);
     try std.testing.expect(!std.mem.eql(u8, set.pre_tool_use[2].id, set.pre_tool_use[3].id));
-    const more = try discover(a, std.testing.io, .{ .pre_tool_use = &.{ .{ .command = "inline" }, .{ .command = "another" } } }, root, home, 30000, store);
+    const more = try discover(a, std.testing.io, .{ .pre_tool_use = &.{ .{ .command = "inline" }, .{ .command = "another" } } }, root, home, store);
     try std.testing.expectEqualStrings(set.pre_tool_use[2].id, more.pre_tool_use[3].id);
 }
 
@@ -232,14 +256,39 @@ test "changing a routing filter invalidates trust and inspection shows the route
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     var store = try Store.init(std.testing.allocator, std.testing.io, null);
     defer store.deinit();
-    const original = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true" }} }, root, null, 30000, store);
+    const original = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true" }} }, root, null, store);
     try store.put(original.pre_tool_use[0].id, .{ .trusted = true });
-    const unchanged = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true" }} }, root, null, 30000, store);
+    const unchanged = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true" }} }, root, null, store);
     try std.testing.expect(unchanged.pre_tool_use[0].trusted);
-    const routed = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true", .when = .{ .agent_scope = .subagent } }} }, root, null, 30000, store);
+    const routed = try discover(a, std.testing.io, .{ .pre_tool_use = &.{.{ .command = "true", .when = .{ .agent_scope = .subagent } }} }, root, null, store);
     try std.testing.expect(!routed.pre_tool_use[0].trusted);
     try std.testing.expect(!std.mem.eql(u8, original.pre_tool_use[0].id, routed.pre_tool_use[0].id));
     const listed = try report(std.testing.allocator, routed, 30000, false, null);
     defer std.testing.allocator.free(listed);
     try std.testing.expect(std.mem.indexOf(u8, listed, "when: {\"agent_scope\":\"subagent\"}") != null);
+}
+
+test "user hook trust survives project changes and accepts unique id prefixes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var home = std.testing.tmpDir(.{});
+    defer home.cleanup();
+    try home.dir.createDirPath(io, ".synth");
+    try home.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"true\"}]}" });
+    const path = try home.dir.realPathFileAlloc(io, ".", scratch);
+    var store = try Store.init(a, io, null);
+    defer store.deinit();
+    const initial = try discover(scratch, io, .{}, "/first-project", path, store);
+    const id = initial.pre_tool_use[0].id;
+    const state_path = try std.fs.path.join(scratch, &.{ path, "trust.json" });
+    var updated = initial;
+    try change(scratch, io, &updated, state_path, .trust, id[0..8]);
+    var saved = try Store.init(a, io, state_path);
+    defer saved.deinit();
+    const moved = try discover(scratch, io, .{}, "/second-project", path, saved);
+    try std.testing.expect(moved.pre_tool_use[0].trusted);
+    try std.testing.expectEqualStrings(id, moved.pre_tool_use[0].id);
 }

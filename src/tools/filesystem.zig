@@ -241,18 +241,10 @@ fn candidates(ctx: Context, scope: []const u8) ![]const []const u8 {
     }
 
     for (everything) |path| {
-        if (!under(path, scope)) continue;
+        if (!@import("../core/paths.zig").inside(scope, path)) continue;
         try kept.append(ctx.allocator, try ctx.allocator.dupe(u8, path));
     }
     return kept.toOwnedSlice(ctx.allocator);
-}
-
-/// Whether `path` is `scope` itself or something inside it. Compared segment by
-/// segment so `src` does not claim `srcfoo/x.zig`.
-fn under(path: []const u8, scope: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, scope)) return false;
-    if (path.len == scope.len) return true;
-    return path[scope.len] == '/';
 }
 
 /// `path` as the project sees it: relative to the root, with "." meaning all of
@@ -270,9 +262,9 @@ fn scopeOf(ctx: Context, path: []const u8) ![]const u8 {
 fn searchBase(ctx: Context, path: []const u8) ![]const u8 {
     const resolved = try resolve(ctx, path);
     defer ctx.allocator.free(resolved);
-    if (under(resolved, ctx.project_root)) return ctx.allocator.dupe(u8, ctx.project_root);
+    if (@import("../core/paths.zig").inside(ctx.project_root, resolved)) return ctx.allocator.dupe(u8, ctx.project_root);
     for (ctx.additional_roots) |root| {
-        if (under(resolved, root)) return ctx.allocator.dupe(u8, root);
+        if (@import("../core/paths.zig").inside(root, resolved)) return ctx.allocator.dupe(u8, root);
     }
     const stat = try std.Io.Dir.cwd().statFile(ctx.io, resolved, .{});
     return ctx.allocator.dupe(u8, if (stat.kind == .directory) resolved else std.fs.path.dirname(resolved) orelse resolved);
@@ -768,10 +760,10 @@ test "grep finds matches and reports misses" {
 }
 
 test "a scope is compared segment by segment" {
-    try testing.expect(under("src/main.zig", "src"));
-    try testing.expect(under("src", "src"));
-    try testing.expect(!under("srcfoo/main.zig", "src"));
-    try testing.expect(!under("other/src/main.zig", "src"));
+    try testing.expect(@import("../core/paths.zig").inside("src", "src/main.zig"));
+    try testing.expect(@import("../core/paths.zig").inside("src", "src"));
+    try testing.expect(!@import("../core/paths.zig").inside("src", "srcfoo/main.zig"));
+    try testing.expect(!@import("../core/paths.zig").inside("src", "other/src/main.zig"));
 }
 
 test "read pages through a file with offset and limit" {

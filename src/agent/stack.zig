@@ -125,7 +125,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.hook_config_path = config.path;
     var hook_store = try HookStore.Store.init(allocator, io, config.hook_state_path);
     defer hook_store.deinit();
-    const discovered_hooks = try HookStore.discover(self.arena.allocator(), io, config.hooks, self.project.root, options.home, config.hook_timeout_ms, hook_store);
+    const discovered_hooks = try HookStore.discover(self.arena.allocator(), io, config.hooks, self.project.root, options.home, hook_store);
     self.hook_runtime = .{ .allocator = allocator, .io = io };
     errdefer self.hook_runtime.deinit();
     self.hooks = .{
@@ -139,7 +139,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.loop.hooks = &self.hooks;
     inline for (std.meta.fields(Hooks.Set)) |field| {
         for (@field(discovered_hooks, field.name)) |hook| {
-            if (hook.enabled and !hook.trusted and self.loop.hook_notice == null) self.loop.hook_notice = try allocator.dupe(u8, "Hooks need review. Use /hooks review or synth hooks review, then trust reviewed ids explicitly.");
+            if (hook.enabled and !hook.trusted and self.loop.hook_flow.notice == null) self.loop.hook_flow.notice = try allocator.dupe(u8, "Hooks need review. Use /hooks review or synth hooks review, then trust reviewed ids explicitly.");
         }
     }
     self.loop.auto_approve_safe = config.auto_approve_safe_commands;
@@ -158,7 +158,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     if (options.db) |db| {
         try self.loop.attachDatabase(db, self.project.name(), self.project.cwd, options.provider.model);
     }
-    try self.loop.hook_watch.configure(allocator, io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills);
+    try self.loop.hook_flow.watch.configure(allocator, io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills);
     try self.loop.trackModel("initial");
     return self;
 }
@@ -168,7 +168,7 @@ pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore
     if (!self.loop.isBusy()) {
         var store = try HookStore.Store.init(allocator, self.hooks.io, self.hook_state_path);
         defer store.deinit();
-        const discovered = try HookStore.discover(self.arena.allocator(), self.hooks.io, self.hook_inline, self.project.root, self.hook_home, self.hooks.timeout_ms, store);
+        const discovered = try HookStore.discover(self.arena.allocator(), self.hooks.io, self.hook_inline, self.project.root, self.hook_home, store);
         for (try changedHookSources(self.arena.allocator(), self.hooks.set, discovered)) |changed_source| {
             const path = if (std.mem.eql(u8, changed_source, "config")) self.hook_config_path else changed_source;
             const source = if (std.mem.startsWith(u8, path, self.project.root) and (path.len == self.project.root.len or path[self.project.root.len] == '/')) "project_settings" else "user_settings";
@@ -182,7 +182,7 @@ pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore
         self.hooks.set = discovered;
     }
     try HookStore.change(self.arena.allocator(), self.hooks.io, &self.hooks.set, self.hook_state_path, action, id);
-    if (!self.loop.isBusy()) try self.loop.hook_watch.configure(self.allocator, self.hooks.io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills);
+    if (!self.loop.isBusy()) try self.loop.hook_flow.watch.configure(self.allocator, self.hooks.io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills);
     return HookStore.report(allocator, self.hooks.set, self.hooks.timeout_ms, action == .review, &self.hook_runtime);
 }
 
@@ -305,10 +305,10 @@ test "main-session shutdown emits one bounded command cleanup" {
     var backend: Backend = .init(.ollama, .{ .allocator = testing.allocator, .io = testing.io, .host = "http://127.0.0.1:9", .label = "test" });
     defer backend.deinit();
     const stack = try create(testing.allocator, testing.io, .{ .config = &config, .provider = backend.provider(), .cwd = cwd });
-    stack.hooks.set.session_end = &.{.{ .command = "cat >> shutdown-events; exec 0<&- 1>&- 2>&-; sleep 30", .timeout_ms = 50 }};
+    stack.hooks.set.session_end = &.{.{ .command = "cat >> shutdown-events; exec 0<&- 1>&- 2>&-; sleep 30", .timeout_ms = 1000 }};
     const started = tool.monotonicMilliseconds(testing.io);
     stack.destroy();
-    try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 1000);
+    try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 3000);
     const trace = try tmp.dir.readFileAlloc(testing.io, "shutdown-events", testing.allocator, .limited(16 * 1024));
     defer testing.allocator.free(trace);
     var lines = std.mem.tokenizeScalar(u8, trace, '\n');

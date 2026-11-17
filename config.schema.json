@@ -1,1081 +1,739 @@
 {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://getsynth.sh/config.schema.json",
-    "title": "synth config",
-    "description": "Schema for $XDG_CONFIG_HOME/synth/config.json. Every key is optional; an absent one keeps the built-in default.",
-    "type": "object",
-    "additionalProperties": false,
-    "properties": {
-        "$schema": {
-            "type": "string",
-            "description": "URL of this schema. Written into a new config file so an editor knows what it is reading."
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://getsynth.sh/config.schema.json",
+  "title": "synth config",
+  "description": "Schema for $XDG_CONFIG_HOME/synth/config.json. Every key is optional; an absent one keeps the built-in default.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "URL of this schema. Written into a new config file so an editor knows what it is reading."
+    },
+    "system_prompt": {
+      "type": "string",
+      "description": "Replaces the base instructions entirely."
+    },
+    "think": {
+      "type": "boolean",
+      "default": true,
+      "description": "Ask for reasoning output. Turn off for models that do not support it."
+    },
+    "auto_approve_safe_commands": {
+      "type": "boolean",
+      "default": true,
+      "description": "Let a preset of read-only shell commands run without a prompt."
+    },
+    "approvals": {
+      "enum": [
+        "ask",
+        "auto",
+        "all"
+      ],
+      "default": "ask",
+      "description": "ask requests human approval; auto reviews non-routine actions with a decision model and uses reviewer_fallback when review is unavailable; all permits actions without ordinary approval checks. Hook denials and explicit asks still apply."
+    },
+    "debug_log": {
+      "type": "string",
+      "description": "Append every request and reply to this file."
+    },
+    "max_turn_ms": {
+      "type": "number",
+      "default": 1800000,
+      "minimum": 0,
+      "description": "How long one turn may run. 0 disables it."
+    },
+    "max_turn_tokens": {
+      "type": "number",
+      "default": 2000000,
+      "minimum": 0,
+      "description": "Tokens one turn may spend, prompt and completion together. 0 disables it."
+    },
+    "max_stall_ms": {
+      "type": "number",
+      "default": 120000,
+      "minimum": 0,
+      "description": "How long the provider may send nothing before the turn is given up on. 0 disables it."
+    },
+    "skill_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "Extra directories to look for skills in, searched in order."
+    },
+    "ollama": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "num_ctx": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Window to ask ollama to load a model with. Omit for the model's advertised maximum; 0 leaves the choice to the server."
         },
-        "system_prompt": {
-            "type": "string",
-            "description": "Replaces the base instructions entirely."
+        "host": {
+          "type": "string",
+          "deprecated": true,
+          "description": "Still read so an old config keeps working. Where a provider points lives in the database now."
+        },
+        "model": {
+          "type": "string",
+          "deprecated": true,
+          "description": "Still read so an old config keeps working. The chosen model lives in the database now."
+        },
+        "api_key": {
+          "type": "string",
+          "deprecated": true,
+          "description": "Still read so an old config keeps working. Keys belong in auth.json now."
         },
         "think": {
-            "type": "boolean",
-            "default": true,
-            "description": "Ask for reasoning output. Turn off for models that do not support it."
-        },
-        "auto_approve_safe_commands": {
-            "type": "boolean",
-            "default": true,
-            "description": "Let a preset of read-only shell commands run without a prompt."
-        },
-        "approvals": {
-            "enum": [
-                "ask",
-                "auto",
-                "all"
-            ],
-            "default": "ask",
-            "description": "Who decides a call that would otherwise ask. 'ask' puts it to you. 'auto' has the configured approval reviewer (the session model by default) judge it, blocking what looks destructive, outside the project or outside the task, and hands decisions back to you after 3 blocks in a row or 20 in a session. 'all' runs everything, paths outside the project included: for a machine set aside for the agent. `PreToolUse` hooks still run under each."
+          "type": "boolean",
+          "deprecated": true,
+          "description": "Still read so an old config keeps working. Use the top-level think instead."
         },
         "debug_log": {
-            "type": "string",
-            "description": "Append every request and reply to this file."
+          "type": "string",
+          "deprecated": true,
+          "description": "Still read so an old config keeps working. Use the top-level debug_log instead."
+        }
+      },
+      "description": "Ollama-specific settings. Everything but num_ctx is the old single-provider shape, kept so an existing config still loads."
+    },
+    "database_path": {
+      "type": "string",
+      "default": "synth.db",
+      "description": "Where sessions live."
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "SessionStart": {
+          "$ref": "#/$defs/hookList"
         },
-        "max_turn_ms": {
-            "type": "number",
-            "default": 1800000,
-            "minimum": 0,
-            "description": "How long one turn may run. 0 disables it."
+        "SessionEnd": {
+          "$ref": "#/$defs/hookList"
         },
-        "max_turn_tokens": {
-            "type": "number",
-            "default": 2000000,
-            "minimum": 0,
-            "description": "Tokens one turn may spend, prompt and completion together. 0 disables it."
+        "UserPromptSubmit": {
+          "$ref": "#/$defs/hookList"
         },
-        "max_stall_ms": {
-            "type": "number",
-            "default": 120000,
-            "minimum": 0,
-            "description": "How long the provider may send nothing before the turn is given up on. 0 disables it."
+        "PreToolUse": {
+          "$ref": "#/$defs/hookList"
         },
-        "skill_paths": {
-            "type": "array",
-            "items": {
-                "type": "string"
-            },
-            "default": [],
-            "description": "Extra directories to look for skills in, searched in order."
+        "PermissionRequest": {
+          "$ref": "#/$defs/hookList"
         },
-        "ollama": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "num_ctx": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "Window to ask ollama to load a model with. Omit for the model's advertised maximum; 0 leaves the choice to the server."
-                },
-                "host": {
-                    "type": "string",
-                    "deprecated": true,
-                    "description": "Still read so an old config keeps working. Where a provider points lives in the database now."
-                },
-                "model": {
-                    "type": "string",
-                    "deprecated": true,
-                    "description": "Still read so an old config keeps working. The chosen model lives in the database now."
-                },
-                "api_key": {
-                    "type": "string",
-                    "deprecated": true,
-                    "description": "Still read so an old config keeps working. Keys belong in auth.json now."
-                },
-                "think": {
-                    "type": "boolean",
-                    "deprecated": true,
-                    "description": "Still read so an old config keeps working. Use the top-level think instead."
-                },
-                "debug_log": {
-                    "type": "string",
-                    "deprecated": true,
-                    "description": "Still read so an old config keeps working. Use the top-level debug_log instead."
-                }
-            },
-            "description": "Ollama-specific settings. Everything but num_ctx is the old single-provider shape, kept so an existing config still loads."
+        "PostToolUse": {
+          "$ref": "#/$defs/hookList"
         },
-        "database_path": {
-            "type": "string",
-            "default": "synth.db",
-            "description": "Where sessions live."
+        "PreCompact": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PostCompact": {
+          "$ref": "#/$defs/hookList"
+        },
+        "SubagentStart": {
+          "$ref": "#/$defs/hookList"
+        },
+        "SubagentStop": {
+          "$ref": "#/$defs/hookList"
+        },
+        "Stop": {
+          "$ref": "#/$defs/hookList"
+        },
+        "Interrupt": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PreModelRequest": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PostModelRequest": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PostToolUseFailure": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PostToolBatch": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PermissionDenied": {
+          "$ref": "#/$defs/hookList"
+        },
+        "StopFailure": {
+          "$ref": "#/$defs/hookList"
+        },
+        "Notification": {
+          "$ref": "#/$defs/hookList"
+        },
+        "InstructionsLoaded": {
+          "$ref": "#/$defs/hookList"
+        },
+        "ConfigChange": {
+          "$ref": "#/$defs/hookList"
+        },
+        "FileChanged": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PreModelSwitch": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PostModelSwitch": {
+          "$ref": "#/$defs/hookList"
+        },
+        "TaskCreated": {
+          "$ref": "#/$defs/hookList"
+        },
+        "TaskCompleted": {
+          "$ref": "#/$defs/hookList"
+        },
+        "UserPromptExpansion": {
+          "$ref": "#/$defs/hookList"
+        },
+        "MessageDisplay": {
+          "$ref": "#/$defs/hookList"
+        },
+        "CwdChanged": {
+          "$ref": "#/$defs/hookList"
+        },
+        "DirectoryAdded": {
+          "$ref": "#/$defs/hookList"
+        },
+        "ModelResolve": {
+          "$ref": "#/$defs/hookList"
+        },
+        "ModelContext": {
+          "$ref": "#/$defs/hookList"
+        },
+        "ModelSettings": {
+          "$ref": "#/$defs/hookList"
+        },
+        "ModelRetry": {
+          "$ref": "#/$defs/hookList"
+        },
+        "PermissionEvaluate": {
+          "$ref": "#/$defs/hookList"
+        },
+        "HttpRequest": {
+          "$ref": "#/$defs/hookList"
+        },
+        "HttpResponse": {
+          "$ref": "#/$defs/hookList"
+        }
+      },
+      "description": "Additive lifecycle hooks. Every definition needs explicit trust after upgrade or changes."
+    },
+    "hook_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 30000,
+      "description": "How long a hook command may run before it is killed.",
+      "maximum": 86400000
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "servers": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/mcpServer"
+          }
+        }
+      },
+      "description": "MCP servers. See README."
+    },
+    "web": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "search_api_key": {
+          "type": "string",
+          "description": "Brave Search API key for the web_search tool. Without one the tool scrapes DuckDuckGo's HTML results page, which needs no key but is throttled after a handful of searches. BRAVE_API_KEY overrides it."
+        }
+      },
+      "description": "Settings for the web tools."
+    },
+    "prune": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delete_after_days": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Sessions idle longer than this are deleted outright, taking their messages and tool calls with them. 0 never deletes a session."
+        },
+        "shed_after_days": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 30,
+          "description": "Sessions idle longer than this keep their transcript but lose stored reasoning and the full tool output behind each card. What the model was shown stays. 0 keeps every payload."
+        }
+      },
+      "description": "What a prune throws away, on startup and on /prune. Ages are in days since a session was last touched."
+    },
+    "bell": {
+      "enum": [
+        "unfocused",
+        "always",
+        "never"
+      ],
+      "default": "unfocused",
+      "description": "When a finished turn says so, by desktop notification and BEL. 'unfocused' needs the terminal to report focus; one that does not never rings, so use 'always' there. Under tmux both need focus-events and allow-passthrough on."
+    },
+    "commit_trailer": {
+      "type": "string",
+      "default": "Co-Authored-By: synth <noreply@getsynth.sh>",
+      "description": "The trailer the model is asked to end its commit messages with, in a git project. An empty string asks for none."
+    },
+    "model_requests": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Purpose-based model routes and reviewer failure policy. Hooks may choose only named routes permitted for that purpose. Route credentials are explicit and never inherited.",
+      "properties": {
+        "routes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/modelRoute"
+          }
+        },
+        "agent": {
+          "type": "string"
+        },
+        "approval_judge": {
+          "type": "string"
+        },
+        "compaction": {
+          "type": "string"
+        },
+        "restrict_routes": {
+          "type": "boolean",
+          "default": false
+        },
+        "reviewer_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300000,
+          "default": 30000
+        },
+        "reviewer_fallback": {
+          "enum": [
+            "ask",
+            "deny"
+          ],
+          "default": "ask"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hook": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "matcher": {
+          "type": "string",
+          "default": "",
+          "description": "Exact tool name to match. Empty or absent matches every tool."
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command run from the session working directory."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
+        },
+        "transcript": {
+          "type": "boolean",
+          "default": false
+        },
+        "when": {
+          "$ref": "#/$defs/hookWhen"
+        },
+        "stream": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt in to per-record HttpResponse hooks."
+        }
+      }
+    },
+    "mcpServer": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "command"
+          ]
+        },
+        {
+          "required": [
+            "url"
+          ]
+        }
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "A command to run a child process."
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Arguments passed to that command."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "A remote server over Streamable HTTP."
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra headers for the remote server."
+        }
+      }
+    },
+    "hookHandler": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/commandHookHandler"
+        },
+        {
+          "$ref": "#/$defs/mcpHookHandler"
+        }
+      ]
+    },
+    "hookGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hooks"
+      ],
+      "properties": {
+        "matcher": {
+          "type": "string",
+          "default": "",
+          "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal filenames."
         },
         "hooks": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "SessionStart": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "SessionEnd": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/sessionEndHookGroup"
-                            }
-                        ]
-                    }
-                },
-                "UserPromptSubmit": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PreToolUse": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PermissionRequest": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PostToolUse": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PreCompact": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PostCompact": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "SubagentStart": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "SubagentStop": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "Stop": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "Interrupt": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PreModelRequest": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PostModelRequest": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PostToolUseFailure": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PostToolBatch": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PermissionDenied": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "StopFailure": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "Notification": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "InstructionsLoaded": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "ConfigChange": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "FileChanged": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PreModelSwitch": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PostModelSwitch": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "TaskCreated": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "TaskCompleted": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "UserPromptExpansion": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "MessageDisplay": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "CwdChanged": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "DirectoryAdded": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "ModelResolve": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "ModelContext": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "ModelSettings": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "ModelRetry": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "PermissionEvaluate": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "HttpRequest": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                },
-                "HttpResponse": {
-                    "type": "array",
-                    "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/hookGroup"
-                            }
-                        ]
-                    }
-                }
-            },
-            "description": "Additive lifecycle hooks. Every definition needs explicit trust after upgrade or changes."
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hookHandler"
+          }
         },
-        "hook_timeout_ms": {
-            "type": "integer",
-            "minimum": 1,
-            "default": 30000,
-            "description": "How long a hook command may run before it is killed.",
-            "maximum": 86400000
-        },
-        "mcp": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "servers": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "$ref": "#/$defs/mcpServer"
-                    }
-                }
-            },
-            "description": "MCP servers. See README."
-        },
-        "web": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "search_api_key": {
-                    "type": "string",
-                    "description": "Brave Search API key for the web_search tool. Without one the tool scrapes DuckDuckGo's HTML results page, which needs no key but is throttled after a handful of searches. BRAVE_API_KEY overrides it."
-                }
-            },
-            "description": "Settings for the web tools."
-        },
-        "prune": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "delete_after_days": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "default": 0,
-                    "description": "Sessions idle longer than this are deleted outright, taking their messages and tool calls with them. 0 never deletes a session."
-                },
-                "shed_after_days": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "default": 30,
-                    "description": "Sessions idle longer than this keep their transcript but lose stored reasoning and the full tool output behind each card. What the model was shown stays. 0 keeps every payload."
-                }
-            },
-            "description": "What a prune throws away, on startup and on /prune. Ages are in days since a session was last touched."
-        },
-        "bell": {
-            "enum": [
-                "unfocused",
-                "always",
-                "never"
-            ],
-            "default": "unfocused",
-            "description": "When a finished turn says so, by desktop notification and BEL. 'unfocused' needs the terminal to report focus; one that does not never rings, so use 'always' there. Under tmux both need focus-events and allow-passthrough on."
-        },
-        "commit_trailer": {
-            "type": "string",
-            "default": "Co-Authored-By: synth <noreply@getsynth.sh>",
-            "description": "The trailer the model is asked to end its commit messages with, in a git project. An empty string asks for none."
-        },
-        "model_requests": {
-            "type": "object",
-            "additionalProperties": false,
-            "description": "Purpose-based model routes and reviewer failure policy. Hooks may choose only named routes permitted for that purpose. Route credentials are explicit and never inherited.",
-            "properties": {
-                "routes": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/$defs/modelRoute"
-                    }
-                },
-                "agent": {
-                    "type": "string"
-                },
-                "approval_judge": {
-                    "type": "string"
-                },
-                "compaction": {
-                    "type": "string"
-                },
-                "restrict_routes": {
-                    "type": "boolean",
-                    "default": false
-                },
-                "reviewer_timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 300000,
-                    "default": 30000
-                },
-                "reviewer_fallback": {
-                    "enum": [
-                        "ask",
-                        "deny"
-                    ],
-                    "default": "ask"
-                }
-            }
+        "when": {
+          "$ref": "#/$defs/hookWhen"
         }
+      }
     },
-    "$defs": {
-        "hook": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "command"
-            ],
-            "properties": {
-                "matcher": {
-                    "type": "string",
-                    "default": "",
-                    "description": "Exact tool name to match. Empty or absent matches every tool."
-                },
-                "command": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Shell command run from the session working directory."
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 86400000
-                },
-                "transcript": {
-                    "type": "boolean",
-                    "default": false
-                },
-                "when": {
-                    "$ref": "#/$defs/hookWhen"
-                }
-            }
+    "commandHookHandler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "type": {
+          "const": "command"
         },
-        "mcpServer": {
-            "type": "object",
-            "minProperties": 1,
-            "additionalProperties": false,
-            "oneOf": [
-                {
-                    "required": [
-                        "command"
-                    ]
-                },
-                {
-                    "required": [
-                        "url"
-                    ]
-                }
-            ],
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "A command to run a child process."
-                },
-                "args": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    },
-                    "description": "Arguments passed to that command."
-                },
-                "url": {
-                    "type": "string",
-                    "format": "uri",
-                    "description": "A remote server over Streamable HTTP."
-                },
-                "headers": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "string"
-                    },
-                    "description": "Extra headers for the remote server."
-                }
-            }
+        "command": {
+          "type": "string",
+          "minLength": 1
         },
-        "hookHandler": {
-            "oneOf": [
-                {
-                    "$ref": "#/$defs/commandHookHandler"
-                },
-                {
-                    "$ref": "#/$defs/mcpHookHandler"
-                }
-            ]
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
         },
-        "hookGroup": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "hooks"
-            ],
-            "properties": {
-                "matcher": {
-                    "type": "string",
-                    "default": "",
-                    "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal filenames."
-                },
-                "hooks": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/$defs/hookHandler"
-                    }
-                },
-                "when": {
-                    "$ref": "#/$defs/hookWhen"
-                }
-            }
+        "async": {
+          "type": "boolean",
+          "default": false
         },
-        "commandHookHandler": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "command"
-            ],
-            "properties": {
-                "type": {
-                    "const": "command"
-                },
-                "command": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 86400000
-                },
-                "async": {
-                    "type": "boolean",
-                    "default": false
-                },
-                "transcript": {
-                    "type": "boolean",
-                    "default": false
-                }
-            }
+        "transcript": {
+          "type": "boolean",
+          "default": false
         },
-        "mcpHookHandler": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "type",
-                "server",
-                "tool",
-                "arguments"
-            ],
-            "properties": {
-                "type": {
-                    "const": "mcp_tool"
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 86400000
-                },
-                "async": {
+        "stream": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt in to per-record HttpResponse hooks."
+        }
+      }
+    },
+    "mcpHookHandler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "server",
+        "tool",
+        "arguments"
+      ],
+      "properties": {
+        "type": {
+          "const": "mcp_tool"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
+        },
+        "async": {
+          "const": false
+        },
+        "transcript": {
+          "type": "boolean",
+          "default": false
+        },
+        "server": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arguments": {
+          "type": [
+            "object",
+            "string"
+          ]
+        },
+        "stream": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt in to per-record HttpResponse hooks."
+        }
+      }
+    },
+    "sessionEndHookGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hooks"
+      ],
+      "properties": {
+        "matcher": {
+          "type": "string",
+          "default": "",
+          "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal filenames."
+        },
+        "hooks": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/commandHookHandler"
+              },
+              {
+                "properties": {
+                  "async": {
                     "const": false
-                },
-                "transcript": {
-                    "type": "boolean",
-                    "default": false
-                },
-                "server": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "tool": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "arguments": {
-                    "type": [
-                        "object",
-                        "string"
-                    ]
+                  }
                 }
-            }
+              }
+            ]
+          }
         },
-        "sessionEndHookGroup": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "hooks"
-            ],
-            "properties": {
-                "matcher": {
-                    "type": "string",
-                    "default": "",
-                    "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal filenames."
-                },
-                "hooks": {
-                    "type": "array",
-                    "items": {
-                        "allOf": [
-                            {
-                                "$ref": "#/$defs/commandHookHandler"
-                            },
-                            {
-                                "properties": {
-                                    "async": {
-                                        "const": false
-                                    }
-                                }
-                            }
-                        ]
-                    }
-                },
-                "when": {
-                    "$ref": "#/$defs/hookWhen"
-                }
-            }
-        },
-        "hookWhen": {
-            "type": "object",
-            "minProperties": 1,
-            "additionalProperties": false,
-            "properties": {
-                "agent_scope": {
-                    "enum": [
-                        "main",
-                        "subagent"
-                    ]
-                },
-                "request_purpose": {
-                    "enum": [
-                        "agent",
-                        "approval_judge",
-                        "compaction"
-                    ]
-                },
-                "agent_type": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "model": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "provider": {
-                    "type": "string",
-                    "minLength": 1
-                }
-            },
-            "description": "All specified fields must match the harness metadata exactly. Omitted fields match every value."
-        },
-        "modelSettings": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "temperature": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 2
-                },
-                "max_output_tokens": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 1048576
-                },
-                "reasoning_effort": {
-                    "enum": [
-                        "none",
-                        "minimal",
-                        "low",
-                        "medium",
-                        "high",
-                        "xhigh"
-                    ]
-                },
-                "attempts": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 4
-                },
-                "retry_delay_ms": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 60000
-                },
-                "top_p": {
-                    "type": "number",
-                    "exclusiveMinimum": 0,
-                    "maximum": 1
-                },
-                "top_k": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 1048576
-                },
-                "seed": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 4294967295
-                },
-                "frequency_penalty": {
-                    "type": "number",
-                    "minimum": -2,
-                    "maximum": 2
-                },
-                "presence_penalty": {
-                    "type": "number",
-                    "minimum": -2,
-                    "maximum": 2
-                },
-                "stop": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 16,
-                    "items": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 4096
-                    }
-                }
-            }
-        },
-        "modelRoute": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "id",
-                "provider",
-                "endpoint",
-                "model"
-            ],
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "provider": {
-                    "enum": [
-                        "openai",
-                        "ollama"
-                    ]
-                },
-                "endpoint": {
-                    "type": "string",
-                    "format": "uri"
-                },
-                "model": {
-                    "type": "string",
-                    "minLength": 1
-                },
-                "api_key": {
-                    "type": "string"
-                },
-                "purposes": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "enum": [
-                            "agent",
-                            "approval_judge",
-                            "compaction"
-                        ]
-                    }
-                },
-                "settings": {
-                    "$ref": "#/$defs/modelSettings"
-                },
-                "context_limit": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 1048576,
-                    "default": 0,
-                    "description": "Known route context window; zero uses the backend default or model table. Ollama also receives num_ctx."
-                },
-                "protocol": {
-                    "enum": [
-                        "chat",
-                        "responses",
-                        "messages"
-                    ],
-                    "default": "chat",
-                    "description": "OpenAI-compatible wire protocol. Ollama selects its native protocol automatically."
-                }
-            }
+        "when": {
+          "$ref": "#/$defs/hookWhen"
         }
+      }
     },
-    "allowComments": false,
-    "allowTrailingCommas": false
+    "hookWhen": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "agent_scope": {
+          "enum": [
+            "main",
+            "subagent"
+          ]
+        },
+        "request_purpose": {
+          "enum": [
+            "agent",
+            "approval_judge",
+            "compaction"
+          ]
+        },
+        "agent_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "description": "All specified fields must match the harness metadata exactly. Omitted fields match every value."
+    },
+    "modelSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "reasoning_effort": {
+          "enum": [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "retry_delay_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "top_p": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "top_k": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "frequency_penalty": {
+          "type": "number",
+          "minimum": -2,
+          "maximum": 2
+        },
+        "presence_penalty": {
+          "type": "number",
+          "minimum": -2,
+          "maximum": 2
+        },
+        "stop": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        }
+      }
+    },
+    "modelRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "provider",
+        "endpoint",
+        "model"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider": {
+          "enum": [
+            "openai",
+            "ollama"
+          ]
+        },
+        "endpoint": {
+          "type": "string",
+          "format": "uri"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "api_key": {
+          "type": "string"
+        },
+        "purposes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "agent",
+              "approval_judge",
+              "compaction"
+            ]
+          }
+        },
+        "settings": {
+          "$ref": "#/$defs/modelSettings"
+        },
+        "context_limit": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576,
+          "default": 0,
+          "description": "Known route context window; zero uses the backend default or model table. Ollama also receives num_ctx."
+        },
+        "protocol": {
+          "enum": [
+            "chat",
+            "responses",
+            "messages"
+          ],
+          "default": "chat",
+          "description": "OpenAI-compatible wire protocol. Ollama selects its native protocol automatically."
+        }
+      }
+    },
+    "hookList": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/hook"
+          },
+          {
+            "$ref": "#/$defs/hookGroup"
+          }
+        ]
+      }
+    }
+  },
+  "allowComments": false,
+  "allowTrailingCommas": false
 }

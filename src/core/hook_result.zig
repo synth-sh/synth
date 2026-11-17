@@ -1,4 +1,5 @@
 const std = @import("std");
+const Event = @import("hooks.zig").Event;
 
 pub const Permission = enum { allow, deny, ask };
 pub const HttpPatch = struct { headers: ?std.json.Value = null, status: ?u16 = null, body: ?std.json.Value = null, drop: bool = false };
@@ -110,7 +111,7 @@ fn combine(allocator: std.mem.Allocator, before: []const u8, after: []const u8, 
     return std.json.Stringify.valueAlloc(allocator, lhs, .{});
 }
 
-pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: []const u8) !Result {
+pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: Event) !Result {
     if (std.mem.trim(u8, source, " \r\n\t").len == 0) return .{};
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, source, .{});
     defer parsed.deinit();
@@ -134,62 +135,62 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: []const u8
             _ = try text(value);
         } else if (std.mem.eql(u8, key, "decision")) {
             const decision = try text(value);
-            if (!oneOf(event, &.{ "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop", "PostToolBatch", "TaskCreated", "TaskCompleted", "PreModelSwitch", "UserPromptExpansion", "ConfigChange" })) return error.UnsupportedHookEffect;
+            if (!event.oneOf(&.{ .pre_tool_use, .post_tool_use, .user_prompt_submit, .stop, .subagent_stop, .post_tool_batch, .task_created, .task_completed, .pre_model_switch, .user_prompt_expansion, .config_change })) return error.UnsupportedHookEffect;
             if (std.mem.eql(u8, decision, "block")) {
                 if (result.blocked) |old| allocator.free(old);
                 result.blocked = try reason(allocator, root, "reason");
-            } else if (std.mem.eql(u8, event, "PreToolUse") and std.mem.eql(u8, decision, "approve")) {
+            } else if (event == .pre_tool_use and std.mem.eql(u8, decision, "approve")) {
                 result.decide(.allow);
             } else return error.InvalidHookOutput;
         } else if (std.mem.eql(u8, key, "hookSpecificOutput")) {
             if (value != .object) return error.InvalidHookOutput;
             const named = value.object.get("hookEventName") orelse return error.InvalidHookOutput;
-            if (!std.mem.eql(u8, try text(named), event)) return error.InvalidHookEvent;
+            if (!std.mem.eql(u8, try text(named), event.name())) return error.InvalidHookEvent;
             try specific(allocator, &result, value, event);
         } else return error.UnsupportedHookEffect;
     }
-    if (oneOf(event, &.{ "PreModelRequest", "PostModelRequest", "SessionEnd", "Interrupt", "SubagentStart", "PostToolUseFailure", "PermissionDenied", "StopFailure", "Notification", "InstructionsLoaded", "FileChanged", "PostModelSwitch", "MessageDisplay", "CwdChanged", "DirectoryAdded" }) and (result.stop or result.blocked != null or result.replacement != null or result.permission != null)) return error.UnsupportedHookEffect;
-    if (oneOf(event, &.{ "ModelResolve", "ModelContext", "ModelSettings", "ModelRetry", "HttpRequest", "HttpResponse" }) and (result.stop or result.context != null or result.blocked != null or result.permission != null)) return error.UnsupportedHookEffect;
-    if (std.mem.eql(u8, event, "PostToolUse") and result.stop) return error.UnsupportedHookEffect;
-    if (oneOf(event, &.{ "TaskCreated", "TaskCompleted" })) result.stop = false;
+    if (event.observational() and (result.stop or result.blocked != null or result.replacement != null or result.permission != null)) return error.UnsupportedHookEffect;
+    if (event.requestStage() and (result.stop or result.context != null or result.blocked != null or result.permission != null)) return error.UnsupportedHookEffect;
+    if (event == .post_tool_use and result.stop) return error.UnsupportedHookEffect;
+    if (event.oneOf(&.{ .task_created, .task_completed })) result.stop = false;
     if (result.stop and result.blocked == null) result.blocked = try reason(allocator, root, "stopReason");
     return result;
 }
 
-fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value, event: []const u8) !void {
+fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value, event: Event) !void {
     var fields = value.object.iterator();
     while (fields.next()) |entry| {
         const key = entry.key_ptr.*;
         const field = entry.value_ptr.*;
         if (std.mem.eql(u8, key, "hookEventName")) continue;
         if (std.mem.eql(u8, key, "requestContext")) {
-            if (!std.mem.eql(u8, event, "ModelContext") or field != .object) return error.UnsupportedHookEffect;
+            if (event != .model_context or field != .object) return error.UnsupportedHookEffect;
             const encoded = try std.json.Stringify.valueAlloc(allocator, field, .{});
             errdefer allocator.free(encoded);
             const parsed = try std.json.parseFromSlice(@import("request_context.zig").Patch, allocator, encoded, .{});
             defer parsed.deinit();
             result.request_context = encoded;
         } else if (std.mem.eql(u8, key, "http")) {
-            if (!oneOf(event, &.{ "HttpRequest", "HttpResponse" }) or field != .object) return error.UnsupportedHookEffect;
+            if (!event.oneOf(&.{ .http_request, .http_response }) or field != .object) return error.UnsupportedHookEffect;
             const encoded = try std.json.Stringify.valueAlloc(allocator, field, .{});
             errdefer allocator.free(encoded);
             const parsed = try std.json.parseFromSlice(HttpPatch, allocator, encoded, .{});
             defer parsed.deinit();
             result.http = encoded;
         } else if (std.mem.eql(u8, key, "effect")) {
-            if (!std.mem.eql(u8, event, "PermissionEvaluate")) return error.UnsupportedHookEffect;
+            if (event != .permission_evaluate) return error.UnsupportedHookEffect;
             result.decide(std.meta.stringToEnum(Permission, try text(field)) orelse return error.InvalidHookOutput);
             if (result.permission == .deny and result.blocked == null) result.blocked = try reason(allocator, value, "reason");
-        } else if (std.mem.eql(u8, key, "reason") and std.mem.eql(u8, event, "PermissionEvaluate")) {
+        } else if (std.mem.eql(u8, key, "reason") and event == .permission_evaluate) {
             _ = try text(field);
         } else if (std.mem.eql(u8, key, "route")) {
-            if (!std.mem.eql(u8, event, "ModelResolve")) return error.UnsupportedHookEffect;
+            if (event != .model_resolve) return error.UnsupportedHookEffect;
             result.model_route = try string(allocator, field);
         } else if (std.mem.eql(u8, key, "contextEdits")) {
-            if (!std.mem.eql(u8, event, "ModelContext") or field != .array) return error.UnsupportedHookEffect;
+            if (event != .model_context or field != .array) return error.UnsupportedHookEffect;
             result.context_edits = try std.json.Stringify.valueAlloc(allocator, field, .{});
         } else if (std.mem.eql(u8, key, "settings")) {
-            if (!std.mem.eql(u8, event, "ModelSettings") or field != .object) return error.UnsupportedHookEffect;
+            if (event != .model_settings or field != .object) return error.UnsupportedHookEffect;
             const encoded = try std.json.Stringify.valueAlloc(allocator, field, .{});
             errdefer allocator.free(encoded);
             const parsed = try std.json.parseFromSlice(@import("model_policy.zig").Settings, allocator, encoded, .{});
@@ -197,42 +198,42 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
             try parsed.value.validate();
             result.settings = encoded;
         } else if (std.mem.eql(u8, key, "retryAllowed")) {
-            if (!std.mem.eql(u8, event, "ModelRetry") or field != .bool) return error.UnsupportedHookEffect;
+            if (event != .model_retry or field != .bool) return error.UnsupportedHookEffect;
             result.retry_allowed = field.bool;
         } else if (std.mem.eql(u8, key, "retryDelayMs")) {
-            if (!std.mem.eql(u8, event, "ModelRetry") or field != .integer or field.integer < 0 or field.integer > 60_000) return error.InvalidHookOutput;
+            if (event != .model_retry or field != .integer or field.integer < 0 or field.integer > 60_000) return error.InvalidHookOutput;
             result.retry_delay_ms = @intCast(field.integer);
         } else if (std.mem.eql(u8, key, "additionalContext")) {
-            if (!oneOf(event, &.{ "PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart", "SubagentStart", "PostToolUseFailure", "PostToolBatch" })) return error.UnsupportedHookEffect;
+            if (!event.oneOf(&.{ .pre_tool_use, .post_tool_use, .user_prompt_submit, .session_start, .subagent_start, .post_tool_use_failure, .post_tool_batch })) return error.UnsupportedHookEffect;
             if (field == .null) continue;
             result.context = try string(allocator, field);
         } else if (std.mem.eql(u8, key, "displayContent")) {
-            if (!std.mem.eql(u8, event, "MessageDisplay")) return error.UnsupportedHookEffect;
+            if (event != .message_display) return error.UnsupportedHookEffect;
             if (field != .null) result.display_content = try string(allocator, field);
         } else if (std.mem.eql(u8, key, "retry")) {
-            if (!std.mem.eql(u8, event, "PermissionDenied")) return error.UnsupportedHookEffect;
+            if (event != .permission_denied) return error.UnsupportedHookEffect;
             if (field != .bool) return error.InvalidHookOutput;
             result.retry = field.bool;
         } else if (std.mem.eql(u8, key, "updatedInput")) {
-            if (!std.mem.eql(u8, event, "PreToolUse")) return error.UnsupportedHookEffect;
+            if (event != .pre_tool_use) return error.UnsupportedHookEffect;
             if (field == .null) continue;
             if (field != .object) return error.InvalidHookOutput;
             result.replacement = try std.json.Stringify.valueAlloc(allocator, field, .{});
         } else if (std.mem.eql(u8, key, "permissionDecision")) {
-            if (!std.mem.eql(u8, event, "PreToolUse")) return error.UnsupportedHookEffect;
+            if (event != .pre_tool_use) return error.UnsupportedHookEffect;
             if (field == .null) continue;
             result.decide(std.meta.stringToEnum(Permission, try text(field)) orelse return error.InvalidHookOutput);
             if (result.permission == .deny and result.blocked == null) result.blocked = try reason(allocator, value, "permissionDecisionReason");
         } else if (std.mem.eql(u8, key, "updatedMCPToolOutput")) {
-            if (!std.mem.eql(u8, event, "PostToolUse")) return error.UnsupportedHookEffect;
+            if (event != .post_tool_use) return error.UnsupportedHookEffect;
             if (field == .null) continue;
             result.feedback = try std.json.Stringify.valueAlloc(allocator, field, .{});
         } else if (std.mem.eql(u8, key, "permissionDecisionReason")) {
-            if (!std.mem.eql(u8, event, "PreToolUse")) return error.UnsupportedHookEffect;
+            if (event != .pre_tool_use) return error.UnsupportedHookEffect;
             if (field == .null) continue;
             _ = try text(field);
         } else if (std.mem.eql(u8, key, "decision")) {
-            if (!std.mem.eql(u8, event, "PermissionRequest")) return error.UnsupportedHookEffect;
+            if (event != .permission_request) return error.UnsupportedHookEffect;
             if (field == .null) continue;
             if (field != .object) return error.InvalidHookOutput;
             var entries = field.object.iterator();
@@ -275,13 +276,13 @@ fn oneOf(value: []const u8, choices: []const []const u8) bool {
 
 test "structured policy validates events types and effects" {
     const a = std.testing.allocator;
-    var result = try parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"updatedInput\":{\"command\":\"echo ok\"},\"additionalContext\":\"context\"}}", "PreToolUse");
+    var result = try parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"updatedInput\":{\"command\":\"echo ok\"},\"additionalContext\":\"context\"}}", .pre_tool_use);
     defer result.deinit(a);
     try std.testing.expect(result.blocked != null);
     try std.testing.expectEqualStrings("{\"command\":\"echo ok\"}", result.replacement.?);
-    try std.testing.expectError(error.InvalidHookOutput, parse(a, "{\"continue\":1}", "Stop"));
-    try std.testing.expectError(error.InvalidHookEvent, parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"Stop\"}}", "PreToolUse"));
-    try std.testing.expectError(error.UnsupportedHookEffect, parse(a, "{\"unknown\":true}", "Stop"));
+    try std.testing.expectError(error.InvalidHookOutput, parse(a, "{\"continue\":1}", .stop));
+    try std.testing.expectError(error.InvalidHookEvent, parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"Stop\"}}", .pre_tool_use));
+    try std.testing.expectError(error.UnsupportedHookEffect, parse(a, "{\"unknown\":true}", .stop));
 }
 
 test "pinned event result compatibility fixtures" {
@@ -290,7 +291,7 @@ test "pinned event result compatibility fixtures" {
     const a = arena.allocator();
     const fixtures = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/results.json"), .{});
     for (fixtures.array.items) |fixture| {
-        const event = fixture.object.get("event").?.string;
+        const event = Event.fromName(fixture.object.get("event").?.string) orelse return error.InvalidHookEvent;
         const encoded = try std.json.Stringify.valueAlloc(a, fixture.object.get("output").?, .{});
         if (fixture.object.contains("invalid")) {
             if (parse(a, encoded, event)) |_| return error.InvalidFixtureAccepted else |_| {}
@@ -304,6 +305,25 @@ test "pinned event result compatibility fixtures" {
         try std.testing.expectEqual(fixture.object.contains("feedback"), result.feedback != null);
         try std.testing.expectEqual(fixture.object.contains("display"), result.display_content != null);
         try std.testing.expectEqual(fixture.object.contains("retry"), result.retry);
+        var expected = fixture.object.get("expected").?.object.iterator();
+        while (expected.next()) |field| {
+            inline for (std.meta.fields(Result)) |member| {
+                if (std.mem.eql(u8, member.name, field.key_ptr.*)) {
+                    const value = @field(result, member.name);
+                    if (comptime member.type == ?[]u8) {
+                        if (field.value_ptr.* == .null) {
+                            try std.testing.expect(value == null);
+                        } else {
+                            const actual = value orelse return error.MissingHookResult;
+                            const want = if (field.value_ptr.* == .string) field.value_ptr.string else try std.json.Stringify.valueAlloc(a, field.value_ptr.*, .{});
+                            try std.testing.expectEqualStrings(want, actual);
+                        }
+                    } else {
+                        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, field.value_ptr.*, .{}), try std.json.Stringify.valueAlloc(a, value, .{}));
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -312,6 +312,7 @@ fn runOne(self: *ToolRun, index: usize) void {
         .allocator = self.allocator,
         .io = self.io,
         .project_root = self.project_root,
+        .permitted_root = if (call.additional_roots.len > 0) call.additional_roots[0] else null,
         .additional_roots = call.additional_roots,
         .reads = self.reads,
         .delegate = self.delegate,
@@ -345,6 +346,7 @@ fn runOne(self: *ToolRun, index: usize) void {
         input.event = if (output.is_error) .post_tool_use_failure else .post_tool_use;
         input.error_message = if (output.is_error) output.content else "";
         input.duration_ms = tool.monotonicMilliseconds(self.io) - execution_started;
+        input.is_interrupt = self.stop.load(.acquire);
         input.tool_name = call.name;
         input.tool_input = call.arguments;
         input.tool_response = output.content;

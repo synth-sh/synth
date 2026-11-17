@@ -10,6 +10,29 @@
 
 const std = @import("std");
 
+pub const max_delay_ms: u64 = 60_000;
+
+pub fn errorType(status: std.http.Status) []const u8 {
+    return switch (status) {
+        .unauthorized, .forbidden => "authentication_failed",
+        .too_many_requests => "rate_limit",
+        .bad_request, .unprocessable_entity => "invalid_request",
+        .not_found => "not_found",
+        else => if (status.class() == .server_error) "server_error" else "http_error",
+    };
+}
+
+pub fn pause(io: std.Io, sink: ?@import("provider.zig").Sink, info: @import("provider.zig").RetryInfo) bool {
+    if (sink) |stream| if (stream.stopped(stream.userdata)) return false;
+    const delay = if (sink) |stream| stream.retryDecision(info) orelse return false else delay: {
+        if (!info.allowed) return false;
+        break :delay info.delay_ms;
+    };
+    std.Io.sleep(io, .fromMilliseconds(@intCast(@min(delay, max_delay_ms))), .awake) catch return false;
+    if (sink) |stream| if (stream.stopped(stream.userdata)) return false;
+    return true;
+}
+
 pub const Policy = struct {
     /// Total attempts, including the first. Three retries past the original.
     attempts: usize = 4,
@@ -20,7 +43,7 @@ pub const Policy = struct {
     /// Longest wait a server's own `Retry-After` can ask for. Past this the
     /// request is failed rather than held: a turn that resumes in four minutes
     /// is not a turn anyone is still waiting on.
-    max_retry_after_ms: u64 = 60_000,
+    max_retry_after_ms: u64 = max_delay_ms,
 };
 
 /// Whether a status is worth another attempt.

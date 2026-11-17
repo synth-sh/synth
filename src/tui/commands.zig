@@ -125,13 +125,11 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/hooks") or std.mem.startsWith(u8, line, "/hooks ")) {
-        var words = std.mem.tokenizeAny(u8, line, " \t");
-        _ = words.next();
-        const action = std.meta.stringToEnum(@import("../core/hook_store.zig").Action, words.next() orelse "list") orelse {
-            try self.notification.show(ctx, .warn, "Use /hooks list, review, trust, revoke, enable or disable");
+        const command = @import("../core/hook_store.zig").parseCommand(line) catch {
+            try self.notification.show(ctx, .warn, "Use /hooks list, review, trust, revoke, enable or disable [id]");
             return true;
         };
-        try self.mirror.hooks(action, words.next() orelse "");
+        try self.mirror.hooks(command.action, command.id);
         return true;
     }
     if (std.mem.eql(u8, line, "/permissions")) {

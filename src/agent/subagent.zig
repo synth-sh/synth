@@ -245,7 +245,7 @@ pub const Runner = struct {
         child.loop.handoff = .{ .files = parent.handoff.files };
         child.loop.parent = parent.parent orelse parent;
         for (parent.conversation.messages.items) |message| {
-            if (message.seq == parent.pending_seq and child.index < message.tool_calls.len) child.loop.hook_parent_call_id = message.tool_calls[child.index].id;
+            if (message.seq == parent.pending_seq and child.index < message.tool_calls.len) child.loop.hook_flow.parent_call_id = message.tool_calls[child.index].id;
         }
         child.loop.approvals = parent.approvals;
         // A standing allowance is the person's, not something to inherit.
@@ -433,7 +433,7 @@ fn report(child: *Loop, allocator: std.mem.Allocator, outcome: Outcome) ![]const
         .halted => haltNote(&buffer, halt.reason),
     };
 
-    if (child.hook_failure orelse child.hook_notice) |notice| {
+    if (child.hook_flow.failure orelse child.hook_flow.notice) |notice| {
         return std.fmt.allocPrint(allocator, "{s}{s}\n\n<note>Subagent hook: {s}</note>", .{ answer, note, notice });
     }
     if (answer.len == 0 and note.len == 0) return allocator.dupe(u8, "");
@@ -875,8 +875,8 @@ test "child tools inherit pre-tool denial and return its reason to the parent" {
     try testing.expectEqualStrings("spoofed", parsed.value.object.get("tool_input").?.object.get("model").?.string);
     try testing.expectEqualStrings("agent", parsed.value.object.get("request_purpose").?.string);
     try testing.expectEqualStrings("delegate-42", parsed.value.object.get("parent_tool_call_id").?.string);
-    try testing.expectEqualStrings(&harness.parent.hook_identity, parsed.value.object.get("parent_agent_id").?.string);
-    try testing.expect(!std.mem.eql(u8, &harness.parent.hook_identity, parsed.value.object.get("agent_id").?.string));
+    try testing.expectEqualStrings(&harness.parent.hook_flow.identity, parsed.value.object.get("parent_agent_id").?.string);
+    try testing.expect(!std.mem.eql(u8, &harness.parent.hook_flow.identity, parsed.value.object.get("agent_id").?.string));
 }
 
 test "subagent lifecycle context and continuation retain child identity" {
@@ -909,7 +909,7 @@ test "subagent lifecycle context and continuation retain child identity" {
         const agent_id = fields.get("agent_id").?.string;
         if (index == 0) @memcpy(&identity, agent_id) else try testing.expectEqualStrings(&identity, agent_id);
         try testing.expectEqual(index == 2, fields.get("stop_hook_active").?.bool);
-        try testing.expectEqualStrings(&harness.parent.hook_identity, fields.get("session_id").?.string);
+        try testing.expectEqualStrings(&harness.parent.hook_flow.identity, fields.get("session_id").?.string);
     }
     try testing.expect(lines.next() == null);
 }

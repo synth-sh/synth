@@ -498,10 +498,8 @@ fn respond(
             hook_attempt.error_message = @errorName(refusal.toError(head.status));
             hook_attempt.finish();
 
-            if (head.status == .unauthorized and !refreshed and attempt < self.retries.attempts) {
-                const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = "http_error", .error_message = why }) else @as(?u64, 0);
-                if (wait) |delay| {
-                    try std.Io.sleep(self.io, .fromMilliseconds(@intCast(delay)), .awake);
+            if (head.status == .unauthorized and !refreshed) {
+                if (retry.pause(self.io, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = retry.errorType(head.status), .error_message = why })) {
                     try store.forceRefresh();
                     refreshed = true;
                     attempt += 1;
@@ -553,15 +551,15 @@ fn waitAndRetry(
     sink: ?Provider.Sink,
 ) bool {
     if (attempt >= self.retries.attempts) return false;
-    const eligible = retry.transient(status) and !retry.tooLong(self.retries, retry_after_ms) and status != .too_many_requests;
-    if (stopped(sink)) return false;
-
-    const proposed = retry.waitMs(self.retries, attempt, retry_after_ms);
-    const wait = if (sink) |s| s.retryDecision(.{ .attempt = attempt, .allowed = eligible, .delay_ms = proposed, .status = @intFromEnum(status), .error_type = "http_error", .error_message = self.rejection orelse "" }) orelse return false else if (eligible) proposed else return false;
-    std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
-    return !stopped(sink);
+    return retry.pause(self.io, sink, .{
+        .attempt = attempt,
+        .allowed = retry.transient(status) and !retry.tooLong(self.retries, retry_after_ms) and status != .too_many_requests,
+        .delay_ms = retry.waitMs(self.retries, attempt, retry_after_ms),
+        .status = @intFromEnum(status),
+        .error_type = retry.errorType(status),
+        .error_message = self.rejection orelse "",
+    });
 }
-
 fn stopped(sink: ?Provider.Sink) bool {
     const s = sink orelse return false;
     return s.stopped(s.userdata);

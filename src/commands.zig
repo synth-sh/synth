@@ -833,7 +833,7 @@ pub fn hooks(init_process: std.process.Init, action: @import("core/hook_store.zi
     defer project.deinit(init_process.gpa);
     var store = try store_module.Store.init(init_process.gpa, init_process.io, config.hook_state_path);
     defer store.deinit();
-    var set = try store_module.discover(a, init_process.io, config.hooks, project.root, init_process.environ_map.get("HOME"), config.hook_timeout_ms, store);
+    var set = try store_module.discover(a, init_process.io, config.hooks, project.root, init_process.environ_map.get("HOME"), store);
     try store_module.change(a, init_process.io, &set, config.hook_state_path, action, id);
     const text = try store_module.report(a, set, config.hook_timeout_ms, action == .review, null);
     var buffer: [4096]u8 = undefined;

@@ -411,11 +411,11 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         return connection.reply(id, files);
     } else if (eql(u8, method, m.change_directory)) {
         const asked = try rpc.parse(synth.Directory, arena, params);
-        try session.stack.loop.changeDirectory(asked.path);
+        session.stack.loop.changeDirectory(asked.path) catch |err| return self.noticeFmt(.warning, "Cannot change directory to {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
         try session.publish(arena, true);
     } else if (eql(u8, method, m.add_directory)) {
         const asked = try rpc.parse(synth.Directory, arena, params);
-        try session.stack.loop.addDirectory(asked.path, "register_repo_root");
+        session.stack.loop.addDirectory(asked.path, "slash_command") catch |err| return self.noticeFmt(.warning, "Cannot add directory {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
         try session.publish(arena, true);
     } else if (eql(u8, method, m.hooks)) {
         const asked = try rpc.parse(synth.Hooks, arena, params);
@@ -707,7 +707,11 @@ fn notifyAll(self: *Agent, audience: Audience, method: []const u8, params: anyty
 
 fn noticeFmt(self: *Agent, severity: protocol.Severity, comptime fmt: []const u8, args: anytype) void {
     var buffer: [512]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, fmt, args) catch fmt;
+    const text = std.fmt.bufPrint(&buffer, fmt, args) catch {
+        const owned = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        defer self.allocator.free(owned);
+        return self.notice(severity, owned);
+    };
     self.notice(severity, text);
 }
 
@@ -1699,14 +1703,17 @@ const Session = struct {
 
         const loop = &self.stack.loop;
         if (std.mem.startsWith(u8, text.items, "/")) {
-            if (std.mem.eql(u8, text.items, "/cd") or std.mem.startsWith(u8, text.items, "/cd ")) {
+            const changes_directory = std.mem.eql(u8, text.items, "/cd") or std.mem.startsWith(u8, text.items, "/cd ");
+            if (changes_directory) {
                 const path = std.mem.trim(u8, text.items[3..], " \t\n");
                 if (path.len == 0) return self.notice(.info, "{s}", .{loop.workingDirectory()});
-                try loop.changeDirectory(path);
+                loop.changeDirectory(path) catch |err| return self.notice(.warning, "Cannot change directory to {s}: {s}", .{ path, @import("../core/paths.zig").directoryError(err) });
                 return self.notice(.info, "Working directory: {s}", .{loop.workingDirectory()});
             }
-            if (std.mem.eql(u8, text.items, "/add-dir") or std.mem.startsWith(u8, text.items, "/add-dir ")) {
-                try loop.addDirectory(std.mem.trim(u8, text.items[8..], " \t\n"), "slash_command");
+            const adds_directory = std.mem.eql(u8, text.items, "/add-dir") or std.mem.startsWith(u8, text.items, "/add-dir ");
+            if (adds_directory) {
+                const path = std.mem.trim(u8, text.items[8..], " \t\r\n");
+                loop.addDirectory(path, "slash_command") catch |err| return self.notice(.warning, "Cannot add directory {s}: {s}", .{ path, @import("../core/paths.zig").directoryError(err) });
                 return self.notice(.info, "Directory added to this session", .{});
             }
             if (skill.findIn(self.stack.skills.skills, skill.idOf(text.items))) |found| {
@@ -1718,10 +1725,8 @@ const Session = struct {
                 return loop.submit(text.items, .{ .attachments = attachments.items, .images = images.items, .command_name = found.id, .command_args = std.mem.trimStart(u8, text.items[@min(text.items.len, found.id.len + 1)..], " \t\n"), .expanded_prompt = attachments.items[attachments.items.len - 1].content });
             }
             if (std.mem.eql(u8, text.items, "/hooks") or std.mem.startsWith(u8, text.items, "/hooks ")) {
-                var words = std.mem.tokenizeAny(u8, text.items, " \t\n");
-                _ = words.next();
-                const action = std.meta.stringToEnum(@import("../core/hook_store.zig").Action, words.next() orelse "list") orelse return error.InvalidParams;
-                const report = try self.stack.manageHooks(arena, action, words.next() orelse "");
+                const command = try @import("../core/hook_store.zig").parseCommand(text.items);
+                const report = try self.stack.manageHooks(arena, command.action, command.id);
                 self.agent.noticeFmt(.info, "{s}", .{report});
                 return;
             }
@@ -2619,10 +2624,10 @@ const testing = std.testing;
 /// Answers the first turn by thinking aloud and asking to write a note, or,
 /// for a prompt of "ask me", asking which colour; and the second, once the
 /// call is settled, with "done". Each answer waits on
-/// `gate` after the thinking, so a test can catch a request mid-stream. Offers
+/// `guard` after the thinking, so a test can catch a request mid-stream. Offers
 /// two models, each at two efforts; only the first can be shown images.
 pub const Script = struct {
-    gate: std.Io.Event = .is_set,
+    guard: std.Io.Event = .is_set,
     model: []const u8 = offered[0],
     effort: []const u8 = "",
 
@@ -2682,7 +2687,7 @@ pub const Script = struct {
             s.onThinking(s.userdata, "weighing it up");
             s.onThinkingDone(s.userdata);
         }
-        self.gate.waitUncancelable(testing.io);
+        self.guard.waitUncancelable(testing.io);
         if (turn.compacting) return .{ .text = try allocator.dupe(u8, "The story so far.") };
         const last = convo.last();
         if (last != null and last.?.role == .tool) return .{ .text = try allocator.dupe(u8, "done") };
@@ -3006,7 +3011,7 @@ test "a turn runs, its approval asked as a permission request and its prompt ans
     const session = (try client.open(fixture.project)).sessionId;
     const arena = client.arena.allocator();
 
-    fixture.script.gate.reset();
+    fixture.script.guard.reset();
     const prompted = try client.prompt(session, "make a note");
     var thinking: std.ArrayList(u8) = .empty;
     while (!std.mem.eql(u8, thinking.items, "weighing it up")) {
@@ -3014,7 +3019,7 @@ test "a turn runs, its approval asked as a permission request and its prompt ans
         const update = try rpc.parse(synth.StreamUpdate, arena, message.params);
         try thinking.appendSlice(arena, update.stream.thinking);
     }
-    fixture.script.gate.set(testing.io);
+    fixture.script.guard.set(testing.io);
 
     const status = try client.awaitStatus(struct {
         fn matches(_: @This(), got: synth.Status) bool {
@@ -3042,7 +3047,7 @@ test "a prompt sent while busy steers the turn, and both are answered when it en
     try client.initialize(true);
     const session = (try client.open(fixture.project)).sessionId;
 
-    fixture.script.gate.reset();
+    fixture.script.guard.reset();
     const first = try client.prompt(session, "make a note");
     const second = try client.request(protocol.method.session_prompt, .{
         .sessionId = session,
@@ -3056,7 +3061,7 @@ test "a prompt sent while busy steers the turn, and both are answered when it en
             return got.steering.len == 1;
         }
     }{});
-    fixture.script.gate.set(testing.io);
+    fixture.script.guard.set(testing.io);
     try client.choose((try client.awaitPermission()).id, "once");
 
     const steered = while (true) {

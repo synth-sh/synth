@@ -166,11 +166,10 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
             if (std.mem.eql(u8, word, "hooks")) {
                 const verb = iter.next() orelse return .{ .hooks = .{} };
                 if (std.mem.eql(u8, verb, "--help") or std.mem.eql(u8, verb, "-h")) return .{ .help = .hooks };
-                const action = std.meta.stringToEnum(@import("core/hook_store.zig").Action, verb) orelse return error.UnknownSubcommand;
                 const id = iter.next() orelse "";
                 if (iter.next() != null) return error.UnexpectedArgument;
-                if (action != .list and action != .review and id.len == 0) return error.MissingHookId;
-                return .{ .hooks = .{ .action = action, .id = try allocator.dupe(u8, id) } };
+                const command = try @import("core/hook_store.zig").parseCommand(try std.fmt.allocPrint(allocator, "hooks {s} {s}", .{ verb, id }));
+                return .{ .hooks = .{ .action = command.action, .id = command.id } };
             }
             if (std.mem.eql(u8, word, "mcp")) return parseMcp(init, allocator, &iter);
             if (std.mem.eql(u8, word, "db")) return parseDb(init, &iter);

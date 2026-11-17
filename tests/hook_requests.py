@@ -28,7 +28,7 @@ def tool(name, arguments):
 
 
 @contextlib.contextmanager
-def session(name, respond, logic="", events=(), protocol="chat", attempts=2, extra_hooks=None):
+def session(name, respond, logic="", events=(), protocol="chat", attempts=2, extra_hooks=None, trust=True):
     requests = []
     errors = []
 
@@ -73,9 +73,9 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             routes = [{"id": identifier, "provider": "ollama" if protocol == "ollama" and identifier != "review" else "openai", "endpoint": f"{url}/{identifier}" + ("" if protocol == "ollama" and identifier != "review" else "/v1"), "model": f"{identifier}-model", "protocol": "chat" if protocol == "ollama" or identifier == "review" else protocol, "context_limit": 16384, "api_key": f"{identifier}-secret", "purposes": ["approval_judge"] if identifier == "review" else ["agent", "compaction"], "settings": {"attempts": attempts, "retry_delay_ms": 0}} for identifier in ("agent", "selected", "review")]
             config = {"think": False, "approvals": "auto", "auto_approve_safe_commands": False, "skill_paths": [], "model_requests": {"restrict_routes": True, "agent": "agent", "approval_judge": "review", "compaction": "agent", "reviewer_fallback": "deny", "reviewer_timeout_ms": 2000, "routes": routes}}
             (root / "config.json").write_text(json.dumps(config))
-            (root / "adapter.py").write_text("import json,sys\np=json.load(sys.stdin)\ne=p['hook_event_name']\nwith open('events.jsonl','a') as f: f.write(json.dumps(p)+'\\n')\nout={}\n" + logic + "\nprint(json.dumps({'hookSpecificOutput':{'hookEventName':e,**out}}))\n")
+            (root / "adapter.py").write_text("import json,sys\ndef fail(kind,value,tb):\n import traceback; traceback.print_exception(kind,value,tb); sys.exit(2)\nsys.excepthook=fail\np=json.load(sys.stdin)\ne=p['hook_event_name']\nwith open('events.jsonl','a') as f: f.write(json.dumps(p)+'\\n')\nout={}\n" + logic + "\nprint(json.dumps({'hookSpecificOutput':{'hookEventName':e,**out}}))\n")
             command = f"python3 {shlex.quote(str(root / 'adapter.py'))}"
-            hooks = {event: [{"hooks": [{"command": command}]}] for event in events}
+            hooks = {event: [{"hooks": [{"command": command, "stream": True}]}] for event in events}
             if extra_hooks:
                 hooks.update(extra_hooks(command))
             (root / ".synth/hooks.json").write_text(json.dumps(hooks))
@@ -88,10 +88,10 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             listing = run("hooks", "list")
             assert listing.returncode == 0, listing.stderr
             ids = re.findall(r"^([0-9a-f]{64})$", listing.stdout, re.M)
-            for identifier in ids:
+            for identifier in ids if trust else ():
                 trusted = run("hooks", "trust", identifier)
                 assert trusted.returncode == 0, trusted.stderr
-            result = run("run", "--allow", "route-me canonical human request")
+            result = run("run", "--allow", "route-me reference human request")
             log = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()] if (root / "events.jsonl").exists() else []
             assert all("forbidden" not in packet["path"] for packet in requests), requests
             assert not errors, '\n'.join(errors)
@@ -107,6 +107,9 @@ def expect(result, text):
 
 
 def main():
+    with session('untrusted', lambda *_: chat('must-not-run'), events=('PreToolUse',), trust=False) as (_, result, requests, _):
+        assert result.returncode != 0 and not requests
+        expect(result, 'review')
     rich = """
 if e=='ModelResolve':
  assert 'route-me' in p['request_context']
@@ -131,15 +134,15 @@ elif e=='ModelSettings':
         assert first['top_p'] == 0.7 and first['seed'] == 42 and first['stop'] == ['END']
         assert not (root / 'must-not-exist').exists()
         with sqlite3.connect(root / 'session.db') as db:
-            assert db.execute("select origin,text from message where role='user'").fetchall() == [('human', 'route-me canonical human request')]
+            assert db.execute("select origin,text from message where role='user'").fetchall() == [('human', 'route-me reference human request')]
             assert db.execute('select status from tool_call').fetchall() == [('rejected',)]
-    print('PASS request routing, private route metadata, context/system/tool filtering, generation settings, canonical provenance')
+    print('PASS request routing, private route metadata, context/system/tool filtering, generation settings, reference provenance')
 
     adapter = """
 if e in ('HttpRequest','HttpResponse'):
  assert all(p[key]=='' for key in ('request_context','request_system','request_instruction','request_tools','request_routes'))
  h=json.loads(p['http'])
- if e=='HttpResponse': assert 'route-me canonical human request' in open(p['transcript_path']).read()
+ if e=='HttpResponse': assert 'route-me reference human request' in open(p['transcript_path']).read()
 if e=='HttpRequest':
  assert h['headers'].get('authorization',h['headers'].get('Authorization'))=='<redacted>'
  body=h['body']; body['adapter_marker']='present'
@@ -164,7 +167,7 @@ elif e=='HttpResponse' and h['phase'] in ('event','body'):
             end = {'type': 'response.completed', 'response': {'usage': {'input_tokens': 8, 'output_tokens': 2}}} if protocol == 'responses' else {'type': 'message_stop'} if protocol == 'messages' else {'message': {'role': 'assistant', 'content': ''}, 'done': True, 'prompt_eval_count': 8, 'eval_count': 2}
             prefix = 'data: ' if protocol != 'ollama' else ''
             return 200, ''.join(prefix + json.dumps(item) + '\n\n' for item in (body, end)), 'text/event-stream' if protocol != 'ollama' else 'application/x-ndjson'
-        snapshots = lambda command: {'HttpResponse': [{'hooks': [{'command': command, 'transcript': True}]}]}
+        snapshots = lambda command: {'HttpResponse': [{'hooks': [{'command': command, 'transcript': True, 'stream': True}]}]}
         with session(f"wire-{protocol}", adapted, adapter, ('ModelResolve', 'ModelContext', 'HttpRequest', 'HttpResponse'), protocol=protocol, extra_hooks=snapshots) as (_, result, requests, log):
             assert result.returncode == 0, (result.stdout, result.stderr)
             expect(result, f'{protocol} adapted')
@@ -172,6 +175,11 @@ elif e=='HttpResponse' and h['phase'] in ('event','body'):
             assert any(json.loads(item['http'])['phase'] == 'headers' for item in log if item['hook_event_name'] == 'HttpResponse')
     print('PASS native Chat body, Responses SSE, Messages SSE, Ollama NDJSON adapters and request headers')
 
+    no_records = lambda command: {'HttpResponse': [{'hooks': [{'command': command}]}]}
+    raw_ollama = lambda *_: (200, json.dumps({'message': {'role': 'assistant', 'content': 'native'}, 'done': True}) + '\n', 'application/x-ndjson')
+    with session('stream-opt-in', raw_ollama, events=('HttpResponse',), protocol='ollama', extra_hooks=no_records) as (_, result, requests, log):
+        expect(result, 'native')
+        assert [json.loads(entry['http'])['phase'] for entry in log] == ['headers']
     for value in ('custom-agent', None):
         logic = "out={'http':{'headers':{'User-Agent':" + repr(value) + "}}}"
         with session('standard-header', lambda *_: chat(), logic, ('HttpRequest',)) as (_, result, requests, _):
@@ -203,7 +211,7 @@ if e=='ModelRetry':
 
     compatibility_veto = """
 if e=='ModelRetry':
- assert p['http_status']==400 and p['retry_allowed'] and p['error_type']=='http_error'
+ assert p['http_status']==400 and p['retry_allowed'] and p['error_type']=='invalid_request'
  assert 'stream_options' in p['error_message']
  out={'retryAllowed':False}
 """
@@ -215,6 +223,14 @@ if e=='ModelRetry':
             assert len(requests) == 2
             expect(result, 'Request failed')
             assert 'StreamTooLong' not in result.stdout + result.stderr
+    def compatibility_repair(packet, requests):
+        if len(requests) == 1:
+            return 400, {'error': {'message': 'unsupported stream_options'}}, 'application/json'
+        assert 'stream_options' not in packet['body']
+        return chat('repaired')
+    with session('single-attempt-repair', compatibility_repair, attempts=1) as (_, result, requests, _):
+        expect(result, 'repaired')
+        assert len(requests) == 2
     print('PASS compatibility retry metadata/veto and bounded oversized Ollama error handling')
 
     def proposed(packet, _):
@@ -225,8 +241,8 @@ if e=='ModelRetry':
         return chat('', tool('bash', {'command': 'touch allowed.txt'}))
     allow = "if e=='PermissionEvaluate':\n assert json.loads(p['action'])['tool']=='bash'\n out={'effect':'allow'}\n"
     with session('permission-allow', proposed, allow, ('PermissionEvaluate',)) as (root, result, requests, _):
-        assert (root / 'allowed.txt').exists()
-        assert not any('/review/' in packet['path'] for packet in requests)
+        assert not (root / 'allowed.txt').exists()
+        assert any('/review/' in packet['path'] for packet in requests)
     deny_first = "if e=='PreToolUse': out={'permissionDecision':'deny','permissionDecisionReason':'mandatory policy'}\nelif e=='PermissionEvaluate': out={'effect':'allow'}\n"
     with session('deny-final', proposed, deny_first, ('PreToolUse', 'PermissionEvaluate')) as (root, result, _, log):
         assert not (root / 'allowed.txt').exists()
