@@ -137,6 +137,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         .timeout_ms = config.hook_timeout_ms,
     };
     self.loop.hooks = &self.hooks;
+    self.loop.control_files = if (config.hook_state_path) |path| try self.arena.allocator().dupe([]const u8, &.{ config.path, path }) else try self.arena.allocator().dupe([]const u8, &.{config.path});
     inline for (std.meta.fields(Hooks.Set)) |field| {
         for (@field(discovered_hooks, field.name)) |hook| {
             if (hook.enabled and !hook.trusted and self.loop.hook_flow.notice == null) self.loop.hook_flow.notice = try allocator.dupe(u8, "Hooks need review. Use /hooks review or synth hooks review, then trust reviewed ids explicitly.");

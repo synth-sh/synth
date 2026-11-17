@@ -243,3 +243,45 @@ test "allowances stored before word prefixes keep covering what they did" {
     try expectCovers("find", "find", true);
     try expectCovers("find", "find .", false);
 }
+
+pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, target: []const u8, control_files: []const []const u8, hooks: @import("../core/hooks.zig").Set) !bool {
+    const Paths = @import("../core/paths.zig");
+    const lexical = try std.fs.path.resolve(arena, &.{ root, target });
+    const resolved = try Paths.resolve(io, arena, root, target);
+    for ([_][]const u8{ lexical, resolved }) |path| {
+        var parts = std.mem.tokenizeScalar(u8, path, '/');
+        var previous: []const u8 = "";
+        while (parts.next()) |part| {
+            if (std.mem.eql(u8, part, ".synth") or (std.mem.eql(u8, previous, ".git") and std.mem.eql(u8, part, "hooks"))) return true;
+            previous = part;
+        }
+    }
+    for (control_files) |file| {
+        if (try samePath(arena, io, root, file, lexical, resolved)) return true;
+    }
+    inline for (std.meta.fields(@import("../core/hooks.zig").Set)) |field| {
+        for (@field(hooks, field.name)) |hook| {
+            if (!hook.enabled or !hook.trusted) continue;
+            if (try samePath(arena, io, root, hook.source, lexical, resolved)) return true;
+            var words = safety.arguments(hook.command);
+            while (words.next()) |word| {
+                const candidate = std.mem.trim(u8, word, "\"'");
+                if (candidate.len == 0 or candidate[0] == '-') continue;
+                if (try samePath(arena, io, root, candidate, lexical, resolved)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn samePath(arena: std.mem.Allocator, io: std.Io, root: []const u8, file: []const u8, lexical: []const u8, resolved: []const u8) !bool {
+    if (file.len == 0) return false;
+    const Paths = @import("../core/paths.zig");
+    const named = std.fs.path.resolve(arena, &.{ root, file }) catch return false;
+    if (std.mem.eql(u8, named, lexical)) return true;
+    const actual = Paths.resolve(io, arena, root, file) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    return std.mem.eql(u8, actual, resolved);
+}

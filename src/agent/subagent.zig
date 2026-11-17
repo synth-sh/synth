@@ -236,6 +236,7 @@ pub const Runner = struct {
         child.loop.project = parent.project;
         child.loop.skills = parent.skills;
         child.loop.hooks = parent.hooks;
+        child.loop.control_files = parent.control_files;
         child.loop.backend = if (child.backend) |backend| &backend.backend else parent.backend;
         child.loop.model_policy = parent.model_policy;
         child.loop.system_prompt = parent.system_prompt;

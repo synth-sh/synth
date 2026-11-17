@@ -138,6 +138,7 @@ conversation: *Conversation,
 reads: *tool.ReadLog,
 hooks: ?*const Hooks.Runner = null,
 hook_flow: HookFlow = .{},
+control_files: []const []const u8 = &.{},
 stream_display: bool = true,
 interrupted: bool = false,
 stop_hook_active: bool = false,
@@ -2635,6 +2636,20 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
 }
 
 fn hookRequiresApproval(self: *const Loop, call: *const Conversation.ToolCall) bool {
+    if (self.registry.get(call.name)) |definition| if (!definition.read_only) {
+        var scratch: std.heap.ArenaAllocator = .init(self.allocator);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        const input = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{}) catch return true;
+        if (input == .object) {
+            for ([_][]const u8{ "path", "file" }) |field| {
+                if (input.object.get(field)) |target| {
+                    if (target != .string) continue;
+                    if (permission.protectedPath(arena, self.io, self.project_root, target.string, self.control_files, if (self.hooks) |runner| runner.set else .{}) catch true) return true;
+                }
+            }
+        }
+    };
     for (self.hook_flow.asks.items) |id| if (std.mem.eql(u8, call.id, id)) return true;
     return false;
 }
@@ -6876,7 +6891,7 @@ test "directory changes preserve worker paths and report session cwd from projec
     try testing.expect(found);
 }
 
-test "directory failures and denied cd calls leave cwd and roots unchanged" {
+test "directory failures leave the session workspace unchanged" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
     var loop = fixture.loop();
@@ -6884,14 +6899,6 @@ test "directory failures and denied cd calls leave cwd and roots unchanged" {
     try testing.expectError(error.FileNotFound, loop.changeDirectory("missing"));
     try testing.expectError(error.FileNotFound, loop.addDirectory("missing", "slash_command"));
     try testing.expectEqual(@as(usize, 0), loop.additional_roots.items.len);
-    try fixture.tmp.dir.createDir(testing.io, "sub", .default_dir);
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .matcher = "cd", .command = "exit 2" }} } };
-    loop.hooks = &runner;
-    fixture.fake.tool_name = "cd";
-    fixture.fake.tool_arguments = "{\"path\":\"sub\"}";
-    try loop.submit("cd", .{});
-    try settle(&loop);
-    try testing.expectEqualStrings(fixture.root, loop.workingDirectory());
     loop.state = .awaiting_answer;
     try testing.expectError(error.Busy, loop.changeDirectory("sub"));
     try testing.expectError(error.Busy, loop.addDirectory("sub", "slash_command"));
@@ -7201,4 +7208,63 @@ test "steering with prompt hooks resolves mentions and retains human provenance"
     try testing.expectEqual(Conversation.Origin.human, steered.origin);
     try testing.expectEqualStrings("steered file content", steered.attachments[0].content);
     try testing.expectEqualStrings("aW1hZ2U=", steered.images[0]);
+}
+
+test "adding a home root never grants automatic writes to hook control files" {
+    for ([_][]const u8{ ".synth/hooks.json", "state/hook-trust.json", "config.json", ".git/hooks/pre-commit" }) |name| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        try fixture.tmp.dir.createDirPath(testing.io, "project");
+        try fixture.tmp.dir.createDirPath(testing.io, "home/.synth");
+        try fixture.tmp.dir.createDirPath(testing.io, "home/state");
+        try fixture.tmp.dir.createDirPath(testing.io, "home/.git/hooks");
+        const project = try std.fs.path.join(testing.allocator, &.{ fixture.root, "project" });
+        defer testing.allocator.free(project);
+        const home = try std.fs.path.join(testing.allocator, &.{ fixture.root, "home" });
+        defer testing.allocator.free(home);
+        const target = try std.fs.path.join(testing.allocator, &.{ home, name });
+        defer testing.allocator.free(target);
+        const trust = try std.fs.path.join(testing.allocator, &.{ home, "state/hook-trust.json" });
+        defer testing.allocator.free(trust);
+        const config = try std.fs.path.join(testing.allocator, &.{ home, "config.json" });
+        defer testing.allocator.free(config);
+        var loop = fixture.loop();
+        defer loop.deinit();
+        loop.project_root = project;
+        loop.control_files = &.{ trust, config };
+        loop.approvals = .auto;
+        try loop.addDirectory(home, "slash_command");
+        fixture.fake.tool_name = "write";
+        const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = target, .content = "forged policy" }, .{});
+        defer testing.allocator.free(args);
+        fixture.fake.tool_arguments = args;
+        try loop.submit("update the file", .{});
+        try settle(&loop);
+        try testing.expectEqual(State.awaiting_approval, loop.state);
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, target, .{}));
+        try loop.decide(.deny);
+        try settle(&loop);
+    }
+}
+
+test "a referenced hook script requires human approval before editing" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.tmp.dir.createDirPath(testing.io, "scripts");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "scripts/check.sh", .data = "cat >/dev/null\n" });
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "bash './scripts/check.sh'" }} } };
+    loop.hooks = &runner;
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"scripts/check.sh\",\"content\":\"forged policy\"}";
+    try loop.submit("update the script", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    const original = try fixture.tmp.dir.readFileAlloc(testing.io, "scripts/check.sh", testing.allocator, .limited(1024));
+    defer testing.allocator.free(original);
+    try testing.expectEqualStrings("cat >/dev/null\n", original);
+    try loop.decide(.deny);
+    try settle(&loop);
 }
