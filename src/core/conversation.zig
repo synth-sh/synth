@@ -129,7 +129,7 @@ test "every tool call status is marked differently" {
     }
 }
 
-pub const Origin = enum { unknown, human, agent, tool, hook, harness };
+pub const Origin = enum { unknown, human, human_decision, agent, tool, hook, harness };
 
 pub const Message = struct {
     origin: Origin = .unknown,

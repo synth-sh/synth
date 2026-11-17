@@ -907,6 +907,10 @@ pub fn showReplacedTranscript(self: *Model) !void {
     self.rung_for = self.mirror.finishedTurns();
     self.scroll = 0;
     self.slash.skills = self.mirror.skills;
+    try self.refreshDirectory();
+}
+
+pub fn refreshDirectory(self: *Model) !void {
     const where = if (std.mem.eql(u8, self.mirror.host, remote_client.here))
         try homeRelative(self.allocator, if (self.environ) |env| env.get("HOME") else null, self.mirror.status.cwd)
     else

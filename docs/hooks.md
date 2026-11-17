@@ -64,7 +64,7 @@ Child inputs include parent agent and tool-call identifiers.
 | `SessionStart`, `UserPromptSubmit` | Supply context or block admission |
 | `UserPromptExpansion`, `ConfigChange`, `PreModelSwitch` | Reject the proposed operation |
 | `PreToolUse` | Reject, request approval, replace arguments, or supply context |
-| `PermissionEvaluate`, `PermissionRequest` | Evaluate a prepared action or its approval request |
+| `PermissionEvaluate`, `PermissionRequest` | Deny or request human approval for a prepared action |
 | `PostToolUse`, `PostToolUseFailure` | Successful results accept feedback/context; failures accept context/diagnostics |
 | `PostToolBatch` | Supply context or stop before the next model request |
 | `TaskCreated`, `TaskCompleted` | Reject a todo-list change |
@@ -109,8 +109,9 @@ spawn failures, and malformed synchronous policy outputs fail closed. Other
 nonzero command exits are advisory. Observational failures report diagnostics.
 
 Independent handler outputs merge in declaration order. Denial and explicit ask
-outweigh allowance; tool selections intersect; context edits append; later
-rewrites win. A denial cannot be reversed by another handler. Post-tool hooks
+remain binding; tool selections intersect; context edits append; later
+rewrites win. An `allow` output leaves normal approval policy unchanged; hooks
+cannot grant permission. A denial cannot be reversed by another handler. Post-tool hooks
 cannot undo side effects that already happened.
 
 ## Model requests

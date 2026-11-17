@@ -153,6 +153,7 @@ pub fn exportHookInput(self: *Loop, invocation: Hooks.Invocation) !Hooks.Invocat
     errdefer self.allocator.free(path);
     const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(self.io);
+    errdefer std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
     var buffer: [4096]u8 = undefined;
     var writer = file.writer(self.io, &buffer);
     for (self.conversation.messages.items) |message| {
@@ -160,7 +161,11 @@ pub fn exportHookInput(self: *Loop, invocation: Hooks.Invocation) !Hooks.Invocat
         try writer.interface.writeByte('\n');
     }
     try writer.interface.flush();
-    if (self.hook_flow.export_path) |old| self.allocator.free(old);
+    try runtime.registerSnapshot(path);
+    if (self.hook_flow.export_path) |old| {
+        runtime.releaseSnapshot(old);
+        self.allocator.free(old);
+    }
     self.hook_flow.export_path = path;
     input.transcript_path = path;
     return input;

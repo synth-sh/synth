@@ -237,6 +237,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             if (self.mirror.takeSwitched()) try self.showReplacedTranscript();
             try self.followSubagent();
             while (self.mirror.takeAnswer()) |answer| try commands.showAnswer(self, ctx, answer);
+            if (changes.directory) try self.refreshDirectory();
             if (changes.any) try commands.refreshMcpPicker(self);
             if (changes.transcript) {
                 widget_pool.pruneWidgets(self);

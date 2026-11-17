@@ -530,6 +530,7 @@ fn queue(self: *Mirror, inbound: *Inbound) void {
 pub const Changes = struct {
     /// Anything at all, worth drawing again.
     any: bool = false,
+    directory: bool = false,
     /// A message was added, changed or loaded in full.
     transcript: bool = false,
     /// A message was added at the end, or the transcript replaced: the view
@@ -770,6 +771,7 @@ fn resetStreams(self: *Mirror, request: ?u64) void {
 
 /// Copy a status into an arena of its own, so it outlives the message.
 fn keepStatus(self: *Mirror, status: synth.Status) !void {
+    self.changes.directory = self.changes.directory or !std.mem.eql(u8, self.status.cwd, status.cwd);
     _ = self.status_arena.reset(.retain_capacity);
     const arena = self.status_arena.allocator();
 
@@ -2145,13 +2147,13 @@ test "directory APIs and slash commands update session status without a model re
     defer mirror.close();
     const Ready = struct {
         fn sub(m: *Mirror) bool {
-            return !m.isBusy() and std.mem.endsWith(u8, m.status.cwd, "/sub");
+            return m.waiting.count() == 0 and !m.isBusy() and std.mem.endsWith(u8, m.status.cwd, "/sub");
         }
         fn extra(m: *Mirror) bool {
-            return !m.isBusy() and m.status.additional_roots.len == 1;
+            return m.waiting.count() == 0 and !m.isBusy() and m.status.additional_roots.len == 1;
         }
         fn primary(m: *Mirror) bool {
-            return !m.isBusy() and std.mem.eql(u8, m.status.cwd, m.status.project);
+            return m.waiting.count() == 0 and !m.isBusy() and std.mem.eql(u8, m.status.cwd, m.status.project);
         }
     };
     try mirror.changeDirectory("sub");
@@ -2166,5 +2168,12 @@ test "directory APIs and slash commands update session status without a model re
     try pollUntil(mirror, Ready.primary);
     try mirror.submit("/add-dir ../extra", .{});
     try pollUntil(mirror, Ready.extra);
+    try mirror.changeDirectory("missing-directory");
+    try pollUntil(mirror, Ready.primary);
+    try testing.expectEqual(@as(usize, 0), mirror.waiting.count());
+    try mirror.addDirectory("missing-directory");
+    try pollUntil(mirror, Ready.primary);
+    try testing.expectEqual(@as(usize, 0), mirror.waiting.count());
+    try testing.expect(mirror.notices.items.len >= 2);
     try testing.expectEqual(@as(usize, 0), convo.messages.items.len);
 }

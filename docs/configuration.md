@@ -25,7 +25,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See [MCP](mcp.md). |
-| `hooks` | object | none | 30 lifecycle events, with legacy command lists or grouped command/MCP handlers. Inline, user, and project sources are additive. Optional `when` filters select agent scope, request purpose, role, model, and provider. Every definition needs explicit trust; see [Hooks](hooks.md#targeted-routing). |
+| `hooks` | object | none | Lifecycle and request events, with legacy command lists or grouped command/MCP handlers. Inline, user, and project sources are additive. Optional `when` filters select agent scope, request purpose, role, model, and provider. Every definition needs explicit trust; see [Hooks](hooks.md#targeted-routing). |
 | `hook_timeout_ms` | integer | `30000` | Default hook timeout, 1–86,400,000 ms. A handler can override `timeout_ms`; shutdown/interruption cleanup is capped separately. |
 | `web` | object | none | Settings for the web tools. See below. |
 | `prune` | object | shed after 30 days | What a prune throws away. See [Pruning](#pruning). |

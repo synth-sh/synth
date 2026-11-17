@@ -8,6 +8,7 @@ const ansi = @import("ansi.zig");
 const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
 pub const default_timeout_ms: u64 = 30_000;
+pub const cleanup_timeout_ms: i64 = 3000;
 const posix_signals = switch (builtin.os.tag) {
     .windows, .wasi => false,
     else => true,
@@ -469,6 +470,7 @@ pub const Runtime = struct {
 
     temp_dir: ?[]u8 = null,
     temp_mutex: std.Io.Mutex = .init,
+    snapshots: std.StringHashMapUnmanaged(usize) = .empty,
 
     const Delivery = struct { agent_id: []u8, result: Result = .{} };
 
@@ -627,6 +629,30 @@ pub const Runtime = struct {
         }
         return result;
     }
+    pub fn registerSnapshot(self: *Runtime, path: []const u8) !void {
+        self.temp_mutex.lockUncancelable(self.io);
+        defer self.temp_mutex.unlock(self.io);
+        const key = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(key);
+        try self.snapshots.put(self.allocator, key, 1);
+    }
+    pub fn retainSnapshot(self: *Runtime, path: ?[]const u8) void {
+        const key = path orelse return;
+        self.temp_mutex.lockUncancelable(self.io);
+        defer self.temp_mutex.unlock(self.io);
+        if (self.snapshots.getPtr(key)) |refs| refs.* += 1;
+    }
+    pub fn releaseSnapshot(self: *Runtime, path: ?[]const u8) void {
+        const key = path orelse return;
+        self.temp_mutex.lockUncancelable(self.io);
+        defer self.temp_mutex.unlock(self.io);
+        const refs = self.snapshots.getPtr(key) orelse return;
+        refs.* -= 1;
+        if (refs.* != 0) return;
+        const removed = self.snapshots.fetchRemove(key).?;
+        std.Io.Dir.cwd().deleteFile(self.io, key) catch {};
+        self.allocator.free(removed.key);
+    }
     pub fn privatePath(self: *Runtime, allocator: std.mem.Allocator, extension: []const u8) ![]u8 {
         self.temp_mutex.lockUncancelable(self.io);
         defer self.temp_mutex.unlock(self.io);
@@ -683,6 +709,9 @@ pub const Runtime = struct {
         self.deliveries = .empty;
         self.background = .empty;
         self.pending.deinit(self.allocator);
+        var snapshots = self.snapshots.keyIterator();
+        while (snapshots.next()) |key| self.allocator.free(key.*);
+        self.snapshots.deinit(self.allocator);
         if (self.temp_dir) |path| {
             std.Io.Dir.cwd().deleteTree(self.io, path) catch {};
             self.allocator.free(path);
@@ -711,6 +740,8 @@ const Job = struct {
             allocator.destroy(self);
         }
         self.invocation = try invocation.dupe(self.arena.allocator());
+        if (runner.runtime) |runtime| runtime.retainSnapshot(self.invocation.transcript_path);
+        errdefer if (runner.runtime) |runtime| runtime.releaseSnapshot(self.invocation.transcript_path);
         self.future = try runner.io.concurrent(run, .{self});
         return self;
     }
@@ -730,6 +761,7 @@ const Job = struct {
     }
     fn destroy(self: *Job) void {
         if (!self.joined) self.future.cancel(self.runner.io);
+        if (self.runner.runtime) |runtime| runtime.releaseSnapshot(self.invocation.transcript_path);
         self.arena.deinit();
         self.allocator.destroy(self);
     }
@@ -1234,6 +1266,8 @@ pub const Dispatch = struct {
         errdefer self.arena.deinit();
         self.invocation = try invocation.dupe(self.arena.allocator());
         self.runner.stop = &self.stop;
+        if (runner.runtime) |runtime| runtime.retainSnapshot(self.invocation.transcript_path);
+        errdefer if (runner.runtime) |runtime| runtime.releaseSnapshot(self.invocation.transcript_path);
         self.future = try runner.io.concurrent(run, .{self});
         return self;
     }
@@ -1274,6 +1308,7 @@ pub const Dispatch = struct {
         const allocator = self.allocator;
         if (self.blocked) |blocked| allocator.free(blocked);
         self.result.deinit(allocator);
+        if (self.runner.runtime) |runtime| runtime.releaseSnapshot(self.invocation.transcript_path);
         self.arena.deinit();
         allocator.destroy(self);
     }
@@ -1577,7 +1612,7 @@ test "grouped hooks run despite denial and apply rewrites in declaration order" 
     try std.testing.expectEqualStrings("{\"command\":\"last\"}", result.replacement.?);
 }
 
-test "grouped matcher aliases and alternation invoke a handler once" {
+test "grouped matcher accepts aliases and alternation" {
     const a = std.testing.allocator;
     const hook: Hook = .{ .legacy = false, .matcher = "^(Bash|bash|Edit)$", .command = "true" };
     try std.testing.expect(try hookMatches(a, hook, .{ .event = .pre_tool_use, .tool_name = "bash" }));
@@ -1993,4 +2028,31 @@ test "background saturation rejects excess work without waiting for long command
     const started = std.Io.Clock.now(.awake, std.testing.io).toMilliseconds();
     try std.testing.expectError(error.BackgroundHookLimit, runner.evaluate(a, .{ .event = .pre_tool_use }));
     try std.testing.expect(std.Io.Clock.now(.awake, std.testing.io).toMilliseconds() - started < 1000);
+}
+
+test "a transcript snapshot survives its owner until the last hook reader finishes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
+    defer runtime.deinit();
+    const path = try runtime.privatePath(a, "jsonl");
+    defer a.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "original transcript" });
+    try runtime.registerSnapshot(path);
+    const command = try std.fmt.allocPrint(a, "cat '{s}' > observed", .{path});
+    defer a.free(command);
+    const runner: Runner = .{ .io = std.testing.io, .root = root, .runtime = &runtime, .set = .{ .pre_tool_use = &.{.{ .command = command }} } };
+    const dispatch = try Dispatch.start(a, runner, .{ .event = .pre_tool_use, .transcript_path = path });
+    runtime.releaseSnapshot(path);
+    dispatch.join();
+    const observed = try tmp.dir.readFileAlloc(std.testing.io, "observed", a, .limited(1024));
+    defer a.free(observed);
+    try std.testing.expectEqualStrings("original transcript", observed);
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+    file.close(std.testing.io);
+    dispatch.destroy();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, path, .{}));
 }

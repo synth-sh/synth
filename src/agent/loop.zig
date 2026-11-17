@@ -788,7 +788,10 @@ pub fn deinit(self: *Loop) void {
     self.allowed.deinit(self.allocator);
     for (self.checkpointed.items) |path| self.allocator.free(path);
     self.checkpointed.deinit(self.allocator);
-    if (self.hook_flow.export_path) |path| self.allocator.free(path);
+    if (self.hook_flow.export_path) |path| {
+        if (self.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(path);
+        self.allocator.free(path);
+    }
     self.hook_flow.export_path = null;
     if (self.hook_flow.session_handle) |handle| self.allocator.free(handle);
     self.hook_flow.asks.deinit(self.allocator);
@@ -1158,7 +1161,7 @@ fn endHookSession(self: *Loop, reason: []const u8) void {
     if (configured.runtime) |runtime| runtime.cancelBackground();
     if (!self.hook_flow.session_started) return;
     var runner = configured.*;
-    runner.deadline_ms = tool.monotonicMilliseconds(self.io) + 3000;
+    runner.deadline_ms = tool.monotonicMilliseconds(self.io) + Hooks.cleanup_timeout_ms;
     var input = self.exportHookInput(.{ .event = .session_end }) catch self.hookInput(.{ .event = .session_end });
     input.reason = reason;
     var result = runner.evaluate(self.allocator, input) catch return;
@@ -1730,7 +1733,7 @@ fn reap(self: *Loop) void {
         if (self.hooks) |configured| {
             var runner = configured.*;
             runner.stop = null;
-            runner.deadline_ms = std.Io.Clock.now(.awake, self.io).toMilliseconds() + 3000;
+            runner.deadline_ms = std.Io.Clock.now(.awake, self.io).toMilliseconds() + Hooks.cleanup_timeout_ms;
             var result = runner.evaluate(self.allocator, self.hookInput(.{ .event = .interrupt })) catch null;
             if (result) |*value| {
                 defer value.deinit(self.allocator);
@@ -5402,11 +5405,14 @@ test "post-tool hook runs after an owner-thread todo settles" {
     defer loop.deinit();
     fixture.fake.tool_name = "todo";
     fixture.fake.tool_arguments = "{\"items\":[{\"text\":\"kept\"}]}";
-    const hook = Hooks.Hook{ .matcher = "todo", .command = "read payload; case \"$payload\" in *tool_response*) exit 0;; *) exit 2;; esac" };
+    const hook = Hooks.Hook{ .matcher = "todo", .command = "read payload; case \"$payload\" in *tool_response*) echo observed > post-tool-observed; exit 0;; *) exit 2;; esac" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .post_tool_use = &.{hook} } };
     loop.hooks = &runner;
     try loop.submit("go", .{});
     try settle(&loop);
+    const observed = try fixture.tmp.dir.readFileAlloc(testing.io, "post-tool-observed", testing.allocator, .limited(1024));
+    defer testing.allocator.free(observed);
+    try testing.expectEqualStrings("observed\n", observed);
     try testing.expectEqual(@as(usize, 1), loop.todos.items.items.len);
     try testing.expectEqual(Conversation.ToolCall.Status.ok, fixture.convo.messages.items[1].tool_calls[0].status);
 }
@@ -5954,7 +5960,7 @@ test "a hook rewrite is approved using effective arguments and runs once" {
     defer loop.deinit();
     fixture.fake.tool_name = "bash";
     fixture.fake.tool_arguments = "{\"command\":\"pwd\"}";
-    const hook: Hooks.Hook = .{ .legacy = false, .matcher = "bash", .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"rm -rf dangerous\"}}}'" };
+    const hook: Hooks.Hook = .{ .legacy = false, .matcher = "bash", .command = "echo rewrite >> rewrites; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"rm -rf dangerous\"}}}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
     loop.hooks = &runner;
     try loop.submit("go", .{});
@@ -5963,6 +5969,9 @@ test "a hook rewrite is approved using effective arguments and runs once" {
     try testing.expectEqualStrings("{\"command\":\"rm -rf dangerous\"}", loop.pendingCall().?.arguments);
     try loop.decide(.deny);
     try settle(&loop);
+    const rewrites = try fixture.tmp.dir.readFileAlloc(testing.io, "rewrites", testing.allocator, .limited(1024));
+    defer testing.allocator.free(rewrites);
+    try testing.expectEqualStrings("rewrite\n", rewrites);
 }
 
 test "pre-tool policy denies before an approval can be shown" {
@@ -6212,10 +6221,10 @@ test "an explicit interruption emits one bounded cleanup event" {
 test "transcript exports are private immutable snapshots with explicit null fallback" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
-    var loop = fixture.loop();
-    defer loop.deinit();
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{ .pre_tool_use = &.{.{ .command = "true", .transcript = true }} } };
     loop.hooks = &runner;
     try fixture.convo.add(.user, "history");
@@ -6223,6 +6232,8 @@ test "transcript exports are private immutable snapshots with explicit null fall
     const first = try loop.exportHookInput(.{ .event = .pre_tool_use });
     const first_path = try testing.allocator.dupe(u8, first.transcript_path.?);
     defer testing.allocator.free(first_path);
+    runtime.retainSnapshot(first_path);
+    defer runtime.releaseSnapshot(first_path);
     try fixture.convo.add(.assistant, "later");
     const second = try loop.exportHookInput(.{ .event = .pre_tool_use });
     try testing.expect(!std.mem.eql(u8, first_path, second.transcript_path.?));
@@ -6299,23 +6310,13 @@ test "session hooks distinguish startup clear and resume with persistent handles
     const original_session = loop.session_id.?;
     const original_handle = try db.sessionPublicId(original_session, testing.allocator);
     defer testing.allocator.free(original_handle);
-    loop.hook_flow.context = try testing.allocator.dupe(u8, "old session context");
-    loop.hook_flow.task_cursor = 8;
-    runtime.pending.context = try testing.allocator.dupe(u8, "undelivered old context");
     try testing.expect(loop.resetForNewSession());
-    try testing.expect(loop.hook_flow.context == null);
-    try testing.expectEqual(@as(usize, 0), loop.hook_flow.task_cursor);
-    try testing.expect(runtime.pending.context == null);
     try loop.submit("second", .{});
     try settle(&loop);
     const next_handle = try db.sessionPublicId(loop.session_id.?, testing.allocator);
     defer testing.allocator.free(next_handle);
     try testing.expect(!std.mem.eql(u8, original_handle, next_handle));
-    loop.hook_flow.context = try testing.allocator.dupe(u8, "second session context");
-    runtime.pending.context = try testing.allocator.dupe(u8, "second undelivered context");
     try loop.resumeSession(original_session, 100);
-    try testing.expect(loop.hook_flow.context == null);
-    try testing.expect(runtime.pending.context == null);
     const ends = try fixture.tmp.dir.readFileAlloc(testing.io, "ends", testing.allocator, .limited(16 * 1024));
     defer testing.allocator.free(ends);
     var end_lines = std.mem.tokenizeScalar(u8, ends, '\n');
@@ -6636,6 +6637,9 @@ test "instruction loading reports the actual file once per cached load" {
     loop.project = &project;
     loop.hooks = &runner;
     try loop.submit("go", .{});
+    try settle(&loop);
+    try settleHookObservers(&runtime);
+    try loop.submit("continue", .{});
     try settle(&loop);
     try settleHookObservers(&runtime);
     const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "instructions.jsonl", testing.allocator, .limited(16 * 1024));

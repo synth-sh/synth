@@ -411,11 +411,17 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         return connection.reply(id, files);
     } else if (eql(u8, method, m.change_directory)) {
         const asked = try rpc.parse(synth.Directory, arena, params);
-        session.stack.loop.changeDirectory(asked.path) catch |err| return self.noticeFmt(.warning, "Cannot change directory to {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
+        session.stack.loop.changeDirectory(asked.path) catch |err| {
+            self.noticeFmt(.warning, "Cannot change directory to {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
+            return err;
+        };
         try session.publish(arena, true);
     } else if (eql(u8, method, m.add_directory)) {
         const asked = try rpc.parse(synth.Directory, arena, params);
-        session.stack.loop.addDirectory(asked.path, "slash_command") catch |err| return self.noticeFmt(.warning, "Cannot add directory {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
+        session.stack.loop.addDirectory(asked.path, "slash_command") catch |err| {
+            self.noticeFmt(.warning, "Cannot add directory {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
+            return err;
+        };
         try session.publish(arena, true);
     } else if (eql(u8, method, m.hooks)) {
         const asked = try rpc.parse(synth.Hooks, arena, params);
@@ -1633,9 +1639,10 @@ const Session = struct {
     }
 
     fn notice(self: *Session, severity: protocol.Severity, comptime fmt: []const u8, args: anytype) void {
-        self.agent.noticeFmt(severity, fmt, args);
-        var buffer: [512]u8 = undefined;
-        self.stack.loop.notifyHook("notice", std.fmt.bufPrint(&buffer, fmt, args) catch fmt);
+        const text = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        defer self.allocator.free(text);
+        self.agent.notice(severity, text);
+        self.stack.loop.notifyHook("notice", text);
     }
 
     /// Advance the session, and do what a TUI's tick does for a local one:
@@ -3797,4 +3804,20 @@ test "session list cursors page through equal timestamps and stay within their p
     const remaining = try client.request(protocol.method.session_list, protocol.ListSessions{ .cursor = global.nextCursor.? });
     const global_tail = try rpc.parse(protocol.SessionList, arena, try client.expectResult(remaining));
     try testing.expectEqual(@as(usize, 4), global_tail.sessions.len);
+}
+
+test "session notices preserve formatted text beyond the small notice buffer" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    _ = try client.expectResult(try client.request(protocol.method.initialize, protocol.Initialize{
+        .protocolVersion = protocol.version,
+        .clientCapabilities = .{ .session = .{ .notices = .{} } },
+    }));
+    _ = try client.expectResult(try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project }));
+    const path = "a" ** 1024;
+    fixture.agent.session.?.notice(.info, "Working directory: {s}", .{path});
+    const update = try client.awaitUpdate("notice");
+    try testing.expectEqualStrings("Working directory: " ++ path, update.get("title").?.string);
 }

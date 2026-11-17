@@ -474,6 +474,10 @@ fn isChatModel(id: []const u8) bool {
 /// the reason a request 404s.
 fn endpoint(self: *const OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     const base = std.mem.trimEnd(u8, self.host, "/");
+    if (self.versioned_paths and std.mem.startsWith(u8, path, "/v1/")) {
+        const root = if (std.mem.endsWith(u8, base, "/v1")) base[0 .. base.len - 3] else base;
+        return std.fmt.allocPrint(arena, "{s}{s}", .{ root, path });
+    }
     if (!self.versioned_paths or std.mem.endsWith(u8, base, "/v1")) {
         return std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });
     }
@@ -1461,6 +1465,15 @@ test "a host is completed to an API root however it was written" {
             .model = "gpt-4o",
         };
         try testing.expectEqualStrings(case.want, try backend.endpoint(arena, "/models"));
+    }
+}
+
+test "versioned Messages routes append the version once" {
+    for ([_][]const u8{ "http://localhost:1234", "http://localhost:1234/", "http://localhost:1234/v1", "http://localhost:1234/v1/" }) |host| {
+        const backend: OpenAIProvider = .{ .allocator = testing.allocator, .io = testing.io, .host = host, .model = "model" };
+        const url = try backend.endpoint(testing.allocator, Wire.messages.path());
+        defer testing.allocator.free(url);
+        try testing.expectEqualStrings("http://localhost:1234/v1/messages", url);
     }
 }
 

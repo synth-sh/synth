@@ -24,7 +24,7 @@ pub fn record(self: *Intent, a: std.mem.Allocator, text: []const u8, decision: b
     while (length > 0 and length < text.len and text[length] & 0xc0 == 0x80) length -= 1;
     const body = try a.dupe(u8, text[0..length]);
     errdefer a.free(body);
-    try messages.append(a, .{ .role = .user, .origin = .human, .text = body });
+    try messages.append(a, .{ .role = .user, .origin = if (decision) .human_decision else .human, .text = body });
     var size: usize = 0;
     for (messages.items) |message| size += message.text.len;
     while (size > limit or messages.items.len > max_messages) {

@@ -794,6 +794,7 @@ const Fake = struct {
     /// Time spent in a busy loop rather than a sleep, so the worker is deaf to
     /// both the stop flag and the signal. Stands in for a blocked socket read.
     deaf_ms: u64 = 0,
+    expected_context: ?[]const u8 = null,
 
     const Provider = @import("../provider/provider.zig");
 
@@ -809,12 +810,19 @@ const Fake = struct {
 
     fn respond(
         ptr: *anyopaque,
-        _: *Conversation,
+        convo: *Conversation,
         _: Provider.Turn,
         allocator: std.mem.Allocator,
         _: ?Provider.Sink,
     ) anyerror!Provider.Reply {
         const self: *Fake = @ptrCast(@alignCast(ptr));
+        if (self.expected_context) |expected| {
+            var found = false;
+            for (convo.messages.items) |message| {
+                if (message.origin == .hook and std.mem.indexOf(u8, message.text, expected) != null) found = true;
+            }
+            try testing.expect(found);
+        }
         if (self.deaf_ms > 0) {
             const until = tool.monotonicMilliseconds(testing.io) + @as(i64, @intCast(self.deaf_ms));
             while (tool.monotonicMilliseconds(testing.io) < until) {}
@@ -893,6 +901,7 @@ test "subagent lifecycle context and continuation retain child identity" {
     const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .subagent_start = &.{start_hook}, .subagent_stop = &.{stop_hook} } };
     harness.parent.hooks = &runner;
     harness.fake.script = &.{.{ .text = "done" }};
+    harness.fake.expected_context = "child context";
     const answer = try runTask(harness, .{ .agent = "task", .prompt = "check" });
     defer testing.allocator.free(answer);
     try testing.expectEqualStrings("done", answer);

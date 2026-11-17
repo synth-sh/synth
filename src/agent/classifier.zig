@@ -28,8 +28,6 @@ pub const Verdict = union(enum) {
     unclear,
 };
 
-/// The most of the person's messages shown, newest kept.
-const max_intent_bytes = 12 * 1024;
 /// The most of the agent's earlier calls shown, newest kept.
 const max_history_calls = 40;
 /// How much of one call's arguments is shown.
@@ -109,25 +107,21 @@ pub fn material(
     try out.appendSlice(arena, "\n\n");
 
     try out.appendSlice(arena, "What the person asked for, oldest first:\n");
-    var first: usize = intent.len;
-    var used: usize = 0;
-    while (first > 0) {
-        const msg = intent[first - 1];
-        if (msg.role != .user or msg.origin != .human) {
-            first -= 1;
-            continue;
-        }
-        if (used + msg.text.len > max_intent_bytes and used > 0) break;
-        used += msg.text.len;
-        first -= 1;
-    }
-    for (intent[first..]) |msg| {
+    for (intent) |msg| {
         if (msg.role != .user or msg.origin != .human) continue;
         const text = std.mem.trim(u8, msg.text, " \t\r\n");
         if (text.len == 0) continue;
         try out.appendSlice(arena, "<person>\n");
-        try writeEscaped(arena, &out, tail(text, max_intent_bytes));
+        try writeEscaped(arena, &out, text);
         try out.appendSlice(arena, "\n</person>\n");
+    }
+
+    try out.appendSlice(arena, "\nHuman decisions about earlier actions (not new task instructions):\n");
+    for (intent) |msg| {
+        if (msg.origin != .human_decision) continue;
+        try out.appendSlice(arena, "<decision>\n");
+        try writeEscaped(arena, &out, msg.text);
+        try out.appendSlice(arena, "\n</decision>\n");
     }
 
     try out.appendSlice(arena, "\nActions the agent already took, oldest first:\n");
@@ -266,4 +260,22 @@ test "a verdict is read from either stage's answer" {
     try testing.expectEqualStrings("force pushing rewrites the remote branch; push without --force", blocked.block);
     try testing.expectEqual(Verdict.unclear, verdict(.careful, "I would block this."));
     try testing.expectEqual(Verdict.allow, verdict(.careful, "VERDICT: BLOCK would be wrong here.\n\nVERDICT: ALLOW"));
+}
+
+test "human request restrictions survive decision receipts" {
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    var intent: @import("../core/human_intent.zig") = .{};
+    defer intent.deinit(a);
+    const request = try a.alloc(u8, 11 * 1024);
+    defer a.free(request);
+    @memset(request, 'x');
+    const restriction = "inspect only; do not upload";
+    @memcpy(request[0..restriction.len], restriction);
+    try intent.record(a, request, false);
+    for (0..20) |_| try intent.record(a, "human denied this action; no wider authorization", true);
+    const text = try material(arena.allocator(), "/repo", try intent.view(arena.allocator()), &.{}, .{ .id = "call", .name = "bash", .arguments = "{}" });
+    try std.testing.expect(std.mem.indexOf(u8, text, restriction) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<decision>") != null);
 }

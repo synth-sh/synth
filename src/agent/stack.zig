@@ -250,7 +250,7 @@ pub fn destroy(self: *Stack) void {
     self.runner.deinit();
     self.hook_runtime.cancelBackground();
     var end_runner = self.hooks;
-    end_runner.deadline_ms = std.Io.Clock.now(.awake, self.hooks.io).toMilliseconds() + 3000;
+    end_runner.deadline_ms = std.Io.Clock.now(.awake, self.hooks.io).toMilliseconds() + Hooks.cleanup_timeout_ms;
     var end_result = end_runner.evaluate(self.allocator, end_input) catch null;
     if (end_result) |*result| result.deinit(self.allocator);
     self.hook_runtime.deinit();

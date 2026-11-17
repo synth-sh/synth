@@ -28,7 +28,7 @@ def tool(name, arguments):
 
 
 @contextlib.contextmanager
-def session(name, respond, logic="", events=(), protocol="chat", attempts=2, extra_hooks=None, trust=True):
+def session(name, respond, logic="", events=(), protocol="chat", attempts=2, extra_hooks=None, trust=True, route_policy=True):
     requests = []
     errors = []
 
@@ -41,15 +41,27 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             pass
 
         def do_GET(self):
-            assert self.path.endswith('/api/ps') and '/forbidden/' not in self.path, self.path
-            body = b'{"models":[]}'
+            assert self.path.endswith('/api/ps') or self.path == '/agent/v1/models', self.path
+            body = json.dumps({'data': [{'id': 'agent-model'}]} if self.path.endswith('/models') else {'models': []}).encode()
             self.send_response(200)
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
         def do_POST(self):
+            if self.path.endswith("/api/show"):
+                value = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                assert value["model"] in ("agent-model", "selected-model")
+                body = json.dumps({"capabilities": ["completion", "tools"], "model_info": {"llama.context_length": 16384}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             packet = {"path": self.path, "headers": dict(self.headers), "raw_headers": list(self.headers.items()), "body": json.loads(self.rfile.read(int(self.headers["Content-Length"])))}
+            suffix = "/api/chat" if protocol == "ollama" else "/v1/messages" if protocol == "messages" else "/v1/responses" if protocol == "responses" else "/v1/chat/completions"
+            assert self.path in ("/agent" + suffix, "/selected" + suffix, "/review/v1/chat/completions"), self.path
+            if protocol == "ollama": assert packet["body"].get("think") is not True
             requests.append(packet)
             status, value, content_type = respond(packet, requests)
             body = value.encode() if isinstance(value, str) else json.dumps(value).encode()
@@ -71,7 +83,9 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             (root / "seed.txt").write_text("seed data")
             url = f"http://127.0.0.1:{server.server_port}"
             routes = [{"id": identifier, "provider": "ollama" if protocol == "ollama" and identifier != "review" else "openai", "endpoint": f"{url}/{identifier}" + ("" if protocol == "ollama" and identifier != "review" else "/v1"), "model": f"{identifier}-model", "protocol": "chat" if protocol == "ollama" or identifier == "review" else protocol, "context_limit": 16384, "api_key": f"{identifier}-secret", "purposes": ["approval_judge"] if identifier == "review" else ["agent", "compaction"], "settings": {"attempts": attempts, "retry_delay_ms": 0}} for identifier in ("agent", "selected", "review")]
-            config = {"think": False, "approvals": "auto", "auto_approve_safe_commands": False, "skill_paths": [], "model_requests": {"restrict_routes": True, "agent": "agent", "approval_judge": "review", "compaction": "agent", "reviewer_fallback": "deny", "reviewer_timeout_ms": 2000, "routes": routes}}
+            config = {"think": protocol == "ollama", "approvals": "auto", "auto_approve_safe_commands": False, "skill_paths": [], "model_requests": {"restrict_routes": True, "agent": "agent", "approval_judge": "review", "compaction": "agent", "reviewer_fallback": "deny", "reviewer_timeout_ms": 2000, "routes": routes}}
+            if not route_policy:
+                config.pop('model_requests')
             (root / "config.json").write_text(json.dumps(config))
             (root / "adapter.py").write_text("import json,sys\ndef fail(kind,value,tb):\n import traceback; traceback.print_exception(kind,value,tb); sys.exit(2)\nsys.excepthook=fail\np=json.load(sys.stdin)\ne=p['hook_event_name']\nwith open('events.jsonl','a') as f: f.write(json.dumps(p)+'\\n')\nout={}\n" + logic + "\nprint(json.dumps({'hookSpecificOutput':{'hookEventName':e,**out}}))\n")
             command = f"python3 {shlex.quote(str(root / 'adapter.py'))}"
@@ -80,6 +94,8 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
                 hooks.update(extra_hooks(command))
             (root / ".synth/hooks.json").write_text(json.dumps(hooks))
             env = dict(os.environ, HOME=str(root / "home"), XDG_DATA_HOME=str(root / "private"), SYNTH_PROVIDER="openai-compat", OPENAI_BASE_URL=f"{url}/forbidden/v1", OPENAI_API_KEY="must-not-forward", SYNTH_DB=str(root / "session.db"))
+            if not route_policy:
+                env['OPENAI_BASE_URL'] = f'{url}/agent/v1'
             env.pop("SYNTH_DEBUG_LOG", None)
 
             def run(*args):
@@ -231,7 +247,15 @@ if e=='ModelRetry':
     with session('single-attempt-repair', compatibility_repair, attempts=1) as (_, result, requests, _):
         expect(result, 'repaired')
         assert len(requests) == 2
-    print('PASS compatibility retry metadata/veto and bounded oversized Ollama error handling')
+    def learned_compatibility(packet, requests):
+        if len(requests) == 1:
+            return 400, {'error': {'message': 'unsupported stream_options'}}, 'application/json'
+        assert 'stream_options' not in packet['body']
+        return chat() if any(m['role'] == 'tool' for m in packet['body']['messages']) else chat('', tool('read', {'path': 'seed.txt'}))
+    with session('learned-compatibility', learned_compatibility, route_policy=False) as (_, result, requests, _):
+        assert result.returncode == 0, result.stderr
+        assert len(requests) == 3, requests
+    print('PASS compatibility retry metadata/veto, learned transport capabilities, and bounded oversized Ollama error handling')
 
     def proposed(packet, _):
         if '/review/' in packet['path']:

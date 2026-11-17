@@ -169,6 +169,12 @@ pub fn start(
 
     for (self.reporters, 0..) |*reporter, at| reporter.* = .{ .run = self, .index = at };
 
+    if (self.hooks) |runner| if (runner.runtime) |runtime| {
+        for (self.calls) |call| runtime.retainSnapshot(call.hook_input.transcript_path);
+    };
+    errdefer if (self.hooks) |runner| if (runner.runtime) |runtime| {
+        for (self.calls) |call| runtime.releaseSnapshot(call.hook_input.transcript_path);
+    };
     self.future = try io.concurrent(run, .{self});
     return self;
 }
@@ -227,6 +233,7 @@ pub fn join(self: *ToolRun) void {
 pub fn destroy(self: *ToolRun) void {
     const allocator = self.allocator;
     for (self.calls) |call| {
+        if (self.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(call.hook_input.transcript_path);
         allocator.free(call.name);
         allocator.free(call.arguments);
     }

@@ -171,8 +171,8 @@ pub const Spawned = struct {
                 if (route.context_limit > 0) client.context_limit = route.context_limit;
             },
             .ollama => |*client| {
-                try client.startWithoutProbe();
-                client.context_limit = route.context_limit;
+                try client.start();
+                if (route.context_limit > 0) client.context_limit = route.context_limit;
             },
             else => unreachable,
         }
@@ -242,6 +242,23 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
         .copilot => |*client| try client.startLike(&self.client.copilot),
     }
     return child;
+}
+
+pub fn rememberTransport(self: *Backend, child: *const Spawned) void {
+    switch (self.client) {
+        .openai => |*parent| {
+            if (child.backend.client != .openai) return;
+            const learned = &child.backend.client.openai;
+            const same_target = std.mem.eql(u8, parent.host, learned.host) and std.mem.eql(u8, parent.model, learned.model) and parent.wire == learned.wire;
+            if (same_target) parent.send_stream_options = parent.send_stream_options and learned.send_stream_options;
+        },
+        .copilot => |*parent| {
+            if (child.backend.client != .copilot) return;
+            const learned = &child.backend.client.copilot;
+            if (parent.started and learned.started and std.mem.eql(u8, parent.model, learned.model)) parent.inner.send_stream_options = parent.inner.send_stream_options and learned.inner.send_stream_options;
+        },
+        else => {},
+    }
 }
 
 /// The host this is pointed at, which a runtime connect may have replaced.

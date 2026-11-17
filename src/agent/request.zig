@@ -69,6 +69,7 @@ pub fn start(
         .provider = provider,
         .conversation = conversation,
         .turn = .{
+            .backend = turn.backend,
             .model_policy = turn.model_policy,
             .settings = turn.settings,
             .system = try allocator.dupe(u8, turn.system),
@@ -104,6 +105,8 @@ pub fn start(
     self.turn.attempts = &self.attempt_number;
     self.turn.stop = &self.stop;
     self.display_id_len = (try std.fmt.bufPrint(&self.display_id, "{s}-{d}", .{ turn.hook_input.agent_id, turn.hook_input.request_id })).len;
+    if (self.turn.hooks) |runner| if (runner.runtime) |runtime| runtime.retainSnapshot(self.turn.hook_input.transcript_path);
+    errdefer if (self.turn.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(self.turn.hook_input.transcript_path);
     self.future = try io.concurrent(run, .{self});
     return self;
 }
@@ -139,6 +142,7 @@ pub fn join(self: *Request) void {
     if (self.reaped) return;
     self.reaped = true;
     self.future.await(self.io);
+    if (self.turn.backend) |backend| if (self.owned_backend) |child| backend.rememberTransport(child);
 }
 
 /// Interrupt the turn and wait for it to unwind.
@@ -159,6 +163,7 @@ pub fn destroy(self: *Request) void {
     self.content.deinit();
     self.display_pending.deinit(allocator);
     if (self.reply) |*reply| reply.deinit(allocator);
+    if (self.turn.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(self.turn.hook_input.transcript_path);
     self.freeTurn();
     if (self.prepared_conversation) |*convo| convo.deinit();
     if (self.owned_backend) |owned| owned.deinit();
@@ -446,6 +451,7 @@ test "request settings and retry hooks enforce bounds before transport" {
         fn respond(_: *anyopaque, _: *Conversation, turn: Provider.Turn, _: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
             try std.testing.expectEqual(@as(?f32, 0.25), turn.settings.temperature);
             try std.testing.expectEqual(@as(?u32, 128), turn.settings.max_output_tokens);
+            try std.testing.expectEqual(@as(?u8, 2), turn.settings.attempts);
             try std.testing.expectEqual(@as(?u64, 7), sink.?.retryDecision(.{ .attempt = 1, .allowed = true, .delay_ms = 500 }));
             return .{};
         }
