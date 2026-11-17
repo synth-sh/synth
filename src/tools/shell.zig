@@ -22,7 +22,7 @@ const poll_slice_ms: u64 = 100;
 pub const all: []const tool.Tool = &.{
     .{
         .name = "bash",
-        .description = "Run a shell command from the session working directory and return its output. Use the cd tool for a persistent directory change.",
+        .description = "Run a shell command from the session working directory and return its output. Use cd within a command to run it from another directory.",
         .schema =
         \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
         ,

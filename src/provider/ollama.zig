@@ -1167,7 +1167,7 @@ test "an error body is reduced to the sentence the server wrote" {
         ),
     );
 
-    try testing.expectEqualStrings("502 Bad Guardway", complaint(testing.allocator, "  502 Bad Guardway\n"));
+    try testing.expectEqualStrings("502 Bad Gateway", complaint(testing.allocator, "  502 Bad Gateway\n"));
     try testing.expectEqualStrings("{\"detail\":\"nope\"}", complaint(testing.allocator, "{\"detail\":\"nope\"}"));
     try testing.expectEqualStrings("", complaint(testing.allocator, "   \n"));
 }

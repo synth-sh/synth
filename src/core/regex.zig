@@ -163,7 +163,7 @@ pub const Regex = struct {
                 c;
             hit = swapped != c and class.contains(swapped);
         }
-        return hit != class.nechecked;
+        return hit != class.negated;
     }
 };
 
@@ -181,7 +181,7 @@ fn isWord(c: u8) bool {
 const Range = struct { lo: u8, hi: u8 };
 
 const Class = struct {
-    nechecked: bool,
+    negated: bool,
     ranges: []const Range,
 
     /// Membership before negation, which the caller applies: `[^a]` still must
@@ -413,14 +413,14 @@ const Parser = struct {
         };
     }
 
-    fn shorthand(self: *Parser, ranges: []const Range, nechecked: bool) Error!Node {
-        try self.classes.append(self.arena, .{ .nechecked = nechecked, .ranges = ranges });
+    fn shorthand(self: *Parser, ranges: []const Range, negated: bool) Error!Node {
+        try self.classes.append(self.arena, .{ .negated = negated, .ranges = ranges });
         return .{ .class = self.classes.items.len - 1 };
     }
 
     fn parseClass(self: *Parser) Error!Node {
         self.at += 1;
-        const nechecked = self.eat('^');
+        const negated = self.eat('^');
 
         var ranges: std.ArrayList(Range) = .empty;
         var first = true;
@@ -468,7 +468,7 @@ const Parser = struct {
         }
 
         try self.classes.append(self.arena, .{
-            .nechecked = nechecked,
+            .negated = negated,
             .ranges = try ranges.toOwnedSlice(self.arena),
         });
         return .{ .class = self.classes.items.len - 1 };

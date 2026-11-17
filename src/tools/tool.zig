@@ -16,7 +16,7 @@ pub const Context = struct {
     reads: *ReadLog,
     /// How a tool starts a nested agent. Null where there is no loop behind the
     /// call - a test, a one-off run - and the tool that needs it says so rather
-    /// than pretending to have delechecked.
+    /// than pretending to have delegated.
     delegate: ?Delegate = null,
     /// Set when the caller has given up on this batch of calls. A tool that
     /// runs long must check it, or cancelling a turn waits for the tool rather
