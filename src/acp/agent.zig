@@ -2401,6 +2401,7 @@ const Session = struct {
         if (mcp_host.connecting()) return error.StillConnecting;
         const store = mcp_host.auth orelse return error.NoMcpState;
 
+        self.stack.hook_runtime.cancelBackground();
         const wanted = mcp_host.wants(server);
         try store.setEnabled(server.name, !wanted);
         store.save(server.name) catch |err| self.notice(.warning, "Could not remember that: {s}", .{@errorName(err)});
