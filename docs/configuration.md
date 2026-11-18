@@ -194,6 +194,16 @@ sessions with unknown message provenance need a fresh human request for automati
 review. Ordinary read-only and configured standing allowances still follow the
 existing approval rules.
 
+The judge retains up to eight human prompts and eight typed question/answer
+records independently, with 16 KiB per stored record and 64 KiB per family.
+Rendering uses Codex guardian's 900 estimated-token limit per instruction or
+question/answer record. Records that do not fit are omitted whole; notices warn
+that remaining grants are incomplete, and review continues. Questions remain
+untrusted context; selected option text and harness-written replies never become
+human instructions. The eight most recent approve/deny decisions include bounded
+action descriptions and apply only to those actions. Ollama judge requests set
+`truncate: false`, so an actual overflow uses the configured fallback.
+
 See [model customization hooks](hooks.md#model-requests) for request
 context, generation settings, and bounded retry controls.
 

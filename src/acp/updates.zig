@@ -163,7 +163,7 @@ pub fn question(arena: std.mem.Allocator, session: []const u8, seq: u64, index: 
 
 /// What the person answered a question with, or null when they would not.
 /// A pick with words of their own beside it is both.
-pub fn answerOf(arena: std.mem.Allocator, reply: ?std.json.Value) !?[]const u8 {
+pub fn answerOf(arena: std.mem.Allocator, reply: ?std.json.Value, has_options: bool) !?Loop.Answer {
     const elicited = std.json.parseFromValueLeaky(protocol.Elicited(Question.Filled), arena, reply orelse return null, .{
         .ignore_unknown_fields = true,
     }) catch return null;
@@ -171,8 +171,8 @@ pub fn answerOf(arena: std.mem.Allocator, reply: ?std.json.Value) !?[]const u8 {
     const filled = elicited.content orelse return null;
     const picked = nonEmpty(filled.answer);
     const own = nonEmpty(filled.other);
-    if (picked != null and own != null) return try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ picked.?, own.? });
-    return picked orelse own;
+    const text = if (picked != null and own != null) try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ picked.?, own.? }) else picked orelse own orelse return null;
+    return .{ .text = text, .typed = if (has_options) own else own orelse picked };
 }
 
 fn nonEmpty(text: ?[]const u8) ?[]const u8 {
@@ -252,7 +252,8 @@ test "a question is a form of its offered answers, and its answer read back" {
 
     const read = struct {
         fn run(a: std.mem.Allocator, json: []const u8) !?[]const u8 {
-            return answerOf(a, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
+            const result = try answerOf(a, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}), true);
+            return if (result) |answer| answer.text else null;
         }
     }.run;
     try testing.expectEqualStrings("a", (try read(arena, "{\"action\":\"accept\",\"content\":{\"answer\":\"a\",\"other\":\"\"}}")).?);
@@ -260,6 +261,13 @@ test "a question is a form of its offered answers, and its answer read back" {
     try testing.expectEqualStrings("a\n\nbut later", (try read(arena, "{\"action\":\"accept\",\"content\":{\"answer\":\"a\",\"other\":\"but later\"}}")).?);
     try testing.expectEqual(null, try read(arena, "{\"action\":\"decline\"}"));
     try testing.expectEqual(null, try read(arena, "{\"action\":\"accept\",\"content\":{}}"));
+    const mixed = (try answerOf(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"action\":\"accept\",\"content\":{\"answer\":\"model option\",\"other\":\"my typed limit\"}}", .{}), true)).?;
+    try testing.expectEqualStrings("model option\n\nmy typed limit", mixed.text);
+    try testing.expectEqualStrings("my typed limit", mixed.typed.?);
+    const picked = (try answerOf(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"action\":\"accept\",\"content\":{\"answer\":\"model option\"}}", .{}), true)).?;
+    try testing.expect(picked.typed == null);
+    const freeform = (try answerOf(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"action\":\"accept\",\"content\":{\"answer\":\"typed free text\"}}", .{}), false)).?;
+    try testing.expectEqualStrings("typed free text", freeform.typed.?);
 }
 
 test "a replay tells the conversation and leaves out what the harness wrote" {

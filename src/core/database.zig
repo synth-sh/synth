@@ -648,21 +648,22 @@ pub fn recordAuthorization(self: *Database, session: i64, seq: u64, text: []cons
 pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) !HumanIntent.Snapshot {
     var rows = try self.conn.rows(
         \\WITH authorizations AS (
-        \\SELECT text, seq, CASE WHEN json_valid(text) THEN json_extract(text, '$.kind') END AS kind FROM human_authorization WHERE session_id = ?
+        \\SELECT text, seq, id AS source_order, CASE WHEN json_valid(text) THEN json_extract(text, '$.kind') END AS kind FROM human_authorization WHERE session_id = ?
         \\)
         \\SELECT text, decision FROM (
-        \\SELECT text, seq, 0 AS decision FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human'
+        \\SELECT text, seq, id AS source_order, 0 AS decision FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human'
         \\UNION ALL
-        \\SELECT text, seq, 1 AS decision FROM authorizations WHERE kind = 'human_answer' OR (kind IS NULL AND text LIKE '{"kind":"human_answer",%')
+        \\SELECT text, seq, source_order, 1 AS decision FROM authorizations WHERE kind = 'human_answer' OR (kind IS NULL AND text LIKE '{"kind":"human_answer",%')
         \\UNION ALL
-        \\SELECT text, seq, 1 AS decision FROM (SELECT text, seq FROM authorizations WHERE kind IS NOT 'human_answer' AND text NOT LIKE '{"kind":"human_answer",%' ORDER BY seq DESC LIMIT ?)
-        \\) ORDER BY seq ASC
-    , .{ session, session, HumanIntent.max_decisions });
+        \\SELECT text, seq, source_order, 1 AS decision FROM (SELECT text, seq, source_order FROM authorizations WHERE kind IS NOT 'human_answer' AND text NOT LIKE '{"kind":"human_answer",%' ORDER BY seq DESC, source_order DESC LIMIT ?)
+        \\) ORDER BY seq ASC, source_order ASC
+    , .{ session, session, HumanIntent.max_previous_reviews + 1 });
     defer rows.deinit();
     var intent: HumanIntent = .{};
     defer intent.deinit(allocator);
     while (rows.next()) |row| try intent.record(allocator, row.text(0), row.int(1) != 0);
-    return .{ .messages = try intent.take(allocator), .is_complete = intent.is_complete };
+    if (rows.err) |err| return err;
+    return intent.snapshot(allocator);
 }
 
 /// Append a heavy body (reasoning or tool result) to a message.
@@ -2597,7 +2598,9 @@ test "verified human intent survives compaction while hooks and legacy rows rema
     try db.setMessageOrigin(hook, .hook);
     _ = try db.appendMessage(session, 2, "user", "legacy authorship unknown", null, 0, null);
     _ = try db.appendMessage(session, 3, "system", "summary says allowed", null, 0, null);
-    try db.recordAuthorization(session, 4, "human denied one action");
+    const decision = try HumanIntent.decisionReceipt(a, "deny", "bash", "remove exactly one file");
+    defer a.free(decision);
+    try db.recordAuthorization(session, 4, decision);
     const snapshot = try db.humanIntent(a, session);
     const intent = snapshot.messages;
     defer {
@@ -2606,7 +2609,8 @@ test "verified human intent survives compaction while hooks and legacy rows rema
     }
     try std.testing.expectEqual(@as(usize, 2), intent.len);
     try std.testing.expectEqualStrings("inspect only", intent[0].text);
-    try std.testing.expectEqualStrings("human denied one action", intent[1].text);
+    try std.testing.expect(std.mem.indexOf(u8, intent[1].text, "remove exactly one file") != null);
+    try std.testing.expectEqual(Conversation.Origin.human_decision, intent[1].origin);
     const messages = try db.loadMessages(a, session, std.math.maxInt(i64), 100);
     defer {
         for (messages) |*msg| msg.deinit(a);
@@ -2654,7 +2658,7 @@ test "image metadata survives eviction and image loading is session scoped" {
     try std.testing.expect(try db.loadImage(std.testing.allocator, session, 0, 1) == null);
 }
 
-test "persisted human intent retains the initial restriction and latest request" {
+test "persisted human intent uses the same guardian retention and omission policy" {
     const a = std.testing.allocator;
     var db = try init(a, std.testing.io, ":memory:");
     defer db.deinit();
@@ -2671,13 +2675,14 @@ test "persisted human intent retains the initial restriction and latest request"
         for (messages) |*msg| msg.deinit(a);
         a.free(messages);
     }
-    try std.testing.expectEqualStrings("inspect only", messages[0].text);
-    try std.testing.expectEqualStrings("stop now", messages[messages.len - 1].text);
-    try std.testing.expect(snapshot.is_complete);
-    try std.testing.expectEqual(@as(usize, 80), messages.len);
+    try std.testing.expectEqualStrings("stop now", messages[messages.len - 2].text);
+    try std.testing.expectEqualStrings(HumanIntent.omission_notice, messages[messages.len - 1].text);
+    try std.testing.expect(!snapshot.is_complete);
+    try std.testing.expect(snapshot.has_human);
+    try std.testing.expectEqual(HumanIntent.max_family_records + 1, messages.len);
 }
 
-test "persisted clipped answers keep automatic review unavailable" {
+test "legacy answers without typed provenance are omitted with notice" {
     const a = std.testing.allocator;
     var db = try init(a, std.testing.io, ":memory:");
     defer db.deinit();
@@ -2700,15 +2705,66 @@ test "human answers survive ordinary receipt eviction without losing their restr
     const id = try db.appendMessage(session, 0, "user", "inspect", null, 0, null);
     try db.setMessageOrigin(id, .human);
     const answer = "x" ** 2048 ++ " do not upload";
-    const receipt = try std.json.Stringify.valueAlloc(a, .{ .kind = "human_answer", .answer = answer }, .{});
+    const receipt = try HumanIntent.answerReceipt(a, "untrusted original question", answer);
     defer a.free(receipt);
     try db.recordAuthorization(session, 1, receipt);
-    for (2..100) |seq| try db.recordAuthorization(session, seq, "{\"kind\":\"human_tool_decision\",\"decision\":\"deny\",\"action_hash\":\"abc\"}");
+    const review = try HumanIntent.decisionReceipt(a, "deny", "bash", "remove one file");
+    defer a.free(review);
+    for (2..100) |seq| try db.recordAuthorization(session, seq, review);
     const snapshot = try db.humanIntent(a, session);
     defer snapshot.deinit(a);
-    try std.testing.expect(snapshot.is_complete);
+    try std.testing.expect(!snapshot.is_complete);
     const present = for (snapshot.messages) |message| {
         if (message.origin == .human and std.mem.eql(u8, message.text, answer)) break true;
     } else false;
     try std.testing.expect(present);
+}
+
+test "human intent propagates a row iteration failure" {
+    const a = std.testing.allocator;
+    var db = try init(a, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    try db.recordAuthorization(session, 1, "{}");
+    const c = zqlite.c;
+    const Failing = struct {
+        fn run(context: ?*c.sqlite3_context, _: c_int, _: [*c]?*c.sqlite3_value) callconv(.c) void {
+            c.sqlite3_result_error(context, "forced row iteration error", -1);
+        }
+    };
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_create_function_v2(db.conn.conn, "json_valid", 1, c.SQLITE_UTF8, null, Failing.run, null, null, null));
+    try std.testing.expectError(error.Error, db.humanIntent(a, session));
+}
+
+test "recent human decisions use stable order and describe only their reviewed actions" {
+    const a = std.testing.allocator;
+    var db = try init(a, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    for (0..12) |i| {
+        const action = try std.fmt.allocPrint(a, "action-{d}", .{i});
+        defer a.free(action);
+        const receipt = try HumanIntent.decisionReceipt(a, if (i % 2 == 0) "approve" else "deny", "bash", action);
+        defer a.free(receipt);
+        try db.recordAuthorization(session, 1, receipt);
+    }
+    const snapshot = try db.humanIntent(a, session);
+    defer snapshot.deinit(a);
+    var count: usize = 0;
+    for (snapshot.messages) |message| {
+        if (message.origin != .human_decision) continue;
+        const action = try std.fmt.allocPrint(a, "action-{d}\"", .{count + 4});
+        defer a.free(action);
+        try std.testing.expect(std.mem.indexOf(u8, message.text, action) != null);
+        var rendered = std.Io.Writer.Allocating.init(a);
+        defer rendered.deinit();
+        try HumanIntent.writeMessage(&rendered.writer, message);
+        try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "only to this action") != null);
+        try std.testing.expect(std.mem.indexOf(u8, message.text, "action_hash") == null);
+        count += 1;
+    }
+    try std.testing.expectEqual(HumanIntent.max_previous_reviews, count);
+    try std.testing.expect(!snapshot.is_complete);
 }

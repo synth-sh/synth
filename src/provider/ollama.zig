@@ -657,7 +657,12 @@ const ChatStream = struct {
 fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest, turn: Provider.Turn, input: @import("../core/hooks.zig").Invocation) !ChatStream {
     const url = try std.fmt.allocPrint(a, "{s}/api/chat", .{std.mem.trimEnd(u8, self.host, "/")});
     var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = input, .url = url, .protocol = "ollama", .stop = turn.stop };
-    const body = try std.json.Stringify.valueAlloc(a, request, .{ .emit_null_optional_fields = false });
+    var body = try std.json.Stringify.valueAlloc(a, request, .{ .emit_null_optional_fields = false });
+    if (input.request_purpose == .approval_judge) {
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+        try value.object.put(a, "truncate", .{ .bool = false });
+        body = try std.json.Stringify.valueAlloc(a, value, .{});
+    }
     const prepared = try http.request(a, body, .{ .content_type = .{ .override = "application/json" }, .accept_encoding = .{ .override = "identity" } }, if (self.auth_value.len > 0) self.auth_header[0..1] else &.{});
     const req = try a.create(std.http.Client.Request);
     req.* = try self.client.http_client.client.request(.POST, try std.Uri.parse(url), .{

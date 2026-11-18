@@ -2263,16 +2263,14 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
-    const stored_intent = if (asker.db) |db| if (asker.session_id) |id| try db.humanIntent(self.allocator, id) else null else null;
-    defer if (stored_intent) |snapshot| snapshot.deinit(self.allocator);
-    const remembered = try asker.human_intent.view(arena_state.allocator());
-    const intent = if (stored_intent) |snapshot| snapshot.messages else if (remembered.len > 0) remembered else asker.conversation.messages.items;
-    const complete_intent = if (stored_intent) |snapshot| snapshot.is_complete else asker.human_intent.is_complete;
-    if (!complete_intent) {
-        _ = try self.judgeUnavailable(call_index, "stored human instructions were truncated before this version");
+    const stored_intent = if (asker.db) |db| if (asker.session_id) |id| db.humanIntent(self.allocator, id) catch |err| {
+        _ = try self.judgeUnavailable(call_index, @errorName(err));
         return;
-    }
-    const has_human = for (intent) |message| {
+    } else null else null;
+    defer if (stored_intent) |snapshot| snapshot.deinit(self.allocator);
+    const remembered = if (stored_intent == null) try asker.human_intent.view(arena_state.allocator()) else &.{};
+    const intent = if (stored_intent) |snapshot| snapshot.messages else if (remembered.len > 0) remembered else asker.conversation.messages.items;
+    const has_human = if (stored_intent) |snapshot| snapshot.has_human else asker.human_intent.has_human or for (intent) |message| {
         if (message.role == .user and message.origin == .human and std.mem.trim(u8, message.text, " \t\r\n").len > 0) break true;
     } else false;
     if (!has_human) {
@@ -2424,11 +2422,21 @@ fn firstAsk(self: *Loop) ?*Conversation.ToolCall {
     return null;
 }
 
+pub const Answer = struct {
+    text: []const u8,
+    typed: ?[]const u8 = null,
+};
+
+pub fn answer(self: *Loop, text: []const u8) !void {
+    return self.answerWithSource(.{ .text = text, .typed = text });
+}
+
 /// Write the user's answer in as the result of the question, then carry on.
 ///
 /// The answer settles one call. Anything else the model asked for in the same
 /// batch runs afterwards, and a second question stops the turn again.
-pub fn answer(self: *Loop, text: []const u8) !void {
+pub fn answerWithSource(self: *Loop, response: Answer) !void {
+    const text = response.text;
     if (self.state != .awaiting_answer) return;
 
     const message_index = self.pendingIndex() orelse return;
@@ -2438,9 +2446,11 @@ pub fn answer(self: *Loop, text: []const u8) !void {
         if (call.status != .running) continue;
         if (!std.mem.eql(u8, call.name, ask_user.name)) continue;
 
-        const receipt = try std.json.Stringify.valueAlloc(self.allocator, .{ .kind = "human_answer", .message_seq = self.conversation.messages.items[message_index].seq, .call_index = i, .answer = text }, .{});
-        defer self.allocator.free(receipt);
-        try self.recordHuman(receipt, true);
+        if (response.typed) |typed| {
+            const receipt = try HumanIntent.answerReceipt(self.allocator, call.arguments, typed);
+            defer self.allocator.free(receipt);
+            try self.recordHuman(receipt, true);
+        }
         self.approved_ask_index = null;
         call.settle(.ok, tool.monotonicMilliseconds(self.io));
         call.result = try self.allocator.dupe(u8, text);
@@ -2587,14 +2597,7 @@ pub fn decide(self: *Loop, decision: Decision) !void {
     const message_index = self.pendingIndex() orelse return;
     const call_index = self.firstPending() orelse return;
 
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(call.prepared_action orelse "", &hash, .{});
-    const receipt = try std.json.Stringify.valueAlloc(self.allocator, .{
-        .kind = "human_tool_decision",
-        .decision = std.meta.activeTag(decision),
-        .breadth = if (decision == .always) @tagName(decision.always) else "",
-        .action_hash = std.fmt.bytesToHex(hash, .lower),
-    }, .{});
+    const receipt = try HumanIntent.decisionReceipt(self.allocator, if (decision == .deny) "deny" else "approve", call.name, call.prepared_action orelse call.arguments);
     defer self.allocator.free(receipt);
 
     switch (decision) {
@@ -7418,7 +7421,7 @@ test "an answer within the instruction budget keeps automatic review working" {
     try loop.submit("inspect", .{});
     try settle(&loop);
     try testing.expectEqual(State.awaiting_answer, loop.state);
-    const answer_text = try testing.allocator.alloc(u8, HumanIntent.decision_bytes);
+    const answer_text = try testing.allocator.alloc(u8, 2048);
     defer testing.allocator.free(answer_text);
     @memset(answer_text, 'x');
     try loop.answer(answer_text);
@@ -7498,4 +7501,35 @@ test "automatic review survives receipt eviction and session resume" {
     try testing.expectEqual(State.idle, loop.state);
     try testing.expect(fixture.fake.judged > 0);
     try fixture.tmp.dir.access(testing.io, "reviewed", .{});
+}
+
+test "picked and harness answers never become person instructions" {
+    for ([_]Answer{
+        .{ .text = "The user chose not to answer." },
+        .{ .text = "No one connected can answer questions. Decide for yourself, and say what you assumed." },
+        .{ .text = "model supplied option" },
+        .{ .text = "model supplied option\n\nmy typed restriction", .typed = "my typed restriction" },
+    }) |response| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        var loop = fixture.loop();
+        defer loop.deinit();
+        fixture.fake.tool_name = "ask_user";
+        fixture.fake.tool_arguments = "{\"question\":\"May I send data?\",\"options\":[\"model supplied option\"]}";
+        try loop.submit("inspect only", .{});
+        try settle(&loop);
+        try loop.answerWithSource(response);
+        try settle(&loop);
+        const snapshot = try loop.human_intent.snapshot(testing.allocator);
+        defer snapshot.deinit(testing.allocator);
+        for (snapshot.messages) |message| {
+            if (message.role == .user and message.origin == .human) {
+                try testing.expect(std.mem.eql(u8, message.text, "inspect only") or std.mem.eql(u8, message.text, response.typed orelse ""));
+            }
+        }
+        if (response.typed != null) {
+            try testing.expectEqualStrings(response.typed.?, snapshot.messages[2].text);
+            try testing.expectEqual(Conversation.Role.assistant, snapshot.messages[1].role);
+        }
+    }
 }

@@ -9,6 +9,8 @@
 //! were made.
 
 const std = @import("std");
+const Hooks = @import("../core/hooks.zig");
+const ask_user = @import("../tools/ask.zig");
 const HookStore = @import("../core/hook_store.zig");
 const paths = @import("../core/paths.zig");
 
@@ -792,7 +794,7 @@ fn ask(self: *Agent, arena: std.mem.Allocator, session: *Session, waiting: Sessi
     try self.put(arena, session, &asked, waiting);
     if (asked.for_answer and asked.requests.items.len == 0 and asked.considered.items.len > 0) {
         asked.deinit(self.allocator);
-        return session.stack.loop.answer(unanswerable);
+        return session.stack.loop.answerWithSource(.{ .text = unanswerable });
     }
     self.asked = asked;
 }
@@ -868,10 +870,12 @@ fn answered(self: *Agent, connection: *Connection, message: rpc.Message) void {
     if (asked.for_answer) {
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena_state.deinit();
-        const text = updates.answerOf(arena_state.allocator(), message.result) catch null;
+        const call = loop.pendingQuestion() orelse return;
+        const has_options = ask_user.options(arena_state.allocator(), call.arguments).len > 0;
+        const response = updates.answerOf(arena_state.allocator(), message.result, has_options) catch null;
         _ = asked.requests.swapRemove(index);
         self.withdraw();
-        loop.answer(text orelse declined) catch |err| self.noticeFmt(.warning, "Could not answer: {s}", .{@errorName(err)});
+        loop.answerWithSource(response orelse .{ .text = declined }) catch |err| self.noticeFmt(.warning, "Could not answer: {s}", .{@errorName(err)});
         return;
     }
     const chosen = protocol.chosenOption(message.result) orelse return;
@@ -3516,6 +3520,20 @@ test "a question is put as a form to the clients that draw them, and the answer 
 
     try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(prompted));
     try testing.expectEqualStrings("green", try settledWith(editor, asked.toolCallId.?));
+    const another = try client.prompt(session, "ask me");
+    const choice = try client.awaitMethod(protocol.method.elicitation_create);
+    try client.answer(choice.id.?, .{ .action = "accept", .content = .{ .answer = "blue" } });
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(another));
+    const stored = (try fixture.db.sessionByHandle(session)).?;
+    const evidence = try fixture.db.humanIntent(testing.allocator, stored);
+    defer evidence.deinit(testing.allocator);
+    var typed = false;
+    for (evidence.messages) |word| {
+        if (word.origin != .human) continue;
+        if (std.mem.eql(u8, word.text, "green")) typed = true;
+        try testing.expect(!std.mem.eql(u8, word.text, "blue"));
+    }
+    try testing.expect(typed);
 }
 
 test "a question no one connected can answer is answered so, and the turn goes on" {
@@ -3536,6 +3554,12 @@ test "a question no one connected can answer is answered so, and the turn goes o
         if (std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call")) seq = update.get("toolCallId").?.string;
     }
     try testing.expectEqualStrings(unanswerable, try settledWith(editor, seq.?));
+    const stored = (try fixture.db.sessionByHandle(session)).?;
+    const evidence = try fixture.db.humanIntent(testing.allocator, stored);
+    defer evidence.deinit(testing.allocator);
+    for (evidence.messages) |word| {
+        if (word.origin == .human) try testing.expect(!std.mem.eql(u8, word.text, unanswerable));
+    }
 }
 
 test "a declined question tells the model so" {
@@ -3552,6 +3576,12 @@ test "a declined question tells the model so" {
     const asked = try rpc.parse(protocol.FormElicitation(updates.Question), editor.arena.allocator(), message.params);
     try editor.answer(message.id.?, .{ .action = "decline" });
     try testing.expectEqualStrings(declined, try settledWith(editor, asked.toolCallId.?));
+    const stored = (try fixture.db.sessionByHandle(session)).?;
+    const evidence = try fixture.db.humanIntent(testing.allocator, stored);
+    defer evidence.deinit(testing.allocator);
+    for (evidence.messages) |word| {
+        if (word.origin == .human) try testing.expect(!std.mem.eql(u8, word.text, declined));
+    }
 }
 
 test "a model and its effort are chosen through config options, and remembered" {

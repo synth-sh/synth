@@ -1221,10 +1221,7 @@ pub fn steer(self: *Mirror, text: []const u8, extras: Loop.Extras) !bool {
     return true;
 }
 
-/// Answer the question out for the call waiting on an answer, or the one
-/// on its way when the status already says a question is waiting. An
-/// answer that is not one the form offers goes in its field for the
-/// person's own.
+/// Composer text uses the free-text field even when it matches an offered option.
 pub fn answer(self: *Mirror, text: []const u8) !void {
     const connection = try self.live();
     const asked = self.asked orelse {
@@ -1237,10 +1234,7 @@ pub fn answer(self: *Mirror, text: []const u8) !void {
         .answer => |choices| choices,
         .decision => return error.NothingToAnswer,
     };
-    const offered = choices.len == 0 or for (choices) |choice| {
-        if (std.mem.eql(u8, choice, text)) break true;
-    } else false;
-    const filled: updates.Question.Filled = if (offered) .{ .answer = text } else .{ .other = text };
+    const filled: updates.Question.Filled = if (choices.len == 0) .{ .answer = text } else .{ .other = text };
     try connection.reply(asked.id, protocol.Elicited(updates.Question.Filled){ .action = "accept", .content = filled });
     self.forgetAsked();
 }
@@ -1513,11 +1507,18 @@ test "a question is answered from here, whether or not its request has arrived y
     try mirror.submit("ask me", .{});
     try pollUntil(mirror, awaitingAnswer);
     try testing.expectError(error.NothingToDecide, mirror.decide(.once));
-    try mirror.answer("green");
+    try mirror.answer("blue");
     try pollUntil(mirror, finishedOne);
     try testing.expectEqual(@as(?Loop.Outcome, .done), mirror.status.outcome);
-    try testing.expectEqualStrings("green", convo.messages.items[1].tool_calls[0].result.?);
+    try testing.expectEqualStrings("blue", convo.messages.items[1].tool_calls[0].result.?);
     try testing.expect(mirror.asked == null and mirror.early == null);
+    const session = (try fixture.db.sessionByHandle(mirror.status.handle)).?;
+    const evidence = try fixture.db.humanIntent(testing.allocator, session);
+    defer evidence.deinit(testing.allocator);
+    const typed = for (evidence.messages) |message| {
+        if (message.origin == .human and std.mem.eql(u8, message.text, "blue")) break true;
+    } else false;
+    try testing.expect(typed);
 }
 
 test "device sign-in status retains its code after the incoming buffer is reused" {

@@ -66,7 +66,7 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
                 return
             packet = {"path": self.path, "headers": dict(self.headers), "raw_headers": list(self.headers.items()), "body": json.loads(self.rfile.read(int(self.headers["Content-Length"])))}
             suffix = "/api/chat" if protocol == "ollama" else "/v1/messages" if protocol == "messages" else "/v1/responses" if protocol == "responses" else "/v1/chat/completions"
-            assert self.path in ("/agent" + suffix, "/selected" + suffix, "/review/v1/chat/completions"), self.path
+            assert self.path in ("/agent" + suffix, "/selected" + suffix, "/review/v1/chat/completions", "/review/api/chat"), self.path
             if protocol == "ollama": assert packet["body"].get("think") is not True
             requests.append(packet)
             status, value, content_type = respond(packet, requests)
@@ -157,6 +157,24 @@ def main():
         failure = [event for event in log if event['hook_event_name'] == 'StopFailure']
         assert len(failure) == 1 and failure[0]['error_type'] == 'rate_limit', failure
     print('PASS actual Ollama HTTP failures classify StopFailure hooks')
+
+    def ollama_reviewer(config, url):
+        route = config['model_requests']['routes'][2]
+        route.update(provider='ollama', endpoint=f'{url}/review')
+
+    def reviewer_overflow(packet, _):
+        if packet['path'] == '/review/api/chat':
+            assert packet['body']['truncate'] is False, packet
+            assert 'route-me reference human request' in json.dumps(packet['body']['messages'])
+            return 400, {'error': 'input exceeds context window'}, 'application/json'
+        if any(message['role'] == 'tool' for message in packet['body']['messages']):
+            return chat()
+        return chat('', tool('bash', {'command': 'touch overflow-must-not-run'}))
+
+    with session('ollama-judge-no-truncation', reviewer_overflow, configure=ollama_reviewer) as (root, result, requests, _):
+        assert not (root / 'overflow-must-not-run').exists()
+        assert any(packet['path'] == '/review/api/chat' for packet in requests)
+    print('PASS Ollama judge requests disable truncation and overflow fails closed')
     with session('untrusted', lambda *_: chat('must-not-run'), events=('PreToolUse',), trust=False) as (_, result, requests, _):
         assert result.returncode != 0 and not requests
         expect(result, 'review')
