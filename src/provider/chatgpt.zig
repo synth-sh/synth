@@ -553,14 +553,12 @@ fn waitAndRetry(
     retry_after_ms: ?u64,
     sink: ?Provider.Sink,
 ) bool {
-    if (attempt >= self.retries.attempts) return false;
-    return retry.pause(self.io, sink, .{
+    return retry.wait(self.io, self.retries, sink, .{
+        .status = status,
         .attempt = attempt,
-        .allowed = retry.transient(status) and !retry.tooLong(self.retries, retry_after_ms) and status != .too_many_requests,
-        .delay_ms = retry.waitMs(self.retries, attempt, retry_after_ms),
-        .status = @intFromEnum(status),
-        .error_type = retry.errorType(status),
-        .error_message = self.rejection orelse "",
+        .retry_after_ms = retry_after_ms,
+        .message = self.rejection orelse "",
+        .retryable = retry.transient(status) and status != .too_many_requests,
     });
 }
 

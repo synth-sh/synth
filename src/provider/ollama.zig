@@ -508,14 +508,11 @@ fn waitAndRetry(
     why: []const u8,
     sink: ?Provider.Sink,
 ) bool {
-    if (attempt >= self.retries.attempts) return false;
-    return retry.pause(self.io, sink, .{
+    return retry.wait(self.io, self.retries, sink, .{
+        .status = self.last_status,
         .attempt = attempt,
-        .allowed = retry.transient(self.last_status) or retry.transientText(why),
-        .delay_ms = retry.waitMs(self.retries, attempt, null),
-        .status = @intFromEnum(self.last_status),
-        .error_type = retry.errorType(self.last_status),
-        .error_message = why,
+        .message = why,
+        .retryable = retry.transient(self.last_status) or retry.transientText(why),
     });
 }
 fn isOverflow(why: []const u8) bool {

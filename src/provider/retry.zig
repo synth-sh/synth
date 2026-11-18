@@ -46,6 +46,26 @@ pub const Policy = struct {
     max_retry_after_ms: u64 = max_delay_ms,
 };
 
+pub const Failure = struct {
+    status: std.http.Status,
+    attempt: usize,
+    retry_after_ms: ?u64 = null,
+    message: []const u8 = "",
+    retryable: ?bool = null,
+};
+
+pub fn wait(io: std.Io, policy: Policy, sink: ?@import("provider.zig").Sink, failure: Failure) bool {
+    if (failure.attempt >= policy.attempts) return false;
+    return pause(io, sink, .{
+        .attempt = failure.attempt,
+        .allowed = (failure.retryable orelse transient(failure.status)) and !tooLong(policy, failure.retry_after_ms),
+        .delay_ms = waitMs(policy, failure.attempt, failure.retry_after_ms),
+        .status = @intFromEnum(failure.status),
+        .error_type = errorType(failure.status),
+        .error_message = failure.message,
+    });
+}
+
 /// Whether a status is worth another attempt.
 pub fn transient(status: std.http.Status) bool {
     return switch (status) {
@@ -161,4 +181,43 @@ test "Retry-After is read as seconds, and anything else is ignored" {
     try testing.expect(retryAfterMs("") == null);
     try testing.expect(retryAfterMs("Wed, 21 Oct 2015 07:28:00 GMT") == null);
     try testing.expect(retryAfterMs("-5") == null);
+}
+
+test "shared retries preserve failure metadata, vetoes and attempt ceilings" {
+    const Provider = @import("provider.zig");
+    const Capture = struct {
+        calls: usize = 0,
+        last: ?Provider.RetryInfo = null,
+        cancelled: bool = false,
+        veto: bool = false,
+
+        fn stopped(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.cancelled;
+        }
+        fn text(_: *anyopaque, _: []const u8) void {}
+        fn decision(ptr: *anyopaque, info: Provider.RetryInfo) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last = info;
+            return if (info.allowed and !self.veto) 0 else null;
+        }
+    };
+    var capture: Capture = .{};
+    const sink: Provider.Sink = .{ .userdata = &capture, .onThinking = Capture.text, .onText = Capture.text, .stopped = Capture.stopped, .onRetry = Capture.decision };
+    const policy: Policy = .{ .attempts = 3 };
+    try testing.expect(wait(testing.io, policy, sink, .{ .status = .too_many_requests, .attempt = 1, .message = "rate limited" }));
+    try testing.expectEqualStrings("rate_limit", capture.last.?.error_type);
+    try testing.expectEqualStrings("rate limited", capture.last.?.error_message);
+    try testing.expectEqual(@as(u16, 429), capture.last.?.status);
+    try testing.expectEqual(policy.base_ms, capture.last.?.delay_ms);
+    try testing.expect(!wait(testing.io, policy, sink, .{ .status = .unauthorized, .attempt = 1 }));
+    try testing.expectEqualStrings("authentication_failed", capture.last.?.error_type);
+    capture.veto = true;
+    try testing.expect(!wait(testing.io, policy, sink, .{ .status = .service_unavailable, .attempt = 1 }));
+    const calls = capture.calls;
+    try testing.expect(!wait(testing.io, policy, sink, .{ .status = .service_unavailable, .attempt = policy.attempts }));
+    capture.cancelled = true;
+    try testing.expect(!wait(testing.io, policy, sink, .{ .status = .service_unavailable, .attempt = 1 }));
+    try testing.expectEqual(calls, capture.calls);
 }

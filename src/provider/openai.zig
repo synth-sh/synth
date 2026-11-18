@@ -680,13 +680,6 @@ fn retryWithout(self: *OpenAIProvider, why: []const u8) bool {
     return true;
 }
 
-/// Whether the server is answering with an event stream. Some compatible
-/// servers ignore `stream` and reply with one JSON body, which is worth
-/// handling: the alternative is a turn that reads as empty.
-/// Whether to wait and send this request again, waiting if so.
-///
-/// Only ever reached before anything has been streamed: a retry once the
-/// reader has produced tokens would repeat them.
 fn waitAndRetry(
     self: *OpenAIProvider,
     status: std.http.Status,
@@ -694,14 +687,11 @@ fn waitAndRetry(
     retry_after_ms: ?u64,
     sink: ?Provider.Sink,
 ) bool {
-    if (attempt >= self.retries.attempts) return false;
-    return retry.pause(self.io, sink, .{
+    return retry.wait(self.io, self.retries, sink, .{
+        .status = status,
         .attempt = attempt,
-        .allowed = retry.transient(status) and !retry.tooLong(self.retries, retry_after_ms),
-        .delay_ms = retry.waitMs(self.retries, attempt, retry_after_ms),
-        .status = @intFromEnum(status),
-        .error_type = retry.errorType(status),
-        .error_message = self.rejection orelse "",
+        .retry_after_ms = retry_after_ms,
+        .message = self.rejection orelse "",
     });
 }
 /// One header off a reply, before a body reader invalidates it.
