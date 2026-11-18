@@ -458,7 +458,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             if (key.matches(vaxis.Key.escape, .{}) and
-                self.mirror.isBusy() and
+                (self.mirror.isBusy() or self.mirror.status.prompt_queued) and
                 self.mirror.state() != .awaiting_approval)
             {
                 try self.mirror.cancel();

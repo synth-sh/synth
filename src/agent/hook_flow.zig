@@ -51,11 +51,15 @@ session_source: enum { startup, clear, @"resume", compact } = .startup,
 resume_turn: bool = false,
 parent_call_id: []const u8 = "",
 identity: [32]u8 = @splat(0),
-turn: [32]u8 = @splat(0),
 notice: ?[]u8 = null,
 failure: ?[]u8 = null,
 export_path: ?[]u8 = null,
 session_handle: ?[]const u8 = null,
+
+pub fn setNotice(self: *Flow, allocator: std.mem.Allocator, notice: []u8) void {
+    if (self.notice) |old| allocator.free(old);
+    self.notice = notice;
+}
 
 pub fn purpose(self: *const Flow) Purpose {
     return std.meta.activeTag(self.pending);
@@ -90,8 +94,7 @@ pub fn hookInput(self: *Loop, invocation: Hooks.Invocation) Hooks.Invocation {
     input.session_id = self.session_public_id orelse self.hook_flow.session_handle orelse &self.hook_flow.identity;
     const owner = self.parent orelse self;
     const turn_number = owner.turn_start_seq orelse owner.conversation.next_seq;
-    const turn_id = std.fmt.bufPrint(&self.hook_flow.turn, "{d}", .{turn_number}) catch "";
-    input.turn_id = turn_id;
+    input.turn_number = turn_number;
     input.agent_id = &self.hook_flow.identity;
     input.agent_type = self.agent.id;
     input.agent_scope = if (self.parent == null) .main else .subagent;

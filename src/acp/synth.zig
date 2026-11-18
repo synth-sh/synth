@@ -203,6 +203,7 @@ pub const Status = struct {
     cwd: []const u8 = "",
     additional_roots: []const []const u8 = &.{},
     state: Loop.State = .idle,
+    prompt_queued: bool = false,
     /// What the session says it is doing: `Loop.label`.
     label: []const u8 = "",
     title: []const u8 = "",

@@ -140,7 +140,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.loop.control_files = if (config.hook_state_path) |path| try self.arena.allocator().dupe([]const u8, &.{ config.path, path }) else try self.arena.allocator().dupe([]const u8, &.{config.path});
     inline for (std.meta.fields(Hooks.Set)) |field| {
         for (@field(discovered_hooks, field.name)) |hook| {
-            if (hook.enabled and !hook.trusted and self.loop.hook_flow.notice == null) self.loop.hook_flow.notice = try allocator.dupe(u8, "Hooks need review. Use /hooks review or synth hooks review, then trust reviewed ids explicitly.");
+            if (hook.enabled and !hook.trusted and self.loop.hook_flow.notice == null) self.loop.hook_flow.notice = try allocator.dupe(u8, Hooks.review_notice);
         }
     }
     self.loop.auto_approve_safe = config.auto_approve_safe_commands;
@@ -184,6 +184,7 @@ pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore
     }
     try HookStore.change(self.arena.allocator(), self.hooks.io, &self.hooks.set, self.hook_state_path, action, id);
     if (!self.loop.isBusy()) try self.loop.hook_flow.watch.configure(self.allocator, self.hooks.io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills);
+    try self.loop.resumePendingPrompt();
     return HookStore.report(allocator, self.hooks.set, self.hooks.timeout_ms, action == .review, &self.hook_runtime);
 }
 

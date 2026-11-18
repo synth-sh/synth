@@ -430,6 +430,8 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     defer self.allocator.free(loaded);
 
     std.mem.reverse(Conversation.Message, loaded);
+    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
+    self.pending_submit = null;
     self.endHookSession("resume");
     if (self.hook_flow.context) |context| self.allocator.free(context);
     self.hook_flow.context = null;
@@ -459,6 +461,8 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
 pub fn resetForNewSession(self: *Loop) bool {
     if (self.isBusy()) return false;
 
+    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
+    self.pending_submit = null;
     self.endHookSession("clear");
     self.hook_flow.reset();
     self.prompt_cache.invalidate(self.allocator);
@@ -668,7 +672,15 @@ fn systemPrompt(self: *Loop) []const u8 {
     ) catch return self.system_prompt;
     if (self.prompt_cache.generation != self.hook_flow.instruction_generation) {
         self.hook_flow.instruction_generation = self.prompt_cache.generation;
-        if (self.prompt_cache.instruction_path) |path| self.observeHook(.{ .event = .instructions_loaded, .file_path = path, .memory_type = "Project", .load_reason = if (self.hook_flow.session_source == .compact) "compact" else "session_start" });
+        if (self.prompt_cache.instruction_path) |path| {
+            const load_reason = if (self.hook_flow.session_source == .compact) "compact" else "session_start";
+            self.observeHook(.{
+                .event = .instructions_loaded,
+                .file_path = path,
+                .memory_type = "Project",
+                .load_reason = load_reason,
+            });
+        }
     }
     if (self.working_directory == null and self.additional_roots.items.len == 0) return text;
     var writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -1039,7 +1051,13 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
 
     if (self.hooks) |runner| {
         if (runner.set.hasUntrusted()) {
-            self.hook_flow.notice = try self.allocator.dupe(u8, "Hooks need review. Use /hooks review or synth hooks review; trust or disable each reviewed id.");
+            if (self.pending_submit) |*old| old.deinit(self.allocator);
+            self.pending_submit = try Submission.init(self.allocator, prompt, extras);
+            self.say("{s}", .{Hooks.review_notice});
+            const queued = try std.fmt.allocPrint(self.allocator, "{s}\n\nQueued prompt: {s}", .{ Hooks.review_notice, prompt });
+            defer self.allocator.free(queued);
+            _ = try self.conversation.append(.{ .role = .assistant, .origin = .harness, .text = queued });
+            try self.persistMessage(self.conversation.messages.items.len - 1);
             return;
         }
     }
@@ -1072,6 +1090,15 @@ fn submitPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
     }
 
     try self.expandPrompt(prompt, extras);
+}
+
+pub fn resumePendingPrompt(self: *Loop) !void {
+    if (self.isBusy()) return;
+    if (self.hooks) |runner| if (runner.set.hasUntrusted()) return;
+    var pending = self.pending_submit orelse return;
+    self.pending_submit = null;
+    defer pending.deinit(self.allocator);
+    try self.submit(pending.prompt, pending.asExtras());
 }
 
 fn expandPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
@@ -1279,16 +1306,12 @@ fn pollPromptHooks(self: *Loop) !bool {
     defer pending.deinit(self.allocator);
 
     if (dispatch.failed) |err| {
-        self.hook_flow.notice = try std.fmt.allocPrint(
-            self.allocator,
-            "UserPromptSubmit hook failed: {s}",
-            .{@errorName(err)},
-        );
+        self.say("UserPromptSubmit hook failed: {s}", .{@errorName(err)});
         self.state = .idle;
         return true;
     }
     if (dispatch.takeBlocked()) |reason| {
-        self.hook_flow.notice = reason;
+        self.hook_flow.setNotice(self.allocator, reason);
         self.state = .idle;
         return true;
     }
@@ -1317,8 +1340,7 @@ fn pollOtherHooks(self: *Loop) !bool {
             return true;
         }
         if (dispatch.takeBlocked()) |reason| {
-            if (self.hook_flow.notice) |old| self.allocator.free(old);
-            self.hook_flow.notice = reason;
+            self.hook_flow.setNotice(self.allocator, reason);
             return true;
         }
         try self.acceptHookResult(&dispatch.result);
@@ -1357,9 +1379,9 @@ fn pollOtherHooks(self: *Loop) !bool {
         var pending = self.steering.orderedRemove(0);
         defer pending.deinit(self.allocator);
         if (dispatch.failed) |err| {
-            self.hook_flow.notice = try std.fmt.allocPrint(self.allocator, "UserPromptSubmit hook failed: {s}", .{@errorName(err)});
+            self.say("UserPromptSubmit hook failed: {s}", .{@errorName(err)});
         } else if (dispatch.takeBlocked()) |reason| {
-            self.hook_flow.notice = reason;
+            self.hook_flow.setNotice(self.allocator, reason);
         } else {
             try self.acceptHookResult(&dispatch.result);
             try self.recordUserPrompt(pending.prompt, pending.asExtras());
@@ -1704,7 +1726,11 @@ fn giveUpIfStalled(self: *Loop, request: *Request) bool {
 
 /// Abandon the turn, discarding whatever the worker had produced.
 pub fn cancel(self: *Loop) !void {
-    if (!self.isBusy()) return;
+    if (!self.isBusy()) {
+        if (self.pending_submit) |*pending| pending.deinit(self.allocator);
+        self.pending_submit = null;
+        return;
+    }
     if (self.state == .cancelling) return;
 
     // `Io.Future.cancel` waits on the calling thread, so `canceller` takes it.
@@ -1872,7 +1898,7 @@ fn pollRequest(self: *Loop) !bool {
     request.join();
     self.request = null;
     defer request.destroy();
-    if (!self.compacting and request.reply != null and request.owned_backend != null) {
+    if (!self.compacting and request.reply != null) {
         const current = request.provider.current();
         const model = try self.allocator.dupe(u8, current.model);
         errdefer self.allocator.free(model);
@@ -2081,7 +2107,7 @@ fn action(self: *Loop, call: *const Conversation.ToolCall) ![]u8 {
         .call_id = call.id,
         .tool = call.name,
         .arguments = input,
-        .cwd = try @import("../core/paths.zig").resolve(self.io, a, self.workingDirectory(), "."),
+        .cwd = try paths.resolve(self.io, a, self.workingDirectory(), "."),
         .allowed_roots = roots.items,
         .resolved_targets = targets.items,
         .agent_id = &self.hook_flow.identity,
@@ -2740,7 +2766,7 @@ fn resolveAgainstProject(self: *const Loop, arena: std.mem.Allocator, path: []co
 /// when `link` points out. Null when that cannot be told, a dangling link
 /// included.
 fn followLinks(self: *const Loop, arena: std.mem.Allocator, lexical: []const u8) ?[]const u8 {
-    return @import("../core/paths.zig").resolve(self.io, arena, self.workingDirectory(), lexical) catch null;
+    return paths.resolve(self.io, arena, self.workingDirectory(), lexical) catch null;
 }
 
 fn inside(self: *const Loop, arena: std.mem.Allocator, resolved: []const u8) bool {
@@ -2752,7 +2778,7 @@ fn inside(self: *const Loop, arena: std.mem.Allocator, resolved: []const u8) boo
     return false;
 }
 
-const pathInside = @import("../core/paths.zig").inside;
+const pathInside = paths.inside;
 
 /// Whether the preset list of read-only commands covers this call. Only `bash`
 /// has commands to classify; every other tool is settled by `read_only`.
@@ -7293,6 +7319,26 @@ test "an unavailable completion policy does not report a successful turn" {
     try testing.expect(std.mem.indexOf(u8, notice, "HookCommandUnavailable") != null);
 }
 
+test "an unreviewed prompt remains visible and resumes after trust" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "true", .trusted = false }} } };
+    loop.hooks = &runner;
+    try loop.submit("keep my request", .{});
+    try testing.expect(std.mem.indexOf(u8, lastAssistant(&fixture.convo).?.text, "Queued prompt: keep my request") != null);
+    try testing.expectEqual(@as(u64, 0), loop.requests_started);
+    runner.set.pre_tool_use = &.{.{ .command = "true" }};
+    try loop.resumePendingPrompt();
+    try settle(&loop);
+    const request = for (fixture.convo.messages.items) |msg| {
+        if (msg.origin == .human and std.mem.eql(u8, msg.text, "keep my request")) break msg;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(Conversation.Role.user, request.role);
+    try testing.expectEqual(Outcome.done, loop.outcome.?);
+}
+
 test "clipped human instructions require a human decision instead of model review" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -7310,6 +7356,22 @@ test "clipped human instructions require a human decision instead of model revie
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "must-not-run", .{}));
     try loop.decide(.deny);
     try settle(&loop);
+}
+
+test "cancelling a queued unreviewed prompt prevents later execution" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "true", .trusted = false }} } };
+    loop.hooks = &runner;
+    try loop.submit("cancel this request", .{});
+    try loop.cancel();
+    runner.set.pre_tool_use = &.{.{ .command = "true" }};
+    try loop.resumePendingPrompt();
+    try settle(&loop);
+    try testing.expectEqual(@as(u64, 0), loop.requests_started);
+    for (fixture.convo.messages.items) |message| try testing.expect(message.origin != .human);
 }
 
 test "a clipped answer keeps subsequent actions behind human review" {

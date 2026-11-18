@@ -9,6 +9,8 @@
 //! were made.
 
 const std = @import("std");
+const HookStore = @import("../core/hook_store.zig");
+const paths = @import("../core/paths.zig");
 
 const pkg = @import("pkg");
 const mcp = @import("mcp");
@@ -276,7 +278,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
 
     if (eql(u8, method, protocol.method.session_cancel)) {
         const session = try self.sessionFor((try rpc.parse(protocol.SessionId, arena, params)).sessionId);
-        if (session.stack.loop.isBusy()) try session.stack.loop.cancel();
+        try session.stack.loop.cancel();
         return;
     }
     if (eql(u8, method, protocol.method.cancel_request)) {
@@ -415,14 +417,14 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     } else if (eql(u8, method, m.change_directory)) {
         const asked = try rpc.parse(synth.Directory, arena, params);
         session.stack.loop.changeDirectory(asked.path) catch |err| {
-            self.noticeFmt(.warning, "Cannot change directory to {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
+            self.noticeFmt(.warning, "Cannot change directory to {s}: {s}", .{ asked.path, paths.directoryError(err) });
             return err;
         };
         try session.publish(arena, true);
     } else if (eql(u8, method, m.add_directory)) {
         const asked = try rpc.parse(synth.Directory, arena, params);
         session.stack.loop.addDirectory(asked.path, @tagName(asked.source)) catch |err| {
-            self.noticeFmt(.warning, "Cannot add directory {s}: {s}", .{ asked.path, @import("../core/paths.zig").directoryError(err) });
+            self.noticeFmt(.warning, "Cannot add directory {s}: {s}", .{ asked.path, paths.directoryError(err) });
             return err;
         };
         try session.publish(arena, true);
@@ -1712,42 +1714,47 @@ const Session = struct {
             .other => {},
         };
 
-        const loop = &self.stack.loop;
-        if (std.mem.startsWith(u8, text.items, "/")) {
-            const changes_directory = std.mem.eql(u8, text.items, "/cd") or std.mem.startsWith(u8, text.items, "/cd ");
-            if (changes_directory) {
-                const path = std.mem.trim(u8, text.items[3..], " \t\n");
-                if (path.len == 0) return self.notice(.info, "{s}", .{loop.workingDirectory()});
-                loop.changeDirectory(path) catch |err| return self.notice(.warning, "Cannot change directory to {s}: {s}", .{ path, @import("../core/paths.zig").directoryError(err) });
-                return self.notice(.info, "Working directory: {s}", .{loop.workingDirectory()});
-            }
-            const adds_directory = std.mem.eql(u8, text.items, "/add-dir") or std.mem.startsWith(u8, text.items, "/add-dir ");
-            if (adds_directory) {
-                const path = std.mem.trim(u8, text.items[8..], " \t\r\n");
-                loop.addDirectory(path, "slash_command") catch |err| return self.notice(.warning, "Cannot add directory {s}: {s}", .{ path, @import("../core/paths.zig").directoryError(err) });
-                return self.notice(.info, "Directory added to this session", .{});
-            }
-            if (skill.findIn(self.stack.skills.skills, skill.idOf(text.items))) |found| {
-                if (loop.isBusy()) return error.Busy;
-                try attachments.append(arena, .{
-                    .path = try std.fs.path.join(arena, &.{ found.dir, skill.file_name }),
-                    .content = try skill_tool.render(arena, found),
-                });
-                return loop.submit(text.items, .{ .attachments = attachments.items, .images = images.items, .command_name = found.id, .command_args = std.mem.trimStart(u8, text.items[@min(text.items.len, found.id.len + 1)..], " \t\n"), .expanded_prompt = attachments.items[attachments.items.len - 1].content });
-            }
-            if (std.mem.eql(u8, text.items, "/hooks") or std.mem.startsWith(u8, text.items, "/hooks ")) {
-                const command = try @import("../core/hook_store.zig").parseCommand(text.items);
-                const report = try self.stack.manageHooks(arena, command.action, command.id);
-                self.agent.noticeFmt(.info, "{s}", .{report});
-                return;
-            }
-            if (std.mem.eql(u8, std.mem.trimEnd(u8, text.items, " \t\n"), "/compact")) {
-                if (loop.isBusy()) return error.Busy;
-                return loop.compact();
-            }
-        }
+        if (std.mem.startsWith(u8, text.items, "/") and try self.slashCommand(arena, text.items, &attachments, images.items)) return;
         const extras: Loop.Extras = .{ .attachments = attachments.items, .images = images.items };
+        const loop = &self.stack.loop;
         if (!try loop.steer(text.items, extras)) try loop.submit(text.items, extras);
+    }
+
+    fn slashCommand(self: *Session, arena: std.mem.Allocator, line: []const u8, attachments: *std.ArrayList(mention.Attachment), images: []const []const u8) !bool {
+        const split = std.mem.indexOfAny(u8, line, " \t\r\n") orelse line.len;
+        const name = line[0..split];
+        const arguments = std.mem.trim(u8, line[split..], " \t\r\n");
+        const loop = &self.stack.loop;
+        if (std.mem.eql(u8, name, "/cd")) {
+            if (arguments.len == 0) {
+                self.notice(.info, "{s}", .{loop.workingDirectory()});
+                return true;
+            }
+            loop.changeDirectory(arguments) catch |err| {
+                self.notice(.warning, "Cannot change directory to {s}: {s}", .{ arguments, paths.directoryError(err) });
+                return true;
+            };
+            self.notice(.info, "Working directory: {s}", .{loop.workingDirectory()});
+        } else if (std.mem.eql(u8, name, "/add-dir")) {
+            loop.addDirectory(arguments, "slash_command") catch |err| {
+                self.notice(.warning, "Cannot add directory {s}: {s}", .{ arguments, paths.directoryError(err) });
+                return true;
+            };
+            self.notice(.info, "Directory added to this session", .{});
+        } else if (skill.findIn(self.stack.skills.skills, skill.idOf(name))) |found| {
+            if (loop.isBusy()) return error.Busy;
+            const expanded = try skill_tool.render(arena, found);
+            try attachments.append(arena, .{ .path = try std.fs.path.join(arena, &.{ found.dir, skill.file_name }), .content = expanded });
+            try loop.submit(line, .{ .attachments = attachments.items, .images = images, .command_name = found.id, .command_args = arguments, .expanded_prompt = expanded });
+        } else if (std.mem.eql(u8, name, "/hooks")) {
+            const command = try HookStore.parseCommand(line);
+            const report = try self.stack.manageHooks(arena, command.action, command.id);
+            self.agent.noticeFmt(.info, "{s}", .{report});
+        } else if (std.mem.eql(u8, name, "/compact") and arguments.len == 0) {
+            if (loop.isBusy()) return error.Busy;
+            try loop.compact();
+        } else return false;
+        return true;
     }
 
     /// A linked file in the project, attached as a mention of it would be.
@@ -2172,6 +2179,7 @@ const Session = struct {
 
         return .{
             .state = loop.state,
+            .prompt_queued = loop.pending_submit != null,
             .label = loop.label(),
             .title = loop.title(),
             .handle = self.handle,

@@ -2132,7 +2132,27 @@ test "hook review and trust flow through the same ACP interface as the TUI" {
     const messages_before = convo.messages.items.len;
     try mirror.submit("blocked before persistence", .{});
     try pollUntil(mirror, finishedAndAnswered);
-    try testing.expectEqual(messages_before, convo.messages.items.len);
+    try testing.expectEqual(messages_before + 1, convo.messages.items.len);
+    const queued = convo.messages.items[convo.messages.items.len - 1].text;
+    try testing.expect(std.mem.indexOf(u8, queued, "Hooks need review") != null);
+    try testing.expect(std.mem.indexOf(u8, queued, "blocked before persistence") != null);
+    try pollUntil(mirror, struct {
+        fn ready(m: *Mirror) bool {
+            return m.status.prompt_queued;
+        }
+    }.ready);
+    try mirror.cancel();
+    try pollUntil(mirror, struct {
+        fn ready(m: *Mirror) bool {
+            return !m.status.prompt_queued;
+        }
+    }.ready);
+    try mirror.hooks(.trust, id);
+    const trusted_again = try pollForAnswer(mirror);
+    defer trusted_again.deinit(testing.allocator);
+    for (convo.messages.items) |message| {
+        try testing.expect(message.origin != .human or !std.mem.eql(u8, message.text, "blocked before persistence"));
+    }
 }
 
 test "directory APIs and slash commands update session status without a model request" {
