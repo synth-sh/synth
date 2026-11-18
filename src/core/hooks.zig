@@ -1,4 +1,5 @@
 const std = @import("std");
+const ToolInput = @import("hook_tool_input.zig");
 const builtin = @import("builtin");
 pub const Result = @import("hook_result.zig").Result;
 const output = @import("hook_result.zig");
@@ -11,7 +12,6 @@ pub const default_timeout_ms: u64 = 30_000;
 pub const cleanup_timeout_ms: i64 = 3000;
 pub const review_notice = "Hooks need review. Use /hooks review or synth hooks review; trust or disable each reviewed id.";
 const max_timeout_ms: u64 = 86_400_000;
-const milliseconds_per_second: u64 = 1000;
 const background_limit: usize = 64;
 const posix_signals = switch (builtin.os.tag) {
     .windows, .wasi => false,
@@ -308,13 +308,13 @@ fn parseHandler(a: std.mem.Allocator, value: std.json.Value, declaration: Declar
     try validateDefinition(value, legacy);
     var normalized = value;
     if (value.object.get("timeout")) |seconds| {
-        if (seconds != .integer or seconds.integer <= 0 or seconds.integer > max_timeout_ms / milliseconds_per_second or value.object.contains("timeout_ms")) return error.InvalidHookTimeout;
+        if (seconds != .integer or seconds.integer <= 0 or seconds.integer > max_timeout_ms / std.time.ms_per_s or value.object.contains("timeout_ms")) return error.InvalidHookTimeout;
         normalized = .{ .object = .empty };
         var fields = value.object.iterator();
         while (fields.next()) |field| {
             if (!std.mem.eql(u8, field.key_ptr.*, "timeout")) try normalized.object.put(a, field.key_ptr.*, field.value_ptr.*);
         }
-        try normalized.object.put(a, "timeout_ms", .{ .integer = seconds.integer * milliseconds_per_second });
+        try normalized.object.put(a, "timeout_ms", .{ .integer = seconds.integer * std.time.ms_per_s });
     }
     const encoded = try std.json.Stringify.valueAlloc(a, normalized, .{});
     var hook = try std.json.parseFromSliceLeaky(Hook, a, encoded, .{});
@@ -1425,16 +1425,11 @@ fn writeJson(
         var scratch: std.heap.ArenaAllocator = .init(allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
-        var arguments = std.json.parseFromSliceLeaky(std.json.Value, a, invocation.tool_input, .{}) catch std.json.Value{ .object = .empty };
-        if (arguments == .object) {
-            const builtin_path = std.mem.eql(u8, invocation.tool_name, "read") or std.mem.eql(u8, invocation.tool_name, "write") or std.mem.eql(u8, invocation.tool_name, "edit");
-            if (builtin_path) if (arguments.object.get("path")) |value| try arguments.object.put(a, "file_path", value);
-            if (std.mem.eql(u8, invocation.tool_name, "edit")) {
-                inline for (.{ .{ "old", "old_string" }, .{ "new", "new_string" } }) |pair| {
-                    if (arguments.object.get(pair[0])) |value| try arguments.object.put(a, pair[1], value);
-                }
-            }
-        }
+        var arguments = std.json.parseFromSliceLeaky(std.json.Value, a, invocation.tool_input, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => std.json.Value{ .object = .empty },
+        };
+        try ToolInput.addAliases(a, invocation.tool_name, &arguments);
         try std.json.Stringify.value(arguments, .{}, w);
     }
     if (invocation.event == .post_tool_use or invocation.event == .post_tool_use_failure) {

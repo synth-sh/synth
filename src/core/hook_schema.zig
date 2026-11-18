@@ -68,7 +68,7 @@ fn typeMatches(name: []const u8, value: std.json.Value) !bool {
     };
 }
 
-fn jsonEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
+pub fn jsonEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
     const lhs_number: ?f128 = switch (lhs) {
         .integer => |v| @floatFromInt(v),
         .float => |v| @floatCast(v),

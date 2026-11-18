@@ -2,6 +2,8 @@
 //! back, repeat until it answers in prose.
 
 const std = @import("std");
+const HookSchema = @import("../core/hook_schema.zig");
+const HookToolInput = @import("../core/hook_tool_input.zig");
 const HumanIntent = @import("../core/human_intent.zig");
 const paths = @import("../core/paths.zig");
 const testing = std.testing;
@@ -1406,23 +1408,15 @@ fn pollOtherHooks(self: *Loop) !bool {
             call.result_bytes = blocked.len;
         } else {
             if (dispatch.result.replacement) |replacement| {
-                var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, replacement, .{}) catch return error.InvalidHookOutput;
-                defer parsed.deinit();
-                if (parsed.value != .object) return error.InvalidHookOutput;
-                const definition = self.registry.get(call.name) orelse return error.UnknownTool;
-                const schema = try std.json.parseFromSlice(std.json.Value, self.allocator, definition.schema, .{});
-                defer schema.deinit();
-                @import("../core/hook_schema.zig").validate(schema.value, parsed.value) catch {
+                self.replaceHookInput(call, replacement) catch |err| {
+                    if (err == error.OutOfMemory) return err;
                     call.status = .rejected;
-                    call.result = try self.allocator.dupe(u8, "hook replacement does not satisfy the tool input schema");
+                    call.result = try std.fmt.allocPrint(self.allocator, "hook replacement does not satisfy the tool input schema: {s}", .{@errorName(err)});
                     call.result_bytes = call.result.?.len;
                     try self.persistToolCall(message_index, index);
                     try self.autoApprove();
                     return true;
                 };
-                const effective = try self.allocator.dupe(u8, replacement);
-                self.allocator.free(call.arguments);
-                call.arguments = effective;
             }
             try self.acceptHookResult(&dispatch.result);
             if (self.hook_flow.purpose() == .tool_policy and dispatch.result.permission == .ask) try self.hook_flow.asks.append(self.allocator, call.id);
@@ -1440,6 +1434,19 @@ fn pollOtherHooks(self: *Loop) !bool {
         return true;
     }
     return self.pollOwnerHooks(dispatch);
+}
+
+fn replaceHookInput(self: *Loop, call: *Conversation.ToolCall, replacement: []const u8) !void {
+    const effective = try HookToolInput.normalize(self.allocator, call.name, call.arguments, replacement);
+    errdefer self.allocator.free(effective);
+    const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, effective, .{});
+    defer parsed.deinit();
+    const definition = self.registry.get(call.name) orelse return error.UnknownTool;
+    const schema = try std.json.parseFromSlice(std.json.Value, self.allocator, definition.schema, .{});
+    defer schema.deinit();
+    try HookSchema.validate(schema.value, parsed.value);
+    self.allocator.free(call.arguments);
+    call.arguments = effective;
 }
 
 fn startPolicyHook(self: *Loop, purpose: HookPurpose, index: usize) !void {
@@ -6135,7 +6142,7 @@ test "rewritten file arguments drive checkpoints execution and persistence" {
     loop.approvals = .all;
     fixture.fake.tool_name = "write";
     fixture.fake.tool_arguments = "{\"path\":\"original.txt\",\"content\":\"original\"}";
-    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"path\":\"effective.txt\",\"content\":\"effective\"}}}'" };
+    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"file_path\":\"effective.txt\",\"content\":\"effective\"}}}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
     loop.hooks = &runner;
     try loop.submit("go", .{});
@@ -7432,4 +7439,23 @@ test "reading from an outside cwd still requires human approval" {
     const call = fixture.convo.messages.items[1].tool_calls[0];
     try testing.expectEqual(Conversation.ToolCall.Status.ok, call.status);
     try testing.expect(std.mem.indexOf(u8, call.result.?, "outside contents") != null);
+}
+
+test "conflicting hook argument spellings reject the call without stalling" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .all;
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"original\",\"content\":\"x\"}";
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"path\":\"one\",\"file_path\":\"two\",\"content\":\"x\"}}}'" }} } };
+    loop.hooks = &runner;
+    try loop.submit("write", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    const call = fixture.convo.messages.items[1].tool_calls[0];
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
+    try testing.expect(std.mem.indexOf(u8, call.result.?, "ConflictingHookAliases") != null);
+    for ([_][]const u8{ "original", "one", "two" }) |path| try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, path, .{}));
 }

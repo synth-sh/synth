@@ -40,6 +40,10 @@ The [path-protection example](../examples/hooks/protect-paths.py) rejects writes
 to secrets, CI files, lockfiles, and migrations, including equivalent paths and
 symlinks. Place it under `.synth/` and match `write|edit`.
 
+Built-in file hooks expose `file_path`, `old_string`, and `new_string` alongside
+Synth's field names, including batched edits. `updatedInput` accepts either
+spelling; conflicting changes reject the call. MCP arguments are preserved.
+
 ## Handlers and matching
 
 Grouped handlers use `type: "command"` by default. `timeout_ms` is milliseconds and `timeout` is seconds;
