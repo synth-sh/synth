@@ -2280,7 +2280,7 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
     const intent = if (stored_intent) |snapshot| snapshot.messages else if (remembered.len > 0) remembered else asker.conversation.messages.items;
     const complete_intent = if (stored_intent) |snapshot| snapshot.is_complete else asker.human_intent.is_complete;
     if (!complete_intent) {
-        _ = try self.judgeUnavailable(call_index, "human instructions exceed the review context budget");
+        _ = try self.judgeUnavailable(call_index, "stored human instructions were truncated before this version");
         return;
     }
     const has_human = for (intent) |message| {
@@ -2449,7 +2449,7 @@ pub fn answer(self: *Loop, text: []const u8) !void {
         if (call.status != .running) continue;
         if (!std.mem.eql(u8, call.name, ask_user.name)) continue;
 
-        const receipt = try std.json.Stringify.valueAlloc(self.allocator, .{ .kind = "human_answer", .message_seq = self.conversation.messages.items[message_index].seq, .call_index = i, .answer = HumanIntent.clip(text, HumanIntent.decision_bytes / 2), .is_complete = text.len <= HumanIntent.decision_bytes / 2 }, .{});
+        const receipt = try std.json.Stringify.valueAlloc(self.allocator, .{ .kind = "human_answer", .message_seq = self.conversation.messages.items[message_index].seq, .call_index = i, .answer = text }, .{});
         defer self.allocator.free(receipt);
         try self.recordHuman(receipt, true);
         self.approved_ask_index = null;
@@ -7358,23 +7358,37 @@ test "an unreviewed prompt remains visible and resumes after trust" {
     try testing.expectEqual(Outcome.done, loop.outcome.?);
 }
 
-test "clipped human instructions require a human decision instead of model review" {
+test "reviewer context failures use a per-request human fallback" {
+    const Limited = struct {
+        fake: *FakeProvider,
+        reject_review: bool = true,
+        fn respond(ptr: *anyopaque, convo: *Conversation, asked: Provider.Turn, a: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.reject_review and std.mem.eql(u8, asked.system, classifier.system_prompt)) return error.ContextTooLarge;
+            return FakeProvider.respond(self.fake, convo, asked, a, sink);
+        }
+    };
     const fixture = try Fixture.init();
     defer fixture.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
+    var limited: Limited = .{ .fake = &fixture.fake };
+    loop.provider.userdata = &limited;
+    loop.provider.respond = Limited.respond;
     loop.approvals = .auto;
     fixture.fake.tool_name = "bash";
-    fixture.fake.tool_arguments = "{\"command\":\"touch must-not-run\"}";
-    const request = try testing.allocator.alloc(u8, HumanIntent.prompt_bytes + 1);
-    defer testing.allocator.free(request);
-    @memset(request, 'x');
-    try loop.submit(request, .{});
+    fixture.fake.tool_arguments = "{\"command\":\"touch reviewed-after-recovery\"}";
+    try loop.submit("inspect", .{});
     try settle(&loop);
     try testing.expectEqual(State.awaiting_approval, loop.state);
-    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "must-not-run", .{}));
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "reviewed-after-recovery", .{}));
     try loop.decide(.deny);
     try settle(&loop);
+    limited.reject_review = false;
+    try loop.submit("create the file", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try fixture.tmp.dir.access(testing.io, "reviewed-after-recovery", .{});
 }
 
 test "cancelling a queued unreviewed prompt prevents later execution" {
@@ -7393,7 +7407,7 @@ test "cancelling a queued unreviewed prompt prevents later execution" {
     for (fixture.convo.messages.items) |message| try testing.expect(message.origin != .human);
 }
 
-test "a clipped answer keeps subsequent actions behind human review" {
+test "an answer within the instruction budget keeps automatic review working" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
     var loop = fixture.loop();
@@ -7410,13 +7424,12 @@ test "a clipped answer keeps subsequent actions behind human review" {
     try loop.answer(answer_text);
     try settle(&loop);
     fixture.fake.tool_name = "bash";
-    fixture.fake.tool_arguments = "{\"command\":\"touch must-not-run\"}";
+    fixture.fake.tool_arguments = "{\"command\":\"touch reviewed-answer\"}";
     try loop.submit("continue", .{});
     try settle(&loop);
-    try testing.expectEqual(State.awaiting_approval, loop.state);
-    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "must-not-run", .{}));
-    try loop.decide(.deny);
-    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expect(fixture.fake.judged > 0);
+    try fixture.tmp.dir.access(testing.io, "reviewed-answer", .{});
 }
 
 test "reading from an outside cwd still requires human approval" {
@@ -7459,4 +7472,30 @@ test "conflicting hook argument spellings reject the call without stalling" {
     try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
     try testing.expect(std.mem.indexOf(u8, call.result.?, "ConflictingHookAliases") != null);
     for ([_][]const u8{ "original", "one", "two" }) |path| try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, path, .{}));
+}
+
+test "automatic review survives receipt eviction and session resume" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch reviewed\"}";
+    for (0..20) |_| {
+        try loop.submit("inspect", .{});
+        try settle(&loop);
+        try testing.expectEqual(State.awaiting_approval, loop.state);
+        try loop.decide(.deny);
+        try settle(&loop);
+    }
+    try loop.resumeSession(loop.session_id.?, 64);
+    loop.approvals = .auto;
+    try loop.submit("create reviewed", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expect(fixture.fake.judged > 0);
+    try fixture.tmp.dir.access(testing.io, "reviewed", .{});
 }

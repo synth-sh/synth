@@ -2,9 +2,8 @@ const std = @import("std");
 const Conversation = @import("conversation.zig");
 const Intent = @This();
 
-pub const prompt_bytes = 12 * 1024;
 pub const decision_bytes = 2 * 1024;
-const max_messages = 64;
+pub const max_decisions = 64;
 
 is_complete: bool = true,
 prompts: std.ArrayList(Conversation.Message) = .empty,
@@ -29,32 +28,43 @@ pub fn deinit(self: *Intent, a: std.mem.Allocator) void {
 }
 
 pub fn record(self: *Intent, a: std.mem.Allocator, text: []const u8, decision: bool) !void {
-    const messages = if (decision) &self.decisions else &self.prompts;
-    const limit: usize = if (decision) decision_bytes else prompt_bytes;
-    const available = if (decision) limit else if (messages.items.len == 0) limit / 2 else limit - messages.items[0].text.len;
-    const body = try a.dupe(u8, clip(text, available));
-    if (body.len < text.len) self.is_complete = false;
     if (decision and std.mem.startsWith(u8, text, "{")) {
-        if (std.json.parseFromSlice(std.json.Value, a, text, .{})) |receipt| {
-            defer receipt.deinit();
-            if (receipt.value == .object) if (receipt.value.object.get("is_complete")) |complete| {
-                if (complete != .bool or !complete.bool) self.is_complete = false;
-            };
-        } else |_| self.is_complete = false;
+        const receipt = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                self.is_complete = false;
+                return;
+            },
+        };
+        defer receipt.deinit();
+        if (receipt.value == .object) {
+            if (receipt.value.object.get("kind")) |kind| {
+                if (kind == .string and std.mem.eql(u8, kind.string, "human_answer")) {
+                    if (receipt.value.object.get("is_complete")) |complete| {
+                        if (complete != .bool or !complete.bool) self.is_complete = false;
+                    }
+                    const answer = receipt.value.object.get("answer") orelse return error.InvalidHumanAnswer;
+                    if (answer != .string) return error.InvalidHumanAnswer;
+                    return self.record(a, answer.string, false);
+                }
+            }
+        }
     }
+    const body = try a.dupe(u8, if (decision) clip(text, decision_bytes) else text);
     errdefer a.free(body);
+    const messages = if (decision) &self.decisions else &self.prompts;
     try messages.append(a, .{ .role = .user, .origin = if (decision) .human_decision else .human, .text = body });
+    if (!decision) return;
     var size: usize = 0;
     for (messages.items) |message| size += message.text.len;
-    while (size > limit or messages.items.len > max_messages) {
-        self.is_complete = false;
-        var old = messages.orderedRemove(if (decision or messages.items.len == 1) 0 else 1);
+    while (size > decision_bytes or messages.items.len > max_decisions) {
+        var old = messages.orderedRemove(0);
         size -= old.text.len;
         old.deinit(a);
     }
 }
 
-pub fn clip(text: []const u8, limit: usize) []const u8 {
+fn clip(text: []const u8, limit: usize) []const u8 {
     var length = @min(text.len, limit);
     while (length > 0 and length < text.len and text[length] & 0xc0 == 0x80) length -= 1;
     return text[0..length];
@@ -80,6 +90,7 @@ test "decision history cannot displace human requests" {
     const messages = try intent.view(a);
     defer a.free(messages);
     try std.testing.expectEqualStrings("inspect only", messages[0].text);
+    try std.testing.expect(intent.is_complete);
 }
 
 test "the initial task and latest correction survive a long human conversation" {
@@ -93,6 +104,8 @@ test "the initial task and latest correction survive a long human conversation" 
     defer a.free(messages);
     try std.testing.expectEqualStrings("inspect only; do not upload", messages[0].text);
     try std.testing.expectEqualStrings("stop now", messages[messages.len - 1].text);
+    try std.testing.expect(intent.is_complete);
+    try std.testing.expectEqual(@as(usize, 102), messages.len);
 }
 
 test "clipped answer receipts cannot restore complete review evidence" {
@@ -102,4 +115,18 @@ test "clipped answer receipts cannot restore complete review evidence" {
     try intent.record(a, "inspect the project", false);
     try intent.record(a, "{\"kind\":\"human_answer\",\"answer\":\"partial answer\",\"is_complete\":false}", true);
     try std.testing.expect(!intent.is_complete);
+}
+
+test "human instructions are preserved for the reviewer actual context window" {
+    const a = std.testing.allocator;
+    var intent: Intent = .{};
+    defer intent.deinit(a);
+    const prompt = try a.alloc(u8, 7 * 1024);
+    defer a.free(prompt);
+    @memset(prompt, 'x');
+    try intent.record(a, prompt, false);
+    const messages = try intent.view(a);
+    defer a.free(messages);
+    try std.testing.expectEqualStrings(prompt, messages[0].text);
+    try std.testing.expect(intent.is_complete);
 }

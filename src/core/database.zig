@@ -2,6 +2,7 @@
 //! remembered approvals.
 
 const std = @import("std");
+const HumanIntent = @import("human_intent.zig");
 
 const zqlite = @import("zqlite");
 
@@ -641,27 +642,27 @@ pub fn setMessageOrigin(self: *Database, id: i64, origin: Conversation.Origin) !
 }
 
 pub fn recordAuthorization(self: *Database, session: i64, seq: u64, text: []const u8) !void {
-    const Intent = @import("human_intent.zig");
-    try self.conn.exec("INSERT INTO human_authorization (session_id, seq, text) VALUES (?, ?, ?)", .{ session, seq, Intent.clip(text, Intent.decision_bytes) });
+    try self.conn.exec("INSERT INTO human_authorization (session_id, seq, text) VALUES (?, ?, ?)", .{ session, seq, text });
 }
 
-pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) !@import("human_intent.zig").Snapshot {
+pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) !HumanIntent.Snapshot {
     var rows = try self.conn.rows(
+        \\WITH authorizations AS (
+        \\SELECT text, seq, CASE WHEN json_valid(text) THEN json_extract(text, '$.kind') END AS kind FROM human_authorization WHERE session_id = ?
+        \\)
         \\SELECT text, decision FROM (
-        \\SELECT text, seq, 0 AS decision FROM (SELECT text, seq FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human' ORDER BY seq ASC LIMIT 1)
-        \\UNION
-        \\SELECT text, seq, 0 AS decision FROM (SELECT text, seq FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human' ORDER BY seq DESC LIMIT 63)
+        \\SELECT text, seq, 0 AS decision FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human'
         \\UNION ALL
-        \\SELECT text, seq, 1 AS decision FROM (SELECT text, seq FROM human_authorization WHERE session_id = ? ORDER BY seq DESC LIMIT 64)
+        \\SELECT text, seq, 1 AS decision FROM authorizations WHERE kind = 'human_answer' OR (kind IS NULL AND text LIKE '{"kind":"human_answer",%')
+        \\UNION ALL
+        \\SELECT text, seq, 1 AS decision FROM (SELECT text, seq FROM authorizations WHERE kind IS NOT 'human_answer' AND text NOT LIKE '{"kind":"human_answer",%' ORDER BY seq DESC LIMIT ?)
         \\) ORDER BY seq ASC
-    , .{ session, session, session });
+    , .{ session, session, HumanIntent.max_decisions });
     defer rows.deinit();
-    var intent: @import("human_intent.zig") = .{};
+    var intent: HumanIntent = .{};
     defer intent.deinit(allocator);
     while (rows.next()) |row| try intent.record(allocator, row.text(0), row.int(1) != 0);
-    const count = try self.conn.row("SELECT (SELECT count(*) FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human'), (SELECT count(*) FROM human_authorization WHERE session_id = ?)", .{ session, session }) orelse return error.MissingHumanIntent;
-    defer count.deinit();
-    return .{ .messages = try intent.take(allocator), .is_complete = intent.is_complete and count.int(0) <= 64 and count.int(1) <= 64 };
+    return .{ .messages = try intent.take(allocator), .is_complete = intent.is_complete };
 }
 
 /// Append a heavy body (reasoning or tool result) to a message.
@@ -2672,6 +2673,8 @@ test "persisted human intent retains the initial restriction and latest request"
     }
     try std.testing.expectEqualStrings("inspect only", messages[0].text);
     try std.testing.expectEqualStrings("stop now", messages[messages.len - 1].text);
+    try std.testing.expect(snapshot.is_complete);
+    try std.testing.expectEqual(@as(usize, 80), messages.len);
 }
 
 test "persisted clipped answers keep automatic review unavailable" {
@@ -2686,4 +2689,26 @@ test "persisted clipped answers keep automatic review unavailable" {
     const snapshot = try db.humanIntent(a, session);
     defer snapshot.deinit(a);
     try std.testing.expect(!snapshot.is_complete);
+}
+
+test "human answers survive ordinary receipt eviction without losing their restrictions" {
+    const a = std.testing.allocator;
+    var db = try init(a, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    const id = try db.appendMessage(session, 0, "user", "inspect", null, 0, null);
+    try db.setMessageOrigin(id, .human);
+    const answer = "x" ** 2048 ++ " do not upload";
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .kind = "human_answer", .answer = answer }, .{});
+    defer a.free(receipt);
+    try db.recordAuthorization(session, 1, receipt);
+    for (2..100) |seq| try db.recordAuthorization(session, seq, "{\"kind\":\"human_tool_decision\",\"decision\":\"deny\",\"action_hash\":\"abc\"}");
+    const snapshot = try db.humanIntent(a, session);
+    defer snapshot.deinit(a);
+    try std.testing.expect(snapshot.is_complete);
+    const present = for (snapshot.messages) |message| {
+        if (message.origin == .human and std.mem.eql(u8, message.text, answer)) break true;
+    } else false;
+    try std.testing.expect(present);
 }
