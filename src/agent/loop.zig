@@ -7254,39 +7254,41 @@ test "steering with prompt hooks resolves mentions and retains human provenance"
 }
 
 test "adding a home root never grants automatic writes to hook control files" {
-    for ([_][]const u8{ ".synth/hooks.json", "state/hook-trust.json", "config.json", ".git/hooks/pre-commit" }) |name| {
-        const fixture = try Fixture.init();
-        defer fixture.deinit();
-        try fixture.tmp.dir.createDirPath(testing.io, "project");
-        try fixture.tmp.dir.createDirPath(testing.io, "home/.synth");
-        try fixture.tmp.dir.createDirPath(testing.io, "home/state");
-        try fixture.tmp.dir.createDirPath(testing.io, "home/.git/hooks");
-        const project = try std.fs.path.join(testing.allocator, &.{ fixture.root, "project" });
-        defer testing.allocator.free(project);
-        const home = try std.fs.path.join(testing.allocator, &.{ fixture.root, "home" });
-        defer testing.allocator.free(home);
-        const target = try std.fs.path.join(testing.allocator, &.{ home, name });
-        defer testing.allocator.free(target);
-        const trust = try std.fs.path.join(testing.allocator, &.{ home, "state/hook-trust.json" });
-        defer testing.allocator.free(trust);
-        const config = try std.fs.path.join(testing.allocator, &.{ home, "config.json" });
-        defer testing.allocator.free(config);
-        var loop = fixture.loop();
-        defer loop.deinit();
-        loop.project_root = project;
-        loop.control_files = &.{ trust, config };
-        loop.approvals = .auto;
-        try loop.addDirectory(home, "slash_command");
-        fixture.fake.tool_name = "write";
-        const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = target, .content = "forged policy" }, .{});
-        defer testing.allocator.free(args);
-        fixture.fake.tool_arguments = args;
-        try loop.submit("update the file", .{});
-        try settle(&loop);
-        try testing.expectEqual(State.awaiting_approval, loop.state);
-        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, target, .{}));
-        try loop.decide(.deny);
-        try settle(&loop);
+    for ([_][]const u8{ ".synth/hooks.json", "state/hook-trust.json", "config.json", ".git/hooks/pre-commit", ".git/config", ".git/objects/new" }) |name| {
+        for ([_]Config.Approvals{ .ask, .auto, .all }) |mode| {
+            const fixture = try Fixture.init();
+            defer fixture.deinit();
+            try fixture.tmp.dir.createDirPath(testing.io, "project");
+            try fixture.tmp.dir.createDirPath(testing.io, "home/.synth");
+            try fixture.tmp.dir.createDirPath(testing.io, "home/state");
+            try fixture.tmp.dir.createDirPath(testing.io, "home/.git/hooks");
+            const project = try std.fs.path.join(testing.allocator, &.{ fixture.root, "project" });
+            defer testing.allocator.free(project);
+            const home = try std.fs.path.join(testing.allocator, &.{ fixture.root, "home" });
+            defer testing.allocator.free(home);
+            const target = try std.fs.path.join(testing.allocator, &.{ home, name });
+            defer testing.allocator.free(target);
+            const trust = try std.fs.path.join(testing.allocator, &.{ home, "state/hook-trust.json" });
+            defer testing.allocator.free(trust);
+            const config = try std.fs.path.join(testing.allocator, &.{ home, "config.json" });
+            defer testing.allocator.free(config);
+            var loop = fixture.loop();
+            defer loop.deinit();
+            loop.project_root = project;
+            loop.control_files = &.{ trust, config };
+            loop.approvals = mode;
+            try loop.addDirectory(home, "slash_command");
+            fixture.fake.tool_name = "write";
+            const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = target, .content = "forged policy" }, .{});
+            defer testing.allocator.free(args);
+            fixture.fake.tool_arguments = args;
+            try loop.submit("update the file", .{});
+            try settle(&loop);
+            try testing.expectEqual(State.awaiting_approval, loop.state);
+            try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, target, .{}));
+            try loop.decide(.deny);
+            try settle(&loop);
+        }
     }
 }
 

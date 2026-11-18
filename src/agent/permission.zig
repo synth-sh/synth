@@ -9,7 +9,7 @@
 //! matches only that path.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const unicode = @import("uucode");
 const Paths = @import("../core/paths.zig");
 const Hooks = @import("../core/hooks.zig");
 const testing = std.testing;
@@ -252,10 +252,8 @@ pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, tar
     const resolved = try Paths.resolve(io, arena, root, target);
     for ([_][]const u8{ lexical, resolved }) |path| {
         var parts = std.mem.tokenizeScalar(u8, path, '/');
-        var previous: []const u8 = "";
         while (parts.next()) |part| {
-            if (sameName(part, ".synth") or (sameName(previous, ".git") and sameName(part, "hooks"))) return true;
-            previous = part;
+            if (sameName(part, ".synth") or sameName(part, ".git")) return true;
         }
     }
     for (control_files) |file| {
@@ -287,11 +285,33 @@ fn samePath(arena: std.mem.Allocator, io: std.Io, root: []const u8, file: []cons
     return sameName(actual, resolved);
 }
 
+const Folded = struct {
+    input: std.unicode.Utf8Iterator,
+    single: [1]u21 = undefined,
+    mapping: []const u21 = &.{},
+    index: usize = 0,
+
+    fn next(self: *Folded) ?u21 {
+        if (self.index == self.mapping.len) {
+            const codepoint = self.input.nextCodepoint() orelse return null;
+            self.mapping = unicode.get(.case_folding_full, codepoint).with(&self.single, codepoint);
+            self.index = 0;
+        }
+        const codepoint = self.mapping[self.index];
+        self.index += 1;
+        return codepoint;
+    }
+};
+
 fn sameName(a: []const u8, b: []const u8) bool {
-    return switch (builtin.os.tag) {
-        .macos, .windows => std.ascii.eqlIgnoreCase(a, b),
-        else => std.mem.eql(u8, a, b),
-    };
+    const left = std.unicode.Utf8View.init(a) catch return std.mem.eql(u8, a, b);
+    const right = std.unicode.Utf8View.init(b) catch return std.mem.eql(u8, a, b);
+    var lhs: Folded = .{ .input = left.iterator() };
+    var rhs: Folded = .{ .input = right.iterator() };
+    while (lhs.next()) |codepoint| {
+        if (codepoint != (rhs.next() orelse return false)) return false;
+    }
+    return rhs.next() == null;
 }
 
 test "hook script protection accounts for shell operators and quoting" {
@@ -317,7 +337,6 @@ test "hook script protection accounts for shell operators and quoting" {
 }
 
 test "missing hook control files cannot bypass protection through case variants" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var tmp = testing.tmpDir(.{});
@@ -325,7 +344,7 @@ test "missing hook control files cannot bypass protection through case variants"
     const a = arena.allocator();
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
     const trust = try std.fs.path.join(a, &.{ root, "hook-trust.json" });
-    for ([_][]const u8{ ".SYNTH/hooks.json", ".GIT/HOOKS/new", "HOOK-TRUST.json" }) |target| {
+    for ([_][]const u8{ ".SYNTH/hooks.json", ".ſynth/hooks.json", ".GIT/HOOKS/new", ".git/config", ".git/objects/new", "HOOK-TRUST.json", "hook-truſt.json", "hooK-trust.json" }) |target| {
         try testing.expect(try protectedPath(a, testing.io, root, target, &.{trust}, .{}));
     }
 }
