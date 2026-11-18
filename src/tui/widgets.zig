@@ -22,12 +22,39 @@ pub fn fill(surface: vxfw.Surface, style: Cell.Style) void {
 /// what makes the transcript read as a call stack rather than a list of cards.
 pub const nest: u16 = 2;
 
+/// Every glyph and hint the TUI draws around text rather than as text, in one
+/// array. A selection tells them apart from the same characters in a message by
+/// where a cell's bytes live, so whatever draws decoration must take its bytes
+/// from here, through `decoration`.
+const decoration_store = ("\u{256d}\u{2500}\u{2510}\u{250c}\u{2500}\u{2514}\u{2500}\u{2518}\u{2502}\u{258c}\u{2506}\u{203a}\u{25cf}" ++
+    " \u{25be} \u{25b8} " ++
+    "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}" ++
+    "click to expand|click to collapse|click to open transcript|esc to cancel|running...").*;
+
+/// `text`, drawn as decoration. A compile error when it is not in the store.
+pub fn decoration(comptime text: []const u8) []const u8 {
+    const at = comptime blk: {
+        @setEvalBranchQuota(decoration_store.len * 64);
+        break :blk std.mem.indexOf(u8, &decoration_store, text) orelse
+            @compileError("not in the decoration store: " ++ text);
+    };
+    return decoration_store[at..][0..text.len];
+}
+
+/// Whether a cell's grapheme was drawn as decoration.
+pub fn isDecoration(grapheme: []const u8) bool {
+    if (grapheme.len == 0) return false;
+    const start = @intFromPtr(&decoration_store);
+    const at = @intFromPtr(grapheme.ptr);
+    return at >= start and at < start + decoration_store.len;
+}
+
 /// What marks the head of a rail or a group of rows.
 ///
 /// A box-drawing corner rather than a bullet or an icon glyph: those are
 /// substitutes for something a terminal cannot draw, and this is a corner the
 /// terminal has. The rule it opens is the section it heads.
-pub const rail_head = "\u{256d}\u{2500}";
+pub const rail_head = decoration("\u{256d}\u{2500}");
 
 /// Write a section heading, marked and set in the colour headings take.
 pub fn writeHeading(
@@ -44,18 +71,18 @@ pub fn writeHeading(
 }
 
 /// A card's edge: solid enough to be the block's own boundary.
-pub const block_rule = "\u{258c}";
+pub const block_rule = decoration("\u{258c}");
 /// A spine: what a tool call or a reply hangs off, one step in from the margin.
-pub const solid_rule = "\u{2502}";
+pub const solid_rule = decoration("\u{2502}");
 /// The same spine, broken, for a block the reader is meant to skim past.
-pub const dashed_rule = "\u{2506}";
+pub const dashed_rule = decoration("\u{2506}");
 /// What marks a turn the reader typed, the way a shell marks the line it was
 /// handed. It sits at the head of the turn rather than running down its side:
 /// what the reader wrote is where the transcript starts, not something the
 /// rows below hang off.
-pub const prompt_mark = "\u{203a}";
+pub const prompt_mark = decoration("\u{203a}");
 /// A status light: what a call did, or which session is in front of you.
-pub const dot = "\u{25cf}";
+pub const dot = decoration("\u{25cf}");
 /// What joins two facts written on one line.
 pub const separator = " \u{00b7} ";
 
@@ -86,11 +113,11 @@ pub fn box(surface: vxfw.Surface, area: Box, ground: Cell.Style, edge: Cell.Colo
         fillRow(surface, row, area.left, area.width, ground);
 
         const corners: [2][]const u8, const span: []const u8 = if (row == area.top)
-            .{ .{ "\u{250c}", "\u{2510}" }, "\u{2500}" }
+            .{ .{ decoration("\u{250c}"), decoration("\u{2510}") }, decoration("\u{2500}") }
         else if (row == bottom)
-            .{ .{ "\u{2514}", "\u{2518}" }, "\u{2500}" }
+            .{ .{ decoration("\u{2514}"), decoration("\u{2518}") }, decoration("\u{2500}") }
         else
-            .{ .{ "\u{2502}", "\u{2502}" }, "" };
+            .{ .{ solid_rule, solid_rule }, "" };
 
         surface.writeCell(area.left, row, .{ .char = .{ .grapheme = corners[0], .width = 1 }, .style = line });
         surface.writeCell(right, row, .{ .char = .{ .grapheme = corners[1], .width = 1 }, .style = line });
@@ -110,7 +137,7 @@ pub fn rule(surface: vxfw.Surface, row: u16, col: u16, width: u16, style: Cell.S
     var x = col;
     while (x < end) : (x += 1) {
         surface.writeCell(x, row, .{
-            .char = .{ .grapheme = "\u{2500}", .width = 1 },
+            .char = .{ .grapheme = decoration("\u{2500}"), .width = 1 },
             .style = style,
         });
     }
@@ -291,4 +318,15 @@ test "a surface height is clamped to what its width can address" {
 pub fn duration(arena: std.mem.Allocator, ms: u64) ![]const u8 {
     var buffer: [humanize.duration_bytes]u8 = undefined;
     return arena.dupe(u8, humanize.duration(&buffer, ms));
+}
+
+test "decoration is told apart from the same characters in text" {
+    try std.testing.expect(isDecoration(solid_rule));
+    try std.testing.expect(isDecoration(decoration("click to expand")));
+    try std.testing.expect(isDecoration(rail_head[3..]));
+
+    const message = "a \u{2502} b";
+    try std.testing.expect(!isDecoration(message[2..5]));
+    try std.testing.expect(!isDecoration("\u{2502}"));
+    try std.testing.expect(!isDecoration(""));
 }

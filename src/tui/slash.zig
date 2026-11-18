@@ -307,7 +307,7 @@ pub fn draw(self: *Slash, ctx: vxfw.DrawContext, widget: vxfw.Widget, width: u16
 
         if (chosen) {
             w.fillRow(surface, y, 0, width, theme.on_card(theme.fg).cell);
-            _ = w.writeText(surface, 0, y, "▌", theme.on_card(theme.accent).cell);
+            _ = w.writeText(surface, 0, y, w.block_rule, theme.on_card(theme.accent).cell);
         }
 
         const name_style = if (chosen)

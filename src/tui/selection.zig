@@ -6,6 +6,8 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const Cell = vaxis.Cell;
 
+const w = @import("widgets.zig");
+
 const Selection = @This();
 
 /// Bytes stored per cell. Enough for any grapheme worth selecting; longer ones
@@ -20,9 +22,16 @@ const GridCell = struct {
     /// loses the link along with the text, which is what makes hit testing
     /// agree with what is on screen.
     link: u16 = 0,
+    /// Drawn around the text rather than as part of it: never highlighted or
+    /// copied.
+    decoration: bool = false,
 
     fn slice(self: *const GridCell) []const u8 {
         return self.bytes[0..self.len];
+    }
+
+    fn isChrome(self: *const GridCell) bool {
+        return self.decoration or self.len == 0 or std.mem.eql(u8, self.slice(), " ");
     }
 };
 
@@ -137,17 +146,19 @@ pub fn rowSpan(self: *const Selection, row: u16) ?struct { from: u16, to: u16 } 
     if (row < bounds.start.row or row > bounds.end.row or row >= self.height) return null;
 
     const limit = self.rowLimit(bounds, row);
-    const from: u16 = if (row == bounds.start.row)
+    var from: u16 = if (row == bounds.start.row)
         @max(self.left, bounds.start.col)
     else
         self.bodyLeft(bounds);
+    if (from <= limit and self.gridCell(row, from).decoration) {
+        while (from <= limit and self.gridCell(row, from).isChrome()) from += 1;
+    }
     if (from > limit) return null;
 
     var last: ?u16 = null;
     var col = from;
     while (col <= limit) : (col += 1) {
-        const bytes = self.cells[@as(usize, row) * self.width + col].slice();
-        if (bytes.len > 0 and !std.mem.eql(u8, bytes, " ")) last = col;
+        if (!self.gridCell(row, col).isChrome()) last = col;
     }
 
     return .{ .from = from, .to = last orelse return null };
@@ -171,7 +182,7 @@ fn bodyLeft(self: *const Selection, bounds: Bounds) u16 {
         const limit = self.rowLimit(bounds, row);
         var col = self.left;
         while (col <= limit and col < self.width) : (col += 1) {
-            if (isChrome(self.cells[@as(usize, row) * self.width + col].slice())) continue;
+            if (self.gridCell(row, col).isChrome()) continue;
             shared = @min(shared orelse col, col);
             break;
         }
@@ -180,11 +191,19 @@ fn bodyLeft(self: *const Selection, bounds: Bounds) u16 {
     return shared orelse self.left;
 }
 
-/// Whether a cell is part of the frame a card drew rather than of its text.
-/// Blanks, and the bar a user's message is drawn with - both sit to the left of
-/// the text on every row, and neither is worth highlighting.
-fn isChrome(bytes: []const u8) bool {
-    return bytes.len == 0 or std.mem.eql(u8, bytes, " ") or std.mem.eql(u8, bytes, "▌");
+/// Whether the selected part of `row` is drawn decoration and nothing else, like
+/// the line under a table's header: it copies as no line at all.
+fn isRuleRow(self: *const Selection, bounds: Bounds, row: u16) bool {
+    var col = if (row == bounds.start.row) @max(self.left, bounds.start.col) else self.bodyLeft(bounds);
+    const limit = self.rowLimit(bounds, row);
+    while (col <= limit) : (col += 1) {
+        if (self.gridCell(row, col).decoration) return true;
+    }
+    return false;
+}
+
+fn gridCell(self: *const Selection, row: u16, col: u16) *const GridCell {
+    return &self.cells[@as(usize, row) * self.width + col];
 }
 
 /// Copy the composited frame into the grid. Called at the end of `draw`, with
@@ -232,9 +251,13 @@ fn put(self: *Selection, row: i32, col: i32, grapheme: []const u8, uri: []const 
 
     const index = @as(usize, @intCast(row)) * self.width + @as(usize, @intCast(col));
     const len = @min(grapheme.len, cell_bytes);
-    var cell: GridCell = .{ .len = @intCast(len), .link = self.uriIndex(uri) };
-    @memcpy(cell.bytes[0..len], grapheme[0..len]);
-    self.cells[index] = cell;
+    var put_cell: GridCell = .{
+        .len = @intCast(len),
+        .link = self.uriIndex(uri),
+        .decoration = w.isDecoration(grapheme),
+    };
+    @memcpy(put_cell.bytes[0..len], grapheme[0..len]);
+    self.cells[index] = put_cell;
 }
 
 /// The one-based index of `uri` in `uris`, adding it if this is the first cell
@@ -251,11 +274,18 @@ fn uriIndex(self: *Selection, uri: []const u8) u16 {
     return @intCast(self.uris.items.len);
 }
 
-/// The grapheme at a cell, or empty when out of range. Borrowed from the grid,
-/// which lives until the next capture.
+/// Whether a cell holds decoration, which a highlight leaves as drawn.
+pub fn isDecorationAt(self: *const Selection, row: u16, col: u16) bool {
+    if (row >= self.height or col >= self.width) return false;
+    return self.gridCell(row, col).decoration;
+}
+
+/// The grapheme at a cell, or empty when out of range or decoration. Borrowed
+/// from the grid, which lives until the next capture.
 pub fn cellText(self: *const Selection, row: u16, col: u16) []const u8 {
     if (row >= self.height or col >= self.width) return "";
-    return self.cells[@as(usize, row) * self.width + col].slice();
+    const at = self.gridCell(row, col);
+    return if (at.decoration) "" else at.slice();
 }
 
 /// The selected text, with trailing blanks trimmed from each row. Caller owns
@@ -273,14 +303,14 @@ pub fn text(self: *const Selection, allocator: std.mem.Allocator) !?[]u8 {
     var row = bounds.start.row;
     while (row <= bounds.end.row and row < self.height) : (row += 1) {
         const span = self.rowSpan(row) orelse {
-            try rows.append(arena, "");
+            if (!self.isRuleRow(bounds, row)) try rows.append(arena, "");
             continue;
         };
 
         var line: std.Io.Writer.Allocating = .init(arena);
         var col = span.from;
         while (col <= span.to) : (col += 1) {
-            const bytes = self.cells[@as(usize, row) * self.width + col].slice();
+            const bytes = self.cellText(row, col);
             try line.writer.writeAll(if (bytes.len == 0) " " else bytes);
         }
         try rows.append(arena, line.written());
@@ -437,9 +467,9 @@ test "a card's bar is chrome, not the start of the text" {
     selection.width = 20;
     selection.height = 2;
 
-    selection.put(0, 0, "▌", "");
+    selection.put(0, 0, w.block_rule, "");
     for ("  first line", 0..) |c, i| selection.put(0, @intCast(2 + i), &.{c}, "");
-    selection.put(1, 0, "▌", "");
+    selection.put(1, 0, w.block_rule, "");
     for ("  second line", 0..) |c, i| selection.put(1, @intCast(2 + i), &.{c}, "");
 
     selection.begin(.{ .row = 0, .col = 4 });
@@ -497,4 +527,56 @@ test "the grid remembers what a cell links to" {
 
     try selection.capture(covered);
     try std.testing.expect(selection.linkAt(0, 2) == null);
+}
+
+test "decoration between and around text is neither highlighted nor copied" {
+    var selection: Selection = .init(std.testing.allocator);
+    defer selection.deinit();
+
+    selection.cells = try std.testing.allocator.alloc(GridCell, 60);
+    @memset(selection.cells, .{});
+    selection.width = 20;
+    selection.height = 3;
+
+    const message = "\u{2502} quoted";
+    selection.put(0, 0, w.solid_rule, "");
+    for ("Total", 0..) |c, i| selection.put(0, @intCast(2 + i), &.{c}, "");
+    selection.put(0, 8, w.solid_rule, "");
+    for ("$2,410", 0..) |c, i| selection.put(0, @intCast(9 + i), &.{c}, "");
+    selection.put(1, 0, w.solid_rule, "");
+    for (0..10) |i| selection.put(1, @intCast(2 + i), w.decoration("\u{2500}"), "");
+    selection.put(2, 0, w.solid_rule, "");
+    selection.put(2, 2, message[0..3], "");
+    for (" quoted", 0..) |c, i| selection.put(2, @intCast(3 + i), &.{c}, "");
+
+    selection.begin(.{ .row = 0, .col = 0 });
+    selection.extend(.{ .row = 2, .col = 19 });
+
+    try std.testing.expectEqual(@as(u16, 2), selection.rowSpan(0).?.from);
+    try std.testing.expect(selection.rowSpan(1) == null);
+
+    const copied = (try selection.text(std.testing.allocator)).?;
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("Total  $2,410\n\u{2502} quoted", copied);
+}
+
+test "a blank line inside a barred block still copies as a blank line" {
+    var selection: Selection = .init(std.testing.allocator);
+    defer selection.deinit();
+
+    selection.cells = try std.testing.allocator.alloc(GridCell, 30);
+    @memset(selection.cells, .{});
+    selection.width = 10;
+    selection.height = 3;
+
+    for (0..3) |row| selection.put(@intCast(row), 0, w.solid_rule, "");
+    for ("one", 0..) |c, i| selection.put(0, @intCast(2 + i), &.{c}, "");
+    for ("two", 0..) |c, i| selection.put(2, @intCast(2 + i), &.{c}, "");
+
+    selection.begin(.{ .row = 0, .col = 0 });
+    selection.extend(.{ .row = 2, .col = 9 });
+
+    const copied = (try selection.text(std.testing.allocator)).?;
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("one\n\ntwo", copied);
 }

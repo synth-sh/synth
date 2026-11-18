@@ -14,7 +14,7 @@ const theme = @import("theme.zig");
 const w = @import("widgets.zig");
 
 /// Spinner animation frames and the delay between them.
-pub const spinner_frames: []const []const u8 = &.{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+pub const spinner_frames: []const []const u8 = &.{ w.decoration("⠋"), w.decoration("⠙"), w.decoration("⠹"), w.decoration("⠸"), w.decoration("⠼"), w.decoration("⠴"), w.decoration("⠦"), w.decoration("⠧"), w.decoration("⠇"), w.decoration("⠏") };
 pub const spinner_interval_ms: u32 = 100;
 
 /// The in-transcript loading indicator. Click the header to expand it and watch
@@ -168,17 +168,17 @@ pub const View = struct {
             }
 
             if (!have_thoughts) {
-                _ = w.writeText(surface, col + 1, 0, "esc to cancel", theme.on_bg(theme.fg_dim).cell);
+                _ = w.writeText(surface, col + 1, 0, w.decoration("esc to cancel"), theme.on_bg(theme.fg_dim).cell);
             }
         }
 
         if (!have_thoughts) return;
 
-        const marker = if (self.expanded) " ▾ " else " ▸ ";
+        const marker = if (self.expanded) w.decoration(" ▾ ") else w.decoration(" ▸ ");
         col = w.writeText(surface, col, 0, marker, theme.on_bg(theme.fg_dim).cell);
 
         if (self.has_mouse) {
-            const hint = if (self.expanded) "click to collapse" else "click to expand";
+            const hint = if (self.expanded) w.decoration("click to collapse") else w.decoration("click to expand");
             _ = w.writeText(surface, col, 0, hint, theme.on_bg(theme.fg_dim).cell);
         }
     }

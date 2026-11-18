@@ -80,12 +80,12 @@ pub fn draw(self: *AttachmentCard, ctx: vxfw.DrawContext) std.mem.Allocator.Erro
     w.fill(surface, theme.card.cell);
     for (0..height) |row| {
         surface.writeCell(0, @intCast(row), .{
-            .char = .{ .grapheme = "▌", .width = 1 },
+            .char = .{ .grapheme = w.block_rule, .width = 1 },
             .style = theme.on_card(theme.fg_dim).cell,
         });
     }
 
-    const marker = if (self.expanded) "▾ " else "▸ ";
+    const marker = if (self.expanded) w.decoration("▾ ") else w.decoration("▸ ");
     var col = w.writeText(surface, indent, 0, marker, theme.on_card(theme.fg_dim).cell);
     col = w.writeText(surface, col, 0, self.label, theme.on_card(theme.accent_alt).cell);
     if (self.kind.len > 0) {

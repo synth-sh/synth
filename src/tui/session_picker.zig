@@ -140,7 +140,7 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
 
         if (chosen) {
             w.fillRow(surface, row, 1, width - 2, theme.card.withBg(theme.surface_alt).cell);
-            _ = w.writeText(surface, 1, row, "▌", theme.on_card(theme.accent).withBg(theme.surface_alt).cell);
+            _ = w.writeText(surface, 1, row, w.block_rule, theme.on_card(theme.accent).withBg(theme.surface_alt).cell);
         }
 
         const base = if (chosen)

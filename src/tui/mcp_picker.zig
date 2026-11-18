@@ -237,7 +237,7 @@ const State = struct {
 fn describe(status: mcp_tools.Status) State {
     return switch (status.state) {
         .off => .{ .on = false, .mark = "○", .color = theme.fg_dim, .detail = "off" },
-        .connected => .{ .on = true, .mark = "●", .color = theme.success, .detail = "connected" },
+        .connected => .{ .on = true, .mark = w.dot, .color = theme.success, .detail = "connected" },
         .connecting => .{ .on = true, .mark = "◌", .color = theme.fg_muted, .detail = "connecting" },
         .failed => .{ .on = true, .mark = "✕", .color = theme.danger, .detail = status.reason },
     };

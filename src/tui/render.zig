@@ -268,23 +268,29 @@ pub fn drawSelectionOverlay(self: *Model, ctx: vxfw.DrawContext, max: vxfw.Size)
     var row = top;
     while (row <= bottom) : (row += 1) {
         const span = self.selection.rowSpan(row) orelse continue;
-        const from = span.from;
         const to = @min(span.to, max.width -| 1);
-        if (from > to) continue;
 
-        const width = to - from + 1;
-        const strip = try w.surfaceClamped(ctx.arena, self.plainWidget(), .{ .width = width, .height = 1 });
+        var from = span.from;
+        while (from <= to) {
+            if (self.selection.isDecorationAt(row, from)) {
+                from += 1;
+                continue;
+            }
+            var end = from;
+            while (end < to and !self.selection.isDecorationAt(row, end + 1)) end += 1;
 
-        var col = from;
-        while (col <= to) : (col += 1) {
-            const bytes = self.selection.cellText(row, col);
-            strip.writeCell(col - from, 0, .{
-                .char = .{ .grapheme = if (bytes.len == 0) " " else bytes, .width = 1 },
-                .style = .{ .fg = theme.bg, .bg = theme.selection_bg },
-            });
+            const strip = try w.surfaceClamped(ctx.arena, self.plainWidget(), .{ .width = end - from + 1, .height = 1 });
+            var col = from;
+            while (col <= end) : (col += 1) {
+                const bytes = self.selection.cellText(row, col);
+                strip.writeCell(col - from, 0, .{
+                    .char = .{ .grapheme = if (bytes.len == 0) " " else bytes, .width = 1 },
+                    .style = .{ .fg = theme.bg, .bg = theme.selection_bg },
+                });
+            }
+            try rows.append(ctx.arena, .{ .origin = .{ .row = row, .col = from }, .surface = strip });
+            from = end + 1;
         }
-
-        try rows.append(ctx.arena, .{ .origin = .{ .row = row, .col = from }, .surface = strip });
     }
 
     if (rows.items.len == 0) return null;
@@ -2162,4 +2168,51 @@ test "the welcome panel is centered in the conversation area" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "copying a reply with a table leaves out its rule and the table's lines" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Dummy = struct {
+        fn drawFn(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+    var userdata: u8 = 0;
+    var model: Model = undefined;
+    try test_model.offline(&model);
+    defer model.deinit();
+    model.plain_vtable = .{ .userdata = &userdata, .drawFn = Dummy.drawFn };
+
+    const width: u16 = 40;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const text =
+        \\Final build
+        \\
+        \\| Part | Price |
+        \\| --- | --- |
+        \\| GPU | $1,494.99 |
+        \\| Case | $129.99 |
+    ;
+    const surface = try messageBlock(&model, ctx, .{ .role = .assistant, .text = text }, width);
+
+    var selection: Selection = .init(testing.allocator);
+    defer selection.deinit();
+    try selection.capture(surface);
+    selection.begin(.{ .row = 0, .col = 0 });
+    selection.extend(.{ .row = surface.size.height - 1, .col = width - 1 });
+
+    const copied = (try selection.text(testing.allocator)).?;
+    defer testing.allocator.free(copied);
+    try testing.expectEqualStrings("Final build\nPart  Price\nGPU   $1,494.99\nCase  $129.99", copied);
 }

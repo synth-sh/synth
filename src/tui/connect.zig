@@ -334,7 +334,7 @@ fn drawList(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vx
         if (chosen) w.fillRow(surface, y, 1, width - 2, base.cell);
 
         if (row.active) {
-            _ = w.writeText(surface, pad, y, "●", base.withFg(theme.success).cell);
+            _ = w.writeText(surface, pad, y, w.dot, base.withFg(theme.success).cell);
         } else if (row.connected) {
             _ = w.writeText(surface, pad, y, "✓", base.withFg(theme.fg_muted).cell);
         }

@@ -206,13 +206,13 @@ fn drawHeader(self: *ToolCard, arena: std.mem.Allocator, surface: vxfw.Surface, 
 /// over, what it is doing while it is not, and the hint under the pointer.
 fn trailingText(self: *const ToolCard, arena: std.mem.Allocator) []const u8 {
     if (self.has_mouse) {
-        if (self.open != null) return "click to open transcript";
+        if (self.open != null) return w.decoration("click to open transcript");
         if (self.result != null or self.capped) {
-            return if (self.expanded) "click to collapse" else "click to expand";
+            return if (self.expanded) w.decoration("click to collapse") else w.decoration("click to expand");
         }
     }
     switch (self.status) {
-        .running => return "running...",
+        .running => return w.decoration("running..."),
         .pending => return "waiting...",
         else => {},
     }
@@ -729,9 +729,6 @@ test "the box has no ground of its own showing between its edge and its contents
     try testing.expect(tinted > (width - text_col) / 2);
 }
 
-
-
-
 test "a call hangs off a rule one level in from the reply that made it" {
     const testing = std.testing;
 
@@ -756,7 +753,6 @@ test "a call hangs off a rule one level in from the reply that made it" {
         try testing.expectEqualStrings(" ", surface.buffer[col].char.grapheme);
     }
 }
-
 
 test "a finished call reports how long it took, in place of what it was doing" {
     const testing = std.testing;
