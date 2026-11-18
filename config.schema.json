@@ -113,7 +113,17 @@
           "$ref": "#/$defs/hookList"
         },
         "SessionEnd": {
-          "$ref": "#/$defs/hookList"
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/hook"
+              },
+              {
+                "$ref": "#/$defs/sessionEndHookGroup"
+              }
+            ]
+          }
         },
         "UserPromptSubmit": {
           "$ref": "#/$defs/hookList"
@@ -343,7 +353,7 @@
         "command": {
           "type": "string",
           "minLength": 1,
-          "description": "Shell command run from the session working directory."
+          "description": "Shell command run from the original project root."
         },
         "timeout_ms": {
           "type": "integer",
@@ -361,7 +371,19 @@
           "type": "boolean",
           "default": false,
           "description": "Opt in to per-record HttpResponse hooks."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "description": "Timeout in seconds; use either timeout or timeout_ms."
         }
+      },
+      "not": {
+        "required": [
+          "timeout",
+          "timeout_ms"
+        ]
       }
     },
     "mcpServer": {
@@ -470,7 +492,19 @@
           "type": "boolean",
           "default": false,
           "description": "Opt in to per-record HttpResponse hooks."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "description": "Timeout in seconds; use either timeout or timeout_ms."
         }
+      },
+      "not": {
+        "required": [
+          "timeout",
+          "timeout_ms"
+        ]
       }
     },
     "mcpHookHandler": {
@@ -516,7 +550,19 @@
           "type": "boolean",
           "default": false,
           "description": "Opt in to per-record HttpResponse hooks."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "description": "Timeout in seconds; use either timeout or timeout_ms."
         }
+      },
+      "not": {
+        "required": [
+          "timeout",
+          "timeout_ms"
+        ]
       }
     },
     "sessionEndHookGroup": {

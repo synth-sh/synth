@@ -1,13 +1,3 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-if ! command -v python3 >/dev/null; then
-  cat >/dev/null
-  echo 'path protection requires python3' >&2
-  exit 2
-fi
-
-exec python3 -c '
 import fnmatch
 import json
 import os
@@ -30,4 +20,3 @@ try:
 except Exception as error:
     print(f"Cannot validate path: {error}", file=sys.stderr)
     sys.exit(2)
-'

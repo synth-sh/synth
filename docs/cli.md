@@ -77,4 +77,4 @@ or register a permitted root through `_synth/add_directory`. Both requests take
 emits `DirectoryAdded` with `source: "register_repo_root"`.
 The TUI sends `source: "slash_command"`. Status updates expose
 `cwd` and `additional_roots`; `root` and `project` retain their session identity
-and original project meaning. See [Session directories](usage.md#hooks-and-workspace).
+and original project meaning. See [Hooks and workspace](usage.md#hooks-and-workspace).

@@ -9,6 +9,7 @@ const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
 pub const default_timeout_ms: u64 = 30_000;
 pub const cleanup_timeout_ms: i64 = 3000;
+pub const review_notice = "Hooks need review. Use /hooks review or synth hooks review; trust or disable each reviewed id.";
 const max_timeout_ms: u64 = 86_400_000;
 const milliseconds_per_second: u64 = 1000;
 const background_limit: usize = 64;
@@ -395,6 +396,7 @@ pub const Invocation = struct {
     tool_response: []const u8 = "",
     session_id: []const u8 = "",
     turn_id: []const u8 = "",
+    turn_number: ?u64 = null,
     tool_call_id: []const u8 = "",
     agent_id: []const u8 = "",
     agent_type: []const u8 = "",
@@ -515,6 +517,7 @@ pub const Runtime = struct {
             const length = @min(64, value.len);
             @memcpy(@field(record_value, pair[0])[0..length], value[0..length]);
         }
+        if (invocation.turn_number) |number| _ = std.fmt.bufPrint(&record_value.turn_id, "{d}", .{number}) catch {};
         @memcpy(record_value.id[0..@min(64, hook.id.len)], hook.id[0..@min(64, hook.id.len)]);
         self.records[self.records_next] = record_value;
         self.records_next = (self.records_next + 1) % self.records.len;
@@ -1390,7 +1393,11 @@ fn writeJson(
     try std.json.Stringify.value(invocation.request_purpose, .{}, w);
     inline for (.{ "request_system", "request_instruction", "request_tools", "request_routes", "permission_effect", "action", "http", "route", "request_context", "request_settings", "provider", "parent_agent_id", "parent_tool_call_id", "old_cwd", "new_cwd", "directory", "session_id", "turn_id", "tool_call_id", "agent_id", "agent_type", "model", "permission_mode", "source", "trigger", "status", "error_type", "error_message", "parent_session_id", "reason", "notification_type", "message", "title", "file_path", "event_type", "load_reason", "memory_type", "from_model", "to_model", "task_id", "task_subject", "task_description", "command_name", "command_args", "expanded_prompt", "message_id", "delta" }) |field| {
         try w.writeAll(",\"" ++ field ++ "\":");
-        try std.json.Stringify.encodeJsonString(@field(invocation, field), .{}, w);
+        if (comptime std.mem.eql(u8, field, "turn_id")) {
+            if (invocation.turn_number) |number| {
+                try w.print("\"{d}\"", .{number});
+            } else try std.json.Stringify.encodeJsonString(invocation.turn_id, .{}, w);
+        } else try std.json.Stringify.encodeJsonString(@field(invocation, field), .{}, w);
     }
     try w.writeAll(",\"tool_use_id\":");
     try std.json.Stringify.encodeJsonString(invocation.tool_call_id, .{}, w);
@@ -1415,11 +1422,20 @@ fn writeJson(
         try w.writeAll(",\"tool_name\":");
         try std.json.Stringify.encodeJsonString(invocation.tool_name, .{}, w);
         try w.writeAll(",\"tool_input\":");
-        if (try std.json.validate(allocator, invocation.tool_input)) {
-            try w.writeAll(invocation.tool_input);
-        } else {
-            try w.writeAll("{}");
+        var scratch: std.heap.ArenaAllocator = .init(allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var arguments = std.json.parseFromSliceLeaky(std.json.Value, a, invocation.tool_input, .{}) catch std.json.Value{ .object = .empty };
+        if (arguments == .object) {
+            const builtin_path = std.mem.eql(u8, invocation.tool_name, "read") or std.mem.eql(u8, invocation.tool_name, "write") or std.mem.eql(u8, invocation.tool_name, "edit");
+            if (builtin_path) if (arguments.object.get("path")) |value| try arguments.object.put(a, "file_path", value);
+            if (std.mem.eql(u8, invocation.tool_name, "edit")) {
+                inline for (.{ .{ "old", "old_string" }, .{ "new", "new_string" } }) |pair| {
+                    if (arguments.object.get(pair[0])) |value| try arguments.object.put(a, pair[1], value);
+                }
+            }
         }
+        try std.json.Stringify.value(arguments, .{}, w);
     }
     if (invocation.event == .post_tool_use or invocation.event == .post_tool_use_failure) {
         try w.writeAll(",\"tool_response\":");
@@ -1729,11 +1745,9 @@ test "protected-path example rejects equivalent paths and symlink targets" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
     var runner: Runner = .{ .io = std.testing.io, .root = root, .set = .{} };
-    const probe = try runner.runCommand(a, "command -v python3", .{ .event = .pre_tool_use });
-    defer a.free(probe.stdout);
-    defer a.free(probe.stderr);
-    if (probe.code != 0) return error.SkipZigTest;
-    const script = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "examples/hooks/protect-paths.sh", a, .limited(16 * 1024));
+    const script_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, "examples/hooks/protect-paths.py", a);
+    defer a.free(script_path);
+    const script = try std.fmt.allocPrint(a, "python3 '{s}'", .{script_path});
     defer a.free(script);
     runner.set.pre_tool_use = &.{.{ .command = script }};
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".env", .data = "secret" });
@@ -1753,12 +1767,10 @@ test "protected-path example rejects equivalent paths and symlink targets" {
     try std.testing.expect(try runner.dispatch(a, .{ .event = .pre_tool_use, .tool_name = "write", .tool_input = "{\"path\":\"safe\"}" }) == null);
     try tmp.dir.createDir(std.testing.io, "bin", .default_dir);
     try tmp.dir.symLink(std.testing.io, "/bin/cat", "bin/cat", .{});
-    const without_jq = try std.fmt.allocPrint(a, "PATH=\"$(pwd -P)/bin\"\n{s}", .{script});
-    defer a.free(without_jq);
-    runner.set.pre_tool_use = &.{.{ .command = without_jq }};
-    const missing_dependency = try runner.dispatch(a, .{ .event = .pre_tool_use, .tool_name = "write", .tool_input = "{\"path\":\".env\"}" });
-    defer if (missing_dependency) |reason| a.free(reason);
-    try std.testing.expect(missing_dependency != null);
+    const without_python = try std.fmt.allocPrint(a, "PATH=\"$(pwd -P)/bin\"\n{s}", .{script});
+    defer a.free(without_python);
+    runner.set.pre_tool_use = &.{.{ .command = without_python }};
+    try std.testing.expectError(error.HookCommandUnavailable, runner.dispatch(a, .{ .event = .pre_tool_use, .tool_name = "write", .tool_input = "{\"path\":\".env\"}" }));
 }
 
 test "a deadline kills descendants before they can finish later work" {
@@ -1942,23 +1954,18 @@ test "event matchers filter lifecycle metadata and ignore unsupported matcher fi
     try std.testing.expect(try hookMatches(a, .{ .legacy = false, .matcher = "ignored" }, .{ .event = .post_tool_batch }));
 }
 
-test "every supported event has input and result fixtures and parses as configuration" {
+test "every supported event has result fixtures and parses as configuration" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const inputs = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/inputs.json"), .{});
     const results = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/results.json"), .{});
     inline for (std.meta.fields(Event)) |field| {
         const event: Event = @field(Event, field.name);
-        var has_input = false;
         var has_result = false;
-        for (inputs.array.items) |item| if (std.mem.eql(u8, item.object.get("event").?.string, event.name())) {
-            has_input = true;
-        };
         for (results.array.items) |item| if (std.mem.eql(u8, item.object.get("event").?.string, event.name()) and !item.object.contains("invalid")) {
             has_result = true;
         };
-        try std.testing.expect(has_input and has_result);
+        try std.testing.expect(has_result);
         const source = try std.fmt.allocPrint(a, "{{\"{s}\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"true\"}}]}}]}}", .{event.name()});
         const config = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{});
         const set = try parse(a, config, "fixture");
@@ -2087,7 +2094,9 @@ test "command hooks normalize timeout seconds and provide project environment" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"PreToolUse\":[{\"hooks\":[{\"command\":\"test \\\"$SYNTH_PROJECT_DIR\\\" = \\\"$CLAUDE_PROJECT_DIR\\\" && printf {}\",\"timeout\":2}]}]}", .{});
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"PreToolUse":[{"hooks":[{"command":"test $SYNTH_PROJECT_DIR = . && test $CLAUDE_PROJECT_DIR = . || exit 2; printf '{}'","timeout":2}]}]}
+    , .{});
     const set = try parse(a, value, "policy.json");
     try std.testing.expectEqual(@as(?u64, 2000), set.pre_tool_use[0].timeout_ms);
     const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = set };

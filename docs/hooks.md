@@ -14,7 +14,7 @@ Declarations load from `config.json`'s `hooks`, `~/.synth/hooks.json`, then
 {
   "PreToolUse": [{
     "matcher": "^(write|edit)$",
-    "hooks": [{"type": "command", "command": "bash ./scripts/protect.sh"}]
+    "hooks": [{"type": "command", "command": "python3 \"$SYNTH_PROJECT_DIR/.synth/protect-paths.py\""}]
   }]
 }
 ```
@@ -24,18 +24,22 @@ the session working directory. Changing directories doesn't change hook lookup
 or grant access to another file root; `/add-dir` explicitly grants that access.
 
 Use `/hooks review` or `synth hooks review` to inspect declarations, then
-`trust <id>` or `disable <id>` to proceed. IDs accept an unambiguous prefix of at
-least eight characters. `revoke`, `enable`, and `list` are also available.
+`trust <id>` or `disable <id>` to proceed. Granting trust or enabling a hook requires at least 32 ID characters. Other
+actions accept an unambiguous prefix of at least eight characters. `revoke`, `enable`, and `list` are also available.
 
 Existing hooks need review before new prompts run. Changed declarations need
-fresh trust. User-level hook trust is shared across projects; project hooks
-remain tied to their checkout. Changing the default timeout doesn't reset trust.
+fresh trust. User-level commands with absolute executable and file paths share trust across
+projects. Relative commands and project hook sources remain tied to their checkout. Changing the default timeout doesn't reset trust.
 Trust covers declarations, not the contents or dependencies of external scripts.
 Keep policy scripts outside agent-writable locations when they carry authority.
 
+The [path-protection example](../examples/hooks/protect-paths.py) rejects writes
+to secrets, CI files, lockfiles, and migrations, including equivalent paths and
+symlinks. Place it under `.synth/` and match `write|edit`.
+
 ## Handlers and matching
 
-Grouped handlers use `type: "command"` by default. `timeout_ms` is milliseconds;
+Grouped handlers use `type: "command"` by default. `timeout_ms` is milliseconds and `timeout` is seconds;
 the default is 30 seconds. `async: true` runs a handler in the background and
 permits context or diagnostics only. Request preparation and permission
 evaluation must run synchronously. Background work is bounded and excess work
@@ -70,7 +74,7 @@ Child inputs include parent agent and tool-call identifiers.
 | `TaskCreated`, `TaskCompleted` | Reject a todo-list change |
 | `PreCompact`, `PostCompact` | Stop compaction or its automatic continuation |
 | `Stop`, `SubagentStop` | Request further work within the existing turn budgets |
-| `SessionEnd`, `SubagentStart`, `Interrupt`, `StopFailure`, `Notification`, `InstructionsLoaded`, `FileChanged`, `PostModelSwitch`, `CwdChanged`, `DirectoryAdded` | Observe only |
+| `SessionEnd`, `SubagentStart`, `Interrupt`, `StopFailure`, `PermissionDenied`, `Notification`, `InstructionsLoaded`, `FileChanged`, `PostModelSwitch`, `CwdChanged`, `DirectoryAdded` | Observe only |
 | `MessageDisplay` | Replace displayed text; stored/model-visible text stays unchanged |
 | `PreModelRequest`, `PostModelRequest` | Observe each physical transport attempt |
 | `ModelResolve`, `ModelSettings`, `ModelContext`, `ModelRetry` | Prepare a request or decide a retry |

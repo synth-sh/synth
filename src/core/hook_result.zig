@@ -179,7 +179,9 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
             result.http = encoded;
         } else if (std.mem.eql(u8, key, "effect")) {
             if (event != .permission_evaluate) return error.UnsupportedHookEffect;
-            result.decide(std.meta.stringToEnum(Permission, try text(field)) orelse return error.InvalidHookOutput);
+            const decision = try text(field);
+            if (std.mem.eql(u8, decision, "defer")) continue;
+            result.decide(std.meta.stringToEnum(Permission, decision) orelse return error.InvalidHookOutput);
             if (result.permission == .deny and result.blocked == null) result.blocked = try reason(allocator, value, "reason");
         } else if (std.mem.eql(u8, key, "reason") and event == .permission_evaluate) {
             _ = try text(field);
@@ -201,7 +203,7 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
             if (event != .model_retry or field != .bool) return error.UnsupportedHookEffect;
             result.retry_allowed = field.bool;
         } else if (std.mem.eql(u8, key, "retryDelayMs")) {
-            if (event != .model_retry or field != .integer or field.integer < 0 or field.integer > 60_000) return error.InvalidHookOutput;
+            if (event != .model_retry or field != .integer or field.integer < 0 or field.integer > @import("../provider/retry.zig").max_delay_ms) return error.InvalidHookOutput;
             result.retry_delay_ms = @intCast(field.integer);
         } else if (std.mem.eql(u8, key, "additionalContext")) {
             if (!event.oneOf(&.{ .pre_tool_use, .post_tool_use, .user_prompt_submit, .session_start, .subagent_start, .post_tool_use_failure, .post_tool_batch })) return error.UnsupportedHookEffect;
@@ -222,7 +224,9 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
         } else if (std.mem.eql(u8, key, "permissionDecision")) {
             if (event != .pre_tool_use) return error.UnsupportedHookEffect;
             if (field == .null) continue;
-            result.decide(std.meta.stringToEnum(Permission, try text(field)) orelse return error.InvalidHookOutput);
+            const decision = try text(field);
+            if (std.mem.eql(u8, decision, "defer")) continue;
+            result.decide(std.meta.stringToEnum(Permission, decision) orelse return error.InvalidHookOutput);
             if (result.permission == .deny and result.blocked == null) result.blocked = try reason(allocator, value, "permissionDecisionReason");
         } else if (std.mem.eql(u8, key, "updatedMCPToolOutput")) {
             if (event != .post_tool_use) return error.UnsupportedHookEffect;
@@ -371,4 +375,12 @@ test "null optional context fields do not erase restrictions during composition"
         try std.testing.expectEqualStrings("read", parsed.value.tools.?[0]);
         try std.testing.expectEqualStrings("prepared", parsed.value.system.?);
     }
+}
+
+test "a deferred pre-tool decision leaves ordinary permission review in control" {
+    const a = std.testing.allocator;
+    var result = try parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"defer\"}}", .pre_tool_use);
+    defer result.deinit(a);
+    try std.testing.expect(result.permission == null);
+    try std.testing.expect(result.blocked == null);
 }

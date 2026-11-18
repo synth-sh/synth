@@ -96,6 +96,9 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             if configure:
                 configure(config, url)
             (root / "config.json").write_text(json.dumps(config))
+            release_config = root / "home/.config/synth/config.json"
+            release_config.parent.mkdir(parents=True)
+            release_config.write_text(json.dumps(config))
             (root / "adapter.py").write_text("import json,sys\ndef fail(kind,value,tb):\n import traceback; traceback.print_exception(kind,value,tb); sys.exit(2)\nsys.excepthook=fail\np=json.load(sys.stdin)\ne=p['hook_event_name']\nwith open('events.jsonl','a') as f: f.write(json.dumps(p)+'\\n')\nout={}\n" + logic + "\nprint(json.dumps({'hookSpecificOutput':{'hookEventName':e,**out}}))\n")
             command = f"python3 {shlex.quote(str(root / 'adapter.py'))}"
             hooks = {event: [{"hooks": [{"command": command, "stream": True}]}] for event in events}
@@ -137,6 +140,13 @@ def main():
         assert result.returncode == 2, (arguments, result.returncode, result.stderr)
         assert 'Usage:' in result.stderr and 'stack trace' not in result.stderr.lower(), result.stderr
     print('PASS hook CLI usage errors exit 2 with usage')
+    def inline_policy(config, _):
+        config['hooks'] = {'PreToolUse': [{'command': 'true'}]}
+    with session('config-source', lambda *_: chat('config hook trusted'), configure=inline_policy) as (_, result, requests, _):
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert len(requests) == 1
+        expect(result, 'config hook trusted')
+    print('PASS config-sourced hook trust survives separate CLI processes')
     with session('untrusted', lambda *_: chat('must-not-run'), events=('PreToolUse',), trust=False) as (_, result, requests, _):
         assert result.returncode != 0 and not requests
         expect(result, 'review')
@@ -278,7 +288,7 @@ if e=='ModelRetry':
             return chat()
         return chat('', tool('bash', {'command': 'touch allowed.txt'}))
     allow = "if e=='PermissionEvaluate':\n assert json.loads(p['action'])['tool']=='bash'\n out={'effect':'allow'}\n"
-    with session('permission-allow', proposed, allow, ('PermissionEvaluate',)) as (root, result, requests, _):
+    with session('permission-allow-defers', proposed, allow, ('PermissionEvaluate',)) as (root, result, requests, _):
         assert not (root / 'allowed.txt').exists()
         assert any('/review/' in packet['path'] for packet in requests)
     deny_first = "if e=='PreToolUse': out={'permissionDecision':'deny','permissionDecisionReason':'mandatory policy'}\nelif e=='PermissionEvaluate': out={'effect':'allow'}\n"
