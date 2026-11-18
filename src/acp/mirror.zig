@@ -6,6 +6,7 @@
 //! Requests go straight out, and their replies come back through the queue.
 
 const std = @import("std");
+const Hooks = @import("../core/hooks.zig");
 
 const rpc = @import("rpc.zig");
 const protocol = @import("protocol.zig");
@@ -107,7 +108,7 @@ const Awaited = union(enum) {
     command: []const u8,
     typed_model: []u8,
     /// A prompt, answered once its turn is over.
-    prompt,
+    prompt: []u8,
     tool_result: struct { seq: u64, call: u32 },
     attachment: struct { seq: u64, index: u32 },
     thinking: u64,
@@ -395,7 +396,7 @@ fn forgetConnection(self: *Mirror) void {
     var waited = self.waiting.valueIterator();
     while (waited.next()) |awaited| switch (awaited.*) {
         .search => |query| self.allocator.free(query),
-        .typed_model => |draft| self.allocator.free(draft),
+        .typed_model, .prompt => |draft| self.allocator.free(draft),
         else => {},
     };
     self.waiting.clearRetainingCapacity();
@@ -482,7 +483,7 @@ fn destroy(self: *Mirror) void {
     var awaited = self.waiting.valueIterator();
     while (awaited.next()) |entry| switch (entry.*) {
         .search => |query| self.allocator.free(query),
-        .typed_model => |draft| self.allocator.free(draft),
+        .typed_model, .prompt => |draft| self.allocator.free(draft),
         else => {},
     };
     self.waiting.deinit(self.allocator);
@@ -844,11 +845,16 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
     const awaited = (self.waiting.fetchRemove(number) orelse return).value;
     defer switch (awaited) {
         .search => |query| self.allocator.free(query),
-        .typed_model => |draft| self.allocator.free(draft),
+        .typed_model, .prompt => |draft| self.allocator.free(draft),
         else => {},
     };
     if (message.err) |err| {
         if (awaited == .models) self.models_failed = true;
+        if (awaited == .prompt and std.mem.eql(u8, err.message, Hooks.review_notice)) {
+            if (self.failed_draft) |draft| self.allocator.free(draft);
+            self.failed_draft = try self.allocator.dupe(u8, awaited.prompt);
+            return self.say("{s}", .{Hooks.review_notice});
+        }
         if (awaited == .typed_model) {
             if (self.failed_draft) |draft| self.allocator.free(draft);
             self.failed_draft = try self.allocator.dupe(u8, awaited.typed_model);
@@ -1210,7 +1216,9 @@ pub fn submit(self: *Mirror, prompt: []const u8, extras: Loop.Extras) !void {
         block.* = .{ .resource = .{ .path = attachment.path, .text = attachment.content } };
     }
     for (extras.images, blocks[1 + extras.attachments.len ..]) |image, *block| block.* = .{ .image = image };
-    try self.send(protocol.method.session_prompt, .{ .sessionId = self.status.handle, .prompt = blocks }, .prompt);
+    const draft = try self.allocator.dupe(u8, prompt);
+    errdefer self.allocator.free(draft);
+    try self.send(protocol.method.session_prompt, .{ .sessionId = self.status.handle, .prompt = blocks }, .{ .prompt = draft });
 }
 
 /// Whether the text went in as steering. Only while busy: otherwise it is a
@@ -2132,24 +2140,15 @@ test "hook review and trust flow through the same ACP interface as the TUI" {
     try testing.expect(std.mem.indexOf(u8, revoked.hooks, "NEEDS REVIEW") != null);
     const messages_before = convo.messages.items.len;
     try mirror.submit("blocked before persistence", .{});
-    try pollUntil(mirror, finishedAndAnswered);
+    try pollUntil(mirror, hasFailedDraft);
+    const rejected_draft = mirror.takeFailedDraft().?;
+    defer testing.allocator.free(rejected_draft);
+    try testing.expectEqualStrings("blocked before persistence", rejected_draft);
     try testing.expectEqual(messages_before, convo.messages.items.len);
-    try pollUntil(mirror, struct {
-        fn ready(m: *Mirror) bool {
-            return m.status.prompt_queued;
-        }
-    }.ready);
-    try mirror.cancel();
-    try pollUntil(mirror, struct {
-        fn ready(m: *Mirror) bool {
-            return !m.status.prompt_queued;
-        }
-    }.ready);
     try mirror.hooks(.trust, id);
     const trusted_again = try pollForAnswer(mirror);
     defer trusted_again.deinit(testing.allocator);
     try testing.expectEqual(messages_before, convo.messages.items.len);
-    try testing.expect(!mirror.status.prompt_queued);
     for (convo.messages.items) |message| {
         try testing.expect(std.mem.indexOf(u8, message.text, "blocked before persistence") == null);
     }

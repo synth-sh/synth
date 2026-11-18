@@ -1462,3 +1462,37 @@ test "a model drives a session on its server, and starts afresh beside it" {
     try testing.expectEqual(@as(usize, 0), model.history.items.len);
     try testing.expect(std.mem.endsWith(u8, model.cwd_display, "/project"));
 }
+
+test "hook review rejection restores the submitted text to the composer" {
+    const testing = std.testing;
+    const served = try test_model.Served.create();
+    defer served.destroy();
+    const model = served.model;
+    try served.fixture.tmp.dir.createDirPath(testing.io, "project/.synth");
+    try served.fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "project/.synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"true\"}]}" });
+    try model.mirror.hooks(.list, "");
+    try served.pollUntil(struct {
+        fn ready(m: *Model) bool {
+            return m.mirror.waiting.count() == 0;
+        }
+    }.ready);
+    model.input.userdata = model;
+    model.input.onSubmit = @import("keys.zig").handleSubmit;
+    try model.input.insertText("keep this private request");
+    var ctx: vaxis.vxfw.EventContext = .{ .phase = .at_target, .io = testing.io, .alloc = testing.allocator, .cmds = .empty };
+    defer ctx.cmds.deinit(testing.allocator);
+    try model.input.handleEvent(&ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
+    try served.pollUntil(struct {
+        fn ready(m: *Model) bool {
+            return m.mirror.failed_draft != null;
+        }
+    }.ready);
+    try @import("keys.zig").typeErasedEventHandler(model, &ctx, .tick);
+    try testing.expectEqualStrings("keep this private request", model.input.text.items);
+    for (model.conversation.messages.items) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.text, "keep this private request") == null);
+    }
+    const stored = (try served.fixture.db.conn.row("SELECT count(*) FROM message WHERE text = ?", .{"keep this private request"})).?;
+    defer stored.deinit();
+    try testing.expectEqual(@as(i64, 0), stored.int(0));
+}

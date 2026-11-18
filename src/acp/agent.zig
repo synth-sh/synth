@@ -975,7 +975,7 @@ fn describe(err: anyerror) []const u8 {
         error.ModelFixed => "this provider has only the one model",
         error.UnknownModel, error.UnknownCopilotModel => "no such model from this provider",
         error.Busy => "finish the turn first",
-        error.PromptQueued => "a prompt is waiting for hook review; trust or disable the hooks, or cancel the queued prompt",
+        error.HooksNeedReview => Hooks.review_notice,
         error.UnknownSkill => "no such skill",
         error.UnknownConfigOption => "no such setting",
         error.ProviderFixed => "this agent's provider is fixed",
@@ -2184,7 +2184,6 @@ const Session = struct {
 
         return .{
             .state = loop.state,
-            .prompt_queued = loop.pending_submit != null,
             .label = loop.label(),
             .title = loop.title(),
             .handle = self.handle,

@@ -147,7 +147,7 @@ stream_display: bool = true,
 interrupted: bool = false,
 stop_hook_active: bool = false,
 approved_ask_index: ?usize = null,
-pending_submit: ?Submission = null,
+hook_submission: ?Submission = null,
 /// Root every tool resolves against. Borrowed.
 project_root: []const u8,
 working_directory: ?[]const u8 = null,
@@ -432,7 +432,7 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     defer self.allocator.free(loaded);
 
     std.mem.reverse(Conversation.Message, loaded);
-    self.discardPendingPrompt();
+    self.discardHookSubmission();
     self.endHookSession("resume");
     if (self.hook_flow.context) |context| self.allocator.free(context);
     self.hook_flow.context = null;
@@ -462,7 +462,7 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
 pub fn resetForNewSession(self: *Loop) bool {
     if (self.isBusy()) return false;
 
-    self.discardPendingPrompt();
+    self.discardHookSubmission();
     self.endHookSession("clear");
     self.hook_flow.reset();
     self.prompt_cache.invalidate(self.allocator);
@@ -785,7 +785,7 @@ pub fn deinit(self: *Loop) void {
         self.hook_flow.dispatch = null;
     }
     if (self.hooks) |runner| if (runner.runtime) |runtime| runtime.discardAgent(&self.hook_flow.identity);
-    self.discardPendingPrompt();
+    self.discardHookSubmission();
 
     self.clearNotes();
     self.todos.deinit();
@@ -1040,7 +1040,6 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
 /// whatever the composer held back.
 pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.isBusy()) return;
-    if (self.pending_submit != null) return error.PromptQueued;
     self.hook_flow.idle_since = null;
     self.hook_flow.idle_notified = false;
     self.hook_flow.permission_notice = null;
@@ -1049,32 +1048,30 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.hook_flow.notice) |notice| self.allocator.free(notice);
     self.hook_flow.notice = null;
 
-    if (self.hooks) |runner| {
-        if (runner.set.hasUntrusted()) {
-            self.pending_submit = try Submission.init(self.allocator, prompt, extras);
-            self.say("{s}\n\nQueued prompt: {s}", .{ Hooks.review_notice, prompt });
-            return;
-        }
-    }
+    try self.checkHookTrust();
     if (!self.hook_flow.session_started) {
         self.hook_flow.session_started = true;
         if (try self.lifecycle(if (self.parent == null) .session_start else .subagent_start, .begin_prompt)) {
-            self.pending_submit = try Submission.init(self.allocator, prompt, extras);
+            self.hook_submission = try Submission.init(self.allocator, prompt, extras);
             return;
         }
     }
     try self.submitPrompt(prompt, extras);
 }
 
+fn checkHookTrust(self: *const Loop) !void {
+    if (self.hooks) |runner| if (runner.set.hasUntrusted()) return error.HooksNeedReview;
+}
+
 fn submitPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.hooks) |runner| {
         if (runner.set.forEvent(.user_prompt_submit).len == 0) return self.expandPrompt(prompt, extras);
 
-        self.pending_submit = try Submission.init(self.allocator, prompt, extras);
-        errdefer self.discardPendingPrompt();
+        self.hook_submission = try Submission.init(self.allocator, prompt, extras);
+        errdefer self.discardHookSubmission();
         self.hook_flow.dispatch = try self.dispatchHook(.{
             .event = .user_prompt_submit,
-            .prompt = self.pending_submit.?.prompt,
+            .prompt = self.hook_submission.?.prompt,
         });
         self.hook_flow.pending = .prompt;
         self.state = .running_hooks;
@@ -1084,26 +1081,17 @@ fn submitPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.expandPrompt(prompt, extras);
 }
 
-fn discardPendingPrompt(self: *Loop) void {
-    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
-    self.pending_submit = null;
-}
-
-pub fn resumePendingPrompt(self: *Loop) !void {
-    if (self.isBusy()) return;
-    if (self.hooks) |runner| if (runner.set.hasUntrusted()) return;
-    var pending = self.pending_submit orelse return;
-    self.pending_submit = null;
-    defer pending.deinit(self.allocator);
-    try self.submit(pending.prompt, pending.asExtras());
+fn discardHookSubmission(self: *Loop) void {
+    if (self.hook_submission) |*pending| pending.deinit(self.allocator);
+    self.hook_submission = null;
 }
 
 fn expandPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (extras.command_name.len > 0) {
         if (self.hooks) |runner| {
             if (runner.set.user_prompt_expansion.len > 0) {
-                self.pending_submit = try Submission.init(self.allocator, prompt, extras);
-                errdefer self.discardPendingPrompt();
+                self.hook_submission = try Submission.init(self.allocator, prompt, extras);
+                errdefer self.discardHookSubmission();
                 self.hook_flow.dispatch = try self.dispatchHook(.{ .event = .user_prompt_expansion, .prompt = prompt, .command_name = extras.command_name, .command_args = extras.command_args, .expanded_prompt = extras.expanded_prompt });
                 self.hook_flow.pending = .expansion;
                 self.state = .running_hooks;
@@ -1256,7 +1244,7 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
             try std.fmt.allocPrint(self.allocator, "Lifecycle hook failed: {s}", .{@errorName(err)})
         else
             dispatch.takeBlocked();
-        self.discardPendingPrompt();
+        self.discardHookSubmission();
         if (dispatch.invocation.event == .session_start) self.hook_flow.session_started = false;
         self.state = .idle;
         if ((self.hook_flow.resume_turn and self.hook_flow.continuation() != .begin_prompt and self.hook_flow.continuation() != .config_idle) or self.hook_flow.continuation() == .ask_model) self.finish(.halted);
@@ -1266,8 +1254,8 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
     self.state = .idle;
     switch (self.hook_flow.continuation()) {
         .begin_prompt => {
-            var pending = self.pending_submit orelse return false;
-            self.pending_submit = null;
+            var pending = self.hook_submission orelse return false;
+            self.hook_submission = null;
             defer pending.deinit(self.allocator);
             try self.submitPrompt(pending.prompt, pending.asExtras());
         },
@@ -1294,8 +1282,8 @@ fn pollPromptHooks(self: *Loop) !bool {
     self.hook_flow.dispatch = null;
     defer dispatch.destroy();
 
-    var pending = self.pending_submit orelse return false;
-    self.pending_submit = null;
+    var pending = self.hook_submission orelse return false;
+    self.hook_submission = null;
     defer pending.deinit(self.allocator);
 
     if (dispatch.failed) |err| {
@@ -1324,8 +1312,8 @@ fn pollOtherHooks(self: *Loop) !bool {
 
     if (self.hook_flow.purpose() == .lifecycle) return self.pollLifecycle(dispatch);
     if (self.hook_flow.purpose() == .expansion) {
-        var pending = self.pending_submit orelse return false;
-        self.pending_submit = null;
+        var pending = self.hook_submission orelse return false;
+        self.hook_submission = null;
         defer pending.deinit(self.allocator);
         self.state = .idle;
         if (dispatch.failed) |err| {
@@ -1657,6 +1645,7 @@ fn applySteering(self: *Loop) !void {
 pub fn steer(self: *Loop, text: []const u8, extras: Extras) !bool {
     if (!self.isBusy()) return false;
 
+    try self.checkHookTrust();
     var pending: Submission = try .init(self.allocator, text, extras);
     errdefer pending.deinit(self.allocator);
     try self.steering.append(self.allocator, pending);
@@ -1724,10 +1713,7 @@ fn giveUpIfStalled(self: *Loop, request: *Request) bool {
 
 /// Abandon the turn, discarding whatever the worker had produced.
 pub fn cancel(self: *Loop) !void {
-    if (!self.isBusy()) {
-        self.discardPendingPrompt();
-        return;
-    }
+    if (!self.isBusy()) return;
     if (self.state == .cancelling) return;
 
     // `Io.Future.cancel` waits on the calling thread, so `canceller` takes it.
@@ -1823,7 +1809,7 @@ fn pollCancelled(self: *Loop) !bool {
     self.clearNotes();
 
     try self.abandonPending("cancelled");
-    self.discardPendingPrompt();
+    self.discardHookSubmission();
 
     if (self.timed_out) {
         self.last_error = error.Timeout;
@@ -7332,28 +7318,24 @@ test "an unavailable completion policy does not report a successful turn" {
     try testing.expect(std.mem.indexOf(u8, notice, "HookCommandUnavailable") != null);
 }
 
-test "an unreviewed prompt remains visible and resumes after trust" {
+test "unreviewed hooks reject prompts without retaining or forwarding their text" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
-    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "true", .trusted = false }} } };
+    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "true", .trusted = false }}, .notification = &.{.{ .command = "cat > leaked-notice" }} } };
     loop.hooks = &runner;
-    try loop.submit("keep my request", .{});
-    const notice = loop.takeHookNotice() orelse return error.TestUnexpectedResult;
-    defer testing.allocator.free(notice);
-    try testing.expect(std.mem.indexOf(u8, notice, "Queued prompt: keep my request") != null);
+    try testing.expectError(error.HooksNeedReview, loop.submit("private rejected request", .{}));
+    try testing.expect(loop.takeHookNotice() == null);
     try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
-    try testing.expectError(error.PromptQueued, loop.submit("replace my request", .{}));
     try testing.expectEqual(@as(u64, 0), loop.requests_started);
     runner.set.pre_tool_use = &.{.{ .command = "true" }};
-    try loop.resumePendingPrompt();
     try settle(&loop);
-    const request = for (fixture.convo.messages.items) |msg| {
-        if (msg.origin == .human and std.mem.eql(u8, msg.text, "keep my request")) break msg;
-    } else return error.TestUnexpectedResult;
-    try testing.expectEqual(Conversation.Role.user, request.role);
-    try testing.expectEqual(Outcome.done, loop.outcome.?);
+    try testing.expectEqual(@as(u64, 0), loop.requests_started);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "leaked-notice", .{}));
+    try loop.submit("new accepted request", .{});
+    try settle(&loop);
+    for (fixture.convo.messages.items) |message| try testing.expect(std.mem.indexOf(u8, message.text, "private rejected request") == null);
 }
 
 test "reviewer context failures use a per-request human fallback" {
@@ -7387,27 +7369,6 @@ test "reviewer context failures use a per-request human fallback" {
     try settle(&loop);
     try testing.expectEqual(State.idle, loop.state);
     try fixture.tmp.dir.access(testing.io, "reviewed-after-recovery", .{});
-}
-
-test "cancelling a queued unreviewed prompt prevents later execution" {
-    const fixture = try Fixture.init();
-    defer fixture.deinit();
-    var loop = fixture.loop();
-    defer loop.deinit();
-    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "true", .trusted = false }} } };
-    loop.hooks = &runner;
-    try loop.submit("cancel this request", .{});
-    try loop.cancel();
-    runner.set.pre_tool_use = &.{.{ .command = "true" }};
-    try loop.resumePendingPrompt();
-    try settle(&loop);
-    try testing.expectEqual(@as(u64, 0), loop.requests_started);
-    try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
-    try loop.submit("a fresh request", .{});
-    try settle(&loop);
-    for (fixture.convo.messages.items) |message| {
-        try testing.expect(std.mem.indexOf(u8, message.text, "cancel this request") == null);
-    }
 }
 
 test "an answer within the instruction budget keeps automatic review working" {

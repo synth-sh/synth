@@ -4,6 +4,7 @@ const std = @import("std");
 
 const pkg = @import("pkg");
 
+const Hooks = @import("core/hooks.zig");
 const Conversation = @import("core/conversation.zig");
 const Stack = @import("agent/stack.zig");
 const Auth = @import("core/auth.zig");
@@ -123,7 +124,12 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     try out.print("{s}▸ you{s} {s}\n", .{ bold, reset, prompt });
     try out.flush();
 
-    try loop.submit(prompt, .{});
+    loop.submit(prompt, .{}) catch |err| {
+        if (err != error.HooksNeedReview) return err;
+        try out.print("{s}\n", .{Hooks.review_notice});
+        try out.flush();
+        return error.HookRejected;
+    };
 
     var printed: usize = 0;
     while (loop.isBusy() or runner.busy()) {

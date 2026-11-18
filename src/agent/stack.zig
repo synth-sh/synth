@@ -184,7 +184,6 @@ pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore
     }
     try HookStore.change(self.arena.allocator(), self.hooks.io, &self.hooks.set, self.hook_state_path, action, id);
     if (!self.loop.isBusy()) try self.loop.hook_flow.watch.configure(self.allocator, self.hooks.io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills);
-    try self.loop.resumePendingPrompt();
     return HookStore.report(allocator, self.hooks.set, self.hooks.timeout_ms, action == .review, &self.hook_runtime);
 }
 

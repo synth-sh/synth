@@ -27,12 +27,14 @@ Use `/hooks review` or `synth hooks review` to inspect declarations, then
 `trust <id>` or `disable <id>` to proceed. Granting trust or enabling a hook requires at least 32 ID characters. Other
 actions accept an unambiguous prefix of at least eight characters. `revoke`, `enable`, and `list` are also available.
 
-Existing hooks need review before new prompts run. Changed declarations need
-fresh trust. User-level commands with absolute executable and file paths share trust across
-projects. Relative commands and project hook sources remain tied to their checkout. Changing the default timeout doesn't reset trust.
+Existing hooks need review before new prompts run. Rejected text stays in the
+composer and is never queued for automatic execution. Changed declarations need
+fresh trust. User-level commands with absolute executable and file paths share
+trust across projects. Relative commands and project hook sources remain tied to
+their checkout. Changing the default timeout doesn't reset trust.
 Trust covers declarations, not the contents or dependencies of external scripts.
-Direct file-tool edits to control files and literal paths named by trusted
-commands require human approval. Shell commands and MCP tools can have other
+Direct file-tool writes under `.git/` and `.synth/`, and edits to control files
+and literal paths named by trusted commands require human approval. Shell commands and MCP tools can have other
 side effects and follow their normal approval policy. Trust does not provide
 filesystem isolation for those processes.
 
