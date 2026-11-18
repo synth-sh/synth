@@ -6427,15 +6427,17 @@ test "idle background context does not create a turn" {
     loop.hooks = &runner;
     var immediate = try runner.evaluate(testing.allocator, loop.hookInput(.{ .event = .pre_tool_use }));
     defer immediate.deinit(testing.allocator);
-    for (0..200) |_| {
-        _ = try loop.poll();
-        if (loop.hook_flow.context != null) break;
-        try std.Io.sleep(testing.io, .fromMilliseconds(5), .awake);
-    }
-    try testing.expect(loop.hook_flow.context != null);
+    try settleHookObservers(&runtime);
+    _ = try loop.poll();
     try testing.expectEqual(State.idle, loop.state);
     try testing.expectEqual(@as(u64, 0), loop.requests_started);
     try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
+    try loop.submit("inspect", .{});
+    try settle(&loop);
+    const delivered = for (fixture.convo.messages.items) |message| {
+        if (message.origin == .hook and std.mem.indexOf(u8, message.text, "later context") != null) break true;
+    } else false;
+    try testing.expect(delivered);
 }
 
 test "cancelling a model pre-event never starts the provider afterward" {
@@ -6994,8 +6996,11 @@ test "child background context must not be consumed by parent" {
     defer runtime.deinit();
     var parent = fixture.loop();
     defer parent.deinit();
+    var child_convo = Conversation.init(testing.allocator);
+    defer child_convo.deinit();
     var child = fixture.loop();
     defer child.deinit();
+    child.conversation = &child_convo;
     child.parent = &parent;
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
         .pre_tool_use = &.{.{ .legacy = false, .async = true, .when = .{ .agent_scope = .subagent }, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"CHILD-ONLY-CONTEXT\"}}'" }},
@@ -7004,14 +7009,20 @@ test "child background context must not be consumed by parent" {
     child.hooks = &runner;
     var dispatched = try runner.evaluate(testing.allocator, child.hookInput(.{ .event = .pre_tool_use, .tool_name = "read" }));
     defer dispatched.deinit(testing.allocator);
-    for (0..1000) |_| {
-        _ = try parent.poll();
-        if (parent.hook_flow.context != null or runtime.background.items.len == 0) break;
-        try std.Io.sleep(testing.io, .fromMilliseconds(1), .awake);
-    }
-    try testing.expect(parent.hook_flow.context == null);
+    try settleHookObservers(&runtime);
+    _ = try parent.poll();
     _ = try child.poll();
-    try testing.expectEqualStrings("[Hook config]\nCHILD-ONLY-CONTEXT", child.hook_flow.context.?);
+    try parent.submit("main request", .{});
+    try settle(&parent);
+    for (fixture.convo.messages.items) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.text, "CHILD-ONLY-CONTEXT") == null);
+    }
+    try child.submit("child request", .{});
+    try settle(&child);
+    const delivered = for (child_convo.messages.items) |message| {
+        if (message.origin == .hook and std.mem.indexOf(u8, message.text, "CHILD-ONLY-CONTEXT") != null) break true;
+    } else false;
+    try testing.expect(delivered);
 }
 
 test "judge material must identify actual execution directory" {
@@ -7398,4 +7409,27 @@ test "a clipped answer keeps subsequent actions behind human review" {
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "must-not-run", .{}));
     try loop.decide(.deny);
     try settle(&loop);
+}
+
+test "reading from an outside cwd still requires human approval" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var outside = testing.tmpDir(.{});
+    defer outside.cleanup();
+    try outside.dir.writeFile(testing.io, .{ .sub_path = "secret.txt", .data = "outside contents" });
+    const cwd = try outside.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(cwd);
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.changeDirectory(cwd);
+    fixture.fake.tool_name = "read";
+    fixture.fake.tool_arguments = "{\"path\":\"secret.txt\"}";
+    try loop.submit("read here", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try loop.decide(.once);
+    try settle(&loop);
+    const call = fixture.convo.messages.items[1].tool_calls[0];
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, call.status);
+    try testing.expect(std.mem.indexOf(u8, call.result.?, "outside contents") != null);
 }

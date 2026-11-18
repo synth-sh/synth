@@ -16,4 +16,4 @@
 - Add `stream: true` to handlers that need individual streamed records. Response headers remain available without it.
 - The path-protection example and offline CLI tests require Python 3.
 - Trust grants and enable operations require at least 32 ID characters. Relative user commands stay scoped to each checkout; absolute commands with absolute file arguments can share trust.
-- Editing Synth control files or literal script paths referenced by trusted hooks requires human approval, including under auto mode and additional roots. Hook scripts and their dependencies still run with the user's process permissions.
+- Direct file-tool edits to Synth control files or literal script paths referenced by trusted hooks require human approval, including under auto mode and additional roots. Shell commands and MCP tools follow their normal approval policy; scripts and their dependencies run with the user's process permissions.

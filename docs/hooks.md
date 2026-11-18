@@ -31,7 +31,10 @@ Existing hooks need review before new prompts run. Changed declarations need
 fresh trust. User-level commands with absolute executable and file paths share trust across
 projects. Relative commands and project hook sources remain tied to their checkout. Changing the default timeout doesn't reset trust.
 Trust covers declarations, not the contents or dependencies of external scripts.
-Keep policy scripts outside agent-writable locations when they carry authority.
+Direct file-tool edits to control files and literal paths named by trusted
+commands require human approval. Shell commands and MCP tools can have other
+side effects and follow their normal approval policy. Trust does not provide
+filesystem isolation for those processes.
 
 The [path-protection example](../examples/hooks/protect-paths.py) rejects writes
 to secrets, CI files, lockfiles, and migrations, including equivalent paths and

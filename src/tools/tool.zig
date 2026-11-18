@@ -430,3 +430,13 @@ test "additional roots admit their files without admitting a shared prefix" {
     try std.testing.expectError(error.PathOutsideProject, resolvePath(ctx, "/sibling-other/secret"));
     try std.testing.expectError(error.PathOutsideProject, resolvePath(ctx, "/sibling/../secret"));
 }
+
+test "a changed working directory does not become a permitted root" {
+    var reads = ReadLog.init(std.testing.allocator);
+    defer reads.deinit();
+    const ctx: Context = .{ .allocator = std.testing.allocator, .io = std.testing.io, .project_root = "/outside", .permitted_root = "/repo", .additional_roots = &.{"/repo"}, .reads = &reads };
+    try std.testing.expectError(error.PathOutsideProject, resolvePath(ctx, "secret.txt"));
+    const admitted = try resolvePath(ctx, "/repo/main.zig");
+    defer std.testing.allocator.free(admitted);
+    try std.testing.expectEqualStrings("/repo/main.zig", admitted);
+}
