@@ -5,7 +5,6 @@ pub const max_probability: f32 = 1;
 pub const max_tokens: u32 = 1_048_576;
 pub const max_top_k: u32 = 1_048_576;
 pub const max_context_limit: u32 = 1_048_576;
-const supported_schemes = [_][]const u8{ "http", "https" };
 pub const max_penalty: f32 = 2;
 pub const max_stops = 16;
 pub const max_stop_bytes = 4096;
@@ -102,10 +101,7 @@ pub const Policy = struct {
         for (self.routes, 0..) |value, i| {
             if (value.id.len == 0 or value.model.len == 0 or value.purposes.len == 0 or value.context_limit > max_context_limit) return error.InvalidModelRoute;
             const uri = std.Uri.parse(value.endpoint) catch return error.InvalidModelRoute;
-            var supported_scheme = false;
-            for (supported_schemes) |scheme| if (std.mem.eql(u8, uri.scheme, scheme)) {
-                supported_scheme = true;
-            };
+            const supported_scheme = std.mem.eql(u8, uri.scheme, "http") or std.mem.eql(u8, uri.scheme, "https");
             if (!supported_scheme or uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidModelRoute;
             for (self.routes[0..i]) |earlier| if (std.mem.eql(u8, earlier.id, value.id)) return error.DuplicateModelRoute;
             if (value.provider == .ollama and value.protocol != .chat) return error.InvalidModelRoute;
