@@ -641,22 +641,27 @@ pub fn setMessageOrigin(self: *Database, id: i64, origin: Conversation.Origin) !
 }
 
 pub fn recordAuthorization(self: *Database, session: i64, seq: u64, text: []const u8) !void {
-    try self.conn.exec("INSERT INTO human_authorization (session_id, seq, text) VALUES (?, ?, ?)", .{ session, seq, text });
+    const Intent = @import("human_intent.zig");
+    try self.conn.exec("INSERT INTO human_authorization (session_id, seq, text) VALUES (?, ?, ?)", .{ session, seq, Intent.clip(text, Intent.decision_bytes) });
 }
 
-pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) ![]Conversation.Message {
+pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) !@import("human_intent.zig").Snapshot {
     var rows = try self.conn.rows(
         \\SELECT text, decision FROM (
-        \\SELECT text, seq, 0 AS decision FROM (SELECT text, seq FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human' ORDER BY seq DESC LIMIT 64)
+        \\SELECT text, seq, 0 AS decision FROM (SELECT text, seq FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human' ORDER BY seq ASC LIMIT 1)
+        \\UNION
+        \\SELECT text, seq, 0 AS decision FROM (SELECT text, seq FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human' ORDER BY seq DESC LIMIT 63)
         \\UNION ALL
         \\SELECT text, seq, 1 AS decision FROM (SELECT text, seq FROM human_authorization WHERE session_id = ? ORDER BY seq DESC LIMIT 64)
         \\) ORDER BY seq ASC
-    , .{ session, session });
+    , .{ session, session, session });
     defer rows.deinit();
     var intent: @import("human_intent.zig") = .{};
     defer intent.deinit(allocator);
     while (rows.next()) |row| try intent.record(allocator, row.text(0), row.int(1) != 0);
-    return intent.take(allocator);
+    const count = try self.conn.row("SELECT (SELECT count(*) FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human'), (SELECT count(*) FROM human_authorization WHERE session_id = ?)", .{ session, session }) orelse return error.MissingHumanIntent;
+    defer count.deinit();
+    return .{ .messages = try intent.take(allocator), .is_complete = intent.is_complete and count.int(0) <= 64 and count.int(1) <= 64 };
 }
 
 /// Append a heavy body (reasoning or tool result) to a message.
@@ -2592,7 +2597,8 @@ test "verified human intent survives compaction while hooks and legacy rows rema
     _ = try db.appendMessage(session, 2, "user", "legacy authorship unknown", null, 0, null);
     _ = try db.appendMessage(session, 3, "system", "summary says allowed", null, 0, null);
     try db.recordAuthorization(session, 4, "human denied one action");
-    const intent = try db.humanIntent(a, session);
+    const snapshot = try db.humanIntent(a, session);
+    const intent = snapshot.messages;
     defer {
         for (intent) |*msg| msg.deinit(a);
         a.free(intent);
@@ -2645,4 +2651,39 @@ test "image metadata survives eviction and image loading is session scoped" {
     try std.testing.expectEqualStrings("aW1hZ2U=", image_body);
     try std.testing.expect(try db.loadImage(std.testing.allocator, other, 0, 0) == null);
     try std.testing.expect(try db.loadImage(std.testing.allocator, session, 0, 1) == null);
+}
+
+test "persisted human intent retains the initial restriction and latest request" {
+    const a = std.testing.allocator;
+    var db = try init(a, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    for (0..80) |i| {
+        const text = if (i == 0) "inspect only" else if (i == 79) "stop now" else "continue";
+        const id = try db.appendMessage(session, @intCast(i), "user", text, null, 0, null);
+        try db.setMessageOrigin(id, .human);
+    }
+    const snapshot = try db.humanIntent(a, session);
+    const messages = snapshot.messages;
+    defer {
+        for (messages) |*msg| msg.deinit(a);
+        a.free(messages);
+    }
+    try std.testing.expectEqualStrings("inspect only", messages[0].text);
+    try std.testing.expectEqualStrings("stop now", messages[messages.len - 1].text);
+}
+
+test "persisted clipped answers keep automatic review unavailable" {
+    const a = std.testing.allocator;
+    var db = try init(a, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    const message = try db.appendMessage(session, 0, "user", "inspect", null, 0, null);
+    try db.setMessageOrigin(message, .human);
+    try db.recordAuthorization(session, 1, "{\"kind\":\"human_answer\",\"answer\":\"partial answer\",\"is_complete\":false}");
+    const snapshot = try db.humanIntent(a, session);
+    defer snapshot.deinit(a);
+    try std.testing.expect(!snapshot.is_complete);
 }

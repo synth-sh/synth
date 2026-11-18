@@ -2,6 +2,8 @@
 //! back, repeat until it answers in prose.
 
 const std = @import("std");
+const HumanIntent = @import("../core/human_intent.zig");
+const paths = @import("../core/paths.zig");
 const testing = std.testing;
 
 const Config = @import("../core/config.zig");
@@ -2240,12 +2242,14 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const stored_intent = if (asker.db) |db| if (asker.session_id) |id| try db.humanIntent(self.allocator, id) else null else null;
-    defer if (stored_intent) |messages| {
-        for (messages) |*msg| msg.deinit(self.allocator);
-        self.allocator.free(messages);
-    };
+    defer if (stored_intent) |snapshot| snapshot.deinit(self.allocator);
     const remembered = try asker.human_intent.view(arena_state.allocator());
-    const intent = stored_intent orelse if (remembered.len > 0) remembered else asker.conversation.messages.items;
+    const intent = if (stored_intent) |snapshot| snapshot.messages else if (remembered.len > 0) remembered else asker.conversation.messages.items;
+    const complete_intent = if (stored_intent) |snapshot| snapshot.is_complete else asker.human_intent.is_complete;
+    if (!complete_intent) {
+        _ = try self.judgeUnavailable(call_index, "human instructions exceed the review context budget");
+        return;
+    }
     const has_human = for (intent) |message| {
         if (message.role == .user and message.origin == .human and std.mem.trim(u8, message.text, " \t\r\n").len > 0) break true;
     } else false;
@@ -2412,7 +2416,7 @@ pub fn answer(self: *Loop, text: []const u8) !void {
         if (call.status != .running) continue;
         if (!std.mem.eql(u8, call.name, ask_user.name)) continue;
 
-        const receipt = try std.json.Stringify.valueAlloc(self.allocator, .{ .kind = "human_answer", .call_id = call.id, .answer = text }, .{});
+        const receipt = try std.json.Stringify.valueAlloc(self.allocator, .{ .kind = "human_answer", .message_seq = self.conversation.messages.items[message_index].seq, .call_index = i, .answer = HumanIntent.clip(text, HumanIntent.decision_bytes / 2), .is_complete = text.len <= HumanIntent.decision_bytes / 2 }, .{});
         defer self.allocator.free(receipt);
         try self.recordHuman(receipt, true);
         self.approved_ask_index = null;
@@ -2570,14 +2574,12 @@ pub fn decide(self: *Loop, decision: Decision) !void {
         .action_hash = std.fmt.bytesToHex(hash, .lower),
     }, .{});
     defer self.allocator.free(receipt);
-    try self.recordHuman(receipt, true);
 
     switch (decision) {
         .once => try self.approve(call),
         .always => |breadth| {
             try self.approve(call);
-            if (call.status != .running) return;
-            try self.allow(call, breadth);
+            if (call.status == .running) try self.allow(call, breadth);
         },
         .deny => {
             call.status = .rejected;
@@ -2587,7 +2589,9 @@ pub fn decide(self: *Loop, decision: Decision) !void {
         },
     }
 
-    if (decision == .always) try self.autoApproveRemaining(message_index);
+    if (decision == .deny or call.status == .running) try self.recordHuman(receipt, true);
+    if (call.status == .rejected) try self.persistToolCall(message_index, call_index);
+    if (decision == .always and call.status == .running) try self.autoApproveRemaining(message_index);
 
     if (self.firstPending() != null) return;
     try self.runApproved();
@@ -7287,4 +7291,49 @@ test "an unavailable completion policy does not report a successful turn" {
     const notice = loop.takeHookNotice().?;
     defer testing.allocator.free(notice);
     try testing.expect(std.mem.indexOf(u8, notice, "HookCommandUnavailable") != null);
+}
+
+test "clipped human instructions require a human decision instead of model review" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch must-not-run\"}";
+    const request = try testing.allocator.alloc(u8, HumanIntent.prompt_bytes + 1);
+    defer testing.allocator.free(request);
+    @memset(request, 'x');
+    try loop.submit(request, .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "must-not-run", .{}));
+    try loop.decide(.deny);
+    try settle(&loop);
+}
+
+test "a clipped answer keeps subsequent actions behind human review" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+    fixture.fake.tool_name = "ask_user";
+    fixture.fake.tool_arguments = "{\"question\":\"Any restrictions?\"}";
+    try loop.submit("inspect", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_answer, loop.state);
+    const answer_text = try testing.allocator.alloc(u8, HumanIntent.decision_bytes);
+    defer testing.allocator.free(answer_text);
+    @memset(answer_text, 'x');
+    try loop.answer(answer_text);
+    try settle(&loop);
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch must-not-run\"}";
+    try loop.submit("continue", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "must-not-run", .{}));
+    try loop.decide(.deny);
+    try settle(&loop);
 }
