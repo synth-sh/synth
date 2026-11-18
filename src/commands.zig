@@ -834,7 +834,12 @@ pub fn hooks(init_process: std.process.Init, action: @import("core/hook_store.zi
     var store = try store_module.Store.init(init_process.gpa, init_process.io, config.hook_state_path);
     defer store.deinit();
     var set = try store_module.discover(a, init_process.io, config.hooks, project.root, init_process.environ_map.get("HOME"), store);
-    try store_module.change(a, init_process.io, &set, config.hook_state_path, action, id);
+    store_module.change(a, init_process.io, &set, config.hook_state_path, action, id) catch |err| switch (err) {
+        error.HookIdTooShort => try cli.reject(init_process.io, .hooks, "hook id prefix is too short", .{}),
+        error.HookNotFound => try cli.reject(init_process.io, .hooks, "no hook matches '{s}'", .{id}),
+        error.AmbiguousHookId => try cli.reject(init_process.io, .hooks, "hook id prefix '{s}' is ambiguous", .{id}),
+        else => return err,
+    };
     const text = try store_module.report(a, set, config.hook_timeout_ms, action == .review, null);
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init_process.io, &buffer);

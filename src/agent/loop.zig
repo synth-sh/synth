@@ -6596,13 +6596,13 @@ test "StopFailure observes a terminal provider error without running Stop" {
     defer fixture.deinit();
     const Failure = struct {
         fn respond(_: *anyopaque, _: *Conversation, _: Provider.Turn, _: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
-            return error.RateLimit;
+            return error.NotSignedIn;
         }
     };
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
-        .stop_failure = &.{.{ .legacy = false, .matcher = "rate_limit", .command = "cat > failure.json" }},
+        .stop_failure = &.{.{ .legacy = false, .matcher = "authentication_failed", .command = "cat > failure.json" }},
         .stop = &.{.{ .command = "touch normal-stop" }},
     } };
     var loop = fixture.loop();
@@ -6617,8 +6617,8 @@ test "StopFailure observes a terminal provider error without running Stop" {
     defer testing.allocator.free(payload);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
     defer parsed.deinit();
-    try testing.expectEqualStrings("rate_limit", parsed.value.object.get("error").?.string);
-    try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("last_assistant_message").?.string, "RateLimit") != null);
+    try testing.expectEqualStrings("authentication_failed", parsed.value.object.get("error").?.string);
+    try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("last_assistant_message").?.string, "NotSignedIn") != null);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(testing.io, "normal-stop", .{}));
 }
 

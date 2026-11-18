@@ -215,11 +215,7 @@ pub fn mentionsOverflow(why: []const u8) bool {
 pub fn errorType(err: anyerror, details: []const u8) []const u8 {
     switch (err) {
         error.ContextTooLarge => return "invalid_request",
-        error.RateLimit => return "rate_limit",
-        error.Unauthorized, error.NotSignedIn => return "authentication_failed",
-        error.ModelNotFound => return "model_not_found",
-        error.Overloaded => return "overloaded",
-        error.BillingError => return "billing_error",
+        error.NotSignedIn => return "authentication_failed",
         else => {},
     }
     var words = std.mem.tokenizeAny(u8, details, " \t\r\n:");

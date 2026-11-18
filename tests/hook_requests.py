@@ -135,7 +135,7 @@ def expect(result, text):
 
 
 def main():
-    for arguments in (('hooks', 'frobnicate'), ('hooks', 'trust'), ('hooks', 'list', 'extra', 'extra')):
+    for arguments in (('hooks', 'frobnicate'), ('hooks', 'trust'), ('hooks', 'trust', 'abc'), ('hooks', 'trust', 'f' * 64), ('hooks', 'list', 'extra', 'extra')):
         result = subprocess.run([str(BINARY), *arguments], capture_output=True, text=True)
         assert result.returncode == 2, (arguments, result.returncode, result.stderr)
         assert 'Usage:' in result.stderr and 'stack trace' not in result.stderr.lower(), result.stderr
@@ -147,6 +147,16 @@ def main():
         assert len(requests) == 1
         expect(result, 'config hook trusted')
     print('PASS config-sourced hook trust survives separate CLI processes')
+    with session('missing-stop', lambda *_: chat('finished'), extra_hooks=lambda _: {'Stop': [{'command': '/synth-does-not-exist'}]}) as (_, result, requests, _):
+        assert result.returncode != 0, (result.stdout, result.stderr)
+        assert len(requests) == 1
+        expect(result, 'HookCommandUnavailable')
+    print('PASS unavailable completion policies fail headless runs')
+    with session('ollama-status', lambda *_: (429, {'error': 'model is busy'}, 'application/json'), events=('StopFailure',), protocol='ollama', attempts=1) as (_, result, _, log):
+        assert result.returncode != 0
+        failure = [event for event in log if event['hook_event_name'] == 'StopFailure']
+        assert len(failure) == 1 and failure[0]['error_type'] == 'rate_limit', failure
+    print('PASS actual Ollama HTTP failures classify StopFailure hooks')
     with session('untrusted', lambda *_: chat('must-not-run'), events=('PreToolUse',), trust=False) as (_, result, requests, _):
         assert result.returncode != 0 and not requests
         expect(result, 'review')

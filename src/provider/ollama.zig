@@ -447,8 +447,8 @@ pub fn describeError(
         ),
         error.HttpError => if (self.rejection) |why| return std.fmt.allocPrint(
             allocator,
-            "ollama rejected the request for `{s}`: {s}. {s}",
-            .{ self.model, std.mem.trimEnd(u8, why, ". \n"), advice(why) },
+            "{d} {s}: ollama rejected the request for `{s}`: {s}. {s}",
+            .{ @intFromEnum(self.last_status), self.last_status.phrase() orelse "HTTP error", self.model, std.mem.trimEnd(u8, why, ". \n"), advice(why) },
         ),
         else => return std.fmt.allocPrint(
             allocator,
