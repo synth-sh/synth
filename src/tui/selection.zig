@@ -62,12 +62,12 @@ pub const Rect = struct {
         return .{ .top = row, .left = col, .bottom = row + height - 1, .right = col + width - 1 };
     }
 
-    fn holds(self: Rect, point: Point) bool {
+    pub fn holds(self: Rect, point: Point) bool {
         return point.row >= self.top and point.row <= self.bottom and
             point.col >= self.left and point.col <= self.right;
     }
 
-    fn clamp(self: Rect, point: Point) Point {
+    pub fn clamp(self: Rect, point: Point) Point {
         return .{
             .row = std.math.clamp(point.row, self.top, self.bottom),
             .col = std.math.clamp(point.col, self.left, self.right),

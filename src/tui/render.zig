@@ -25,6 +25,7 @@ const pkg = @import("pkg");
 const Input = @import("input.zig");
 const markdown = @import("markdown.zig");
 const Selection = @import("selection.zig");
+const transcript_map = @import("transcript_map.zig");
 const scrim = @import("scrim.zig");
 const theme = @import("theme.zig");
 const themes = @import("themes.zig");
@@ -43,6 +44,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     const max = root.size;
     w.fill(root, theme.base.cell);
     self.selection.resetRegions();
+    self.transcript_area = null;
     if (max.width == 0 or max.height == 0) return root;
 
     // The title row and the rule under it, which the frame starts below.
@@ -68,7 +70,9 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
 
     try self.selection.addRegion(Selection.Rect.sized(0, 0, title_h, max.width));
     try self.selection.addRegion(Selection.Rect.sized(title_h + body_h, 0, max.height -| (title_h + body_h), max.width));
-    try self.selection.addRegion(Selection.Rect.sized(title_h, Model.gutter, body_h -| Model.block_gap, column_w));
+    self.transcript_area = Selection.Rect.sized(title_h, Model.gutter, body_h -| Model.block_gap, column_w);
+    try self.selection.addRegion(self.transcript_area);
+    self.cell_size = ctx.cell_size;
 
     var children: std.ArrayList(vxfw.SubSurface) = .empty;
 
@@ -248,7 +252,9 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
 
     root.children = children.items;
 
+    if (self.transcript_drag) |drag| projectDrag(self, drag);
     try self.selection.capture(root);
+    if (!self.selection.isActive()) self.transcript_drag = null;
 
     if (dialog_open) {
         if (try scrim.draw(ctx.arena, self.plainWidget(), root, max)) |dim| {
@@ -273,6 +279,16 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     }
 
     return root;
+}
+
+/// Put a transcript drag's ends where their text is drawn this frame. The
+/// pointer's end is found again too: when the view scrolls under a pointer
+/// that has not moved, it is over different text.
+fn projectDrag(self: *Model, drag: Model.TranscriptDrag) void {
+    const layout = self.transcriptLayout() orelse return;
+    const head = layout.locate(drag.pointer) orelse return;
+    self.selection.anchor = layout.project(drag.anchor);
+    self.selection.head = layout.project(head);
 }
 
 /// The screen a child placed on the root covers, as a selection region.
@@ -351,12 +367,12 @@ const Block = union(enum) {
     tool: struct { msg: *Conversation.Message, index: usize },
     /// A question the model is waiting on, drawn as a question rather than as
     /// the tool call it technically is.
-    question: *Conversation.ToolCall,
+    question: struct { msg: *Conversation.Message, index: usize },
     /// The spinner shown while a turn is in flight.
     thinking,
     /// The reply as it streams in, before it becomes a message.
     streaming,
-    steering: []const u8,
+    steering: struct { prompt: []const u8, index: usize },
     steering_more: usize,
     /// What a finished turn did, as the harness wrote it down.
     recap: *Conversation.Message,
@@ -402,7 +418,7 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
         }
         for (msg.tool_calls, 0..) |*call, index| {
             if (std.mem.eql(u8, call.name, ask_user.name) and call.status == .running) {
-                try blocks.append(arena, .{ .question = call });
+                try blocks.append(arena, .{ .question = .{ .msg = msg, .index = index } });
                 continue;
             }
             try blocks.append(arena, .{ .tool = .{ .msg = msg, .index = index } });
@@ -420,7 +436,7 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
             try blocks.append(arena, .{ .steering_more = steering.len - i });
             break;
         }
-        try blocks.append(arena, .{ .steering = prompt });
+        try blocks.append(arena, .{ .steering = .{ .prompt = prompt, .index = i } });
     }
 
     return blocks.toOwnedSlice(arena);
@@ -477,7 +493,7 @@ fn drawBlock(
             return try card.widget().draw(constraints);
         },
 
-        .question => |call| return try questionBlock(self, ctx, call, width),
+        .question => |at| return try questionBlock(self, ctx, &at.msg.tool_calls[at.index], width),
 
         .thinking => return try self.thinking.widget().draw(constraints),
 
@@ -490,7 +506,7 @@ fn drawBlock(
 
         .recap => |msg| return try recapBlock(self, ctx, msg.text, width),
 
-        .steering => |prompt| return try steeringBlock(self, ctx, prompt, width),
+        .steering => |queued| return try steeringBlock(self, ctx, queued.prompt, width),
 
         .steering_more => |count| return try steeringBlock(
             self,
@@ -501,9 +517,29 @@ fn drawBlock(
     }
 }
 
+/// Where a block sits in the transcript, for a selection to hold on to.
+fn blockId(block: Block) transcript_map.BlockId {
+    const attachment_minor: u32 = 2;
+    const tool_minor: u32 = 1 << 16;
+    const steering_minor: u32 = 2;
+    return switch (block) {
+        .notice => .notice,
+        .summary, .recap, .thought => |msg| .ofMessage(msg.seq, 0),
+        .text => |msg| .ofMessage(msg.seq, 1),
+        .attachment => |at| .ofMessage(at.msg.seq, attachment_minor + @as(u32, @intCast(at.index))),
+        .tool => |at| .ofMessage(at.msg.seq, tool_minor + @as(u32, @intCast(at.index))),
+        .question => |at| .ofMessage(at.msg.seq, tool_minor + @as(u32, @intCast(at.index))),
+        .thinking => .ofTail(0),
+        .streaming => .ofTail(1),
+        .steering => |queued| .ofTail(steering_minor + @as(u32, @intCast(queued.index))),
+        .steering_more => .ofTail(steering_minor + Model.max_steering_shown),
+    };
+}
+
 /// A block placed in the layout: how tall it is, and its surface when it was
 /// worth building one.
 const Placed = struct {
+    id: transcript_map.BlockId,
     height: u16,
     surface: ?vxfw.Surface,
 };
@@ -568,15 +604,84 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
     return hasher.final();
 }
 
+/// 1 while a turn is in flight and the spinner and streaming reply are shown.
+fn pendingBlocks(self: *Model) usize {
+    return if (self.mirror.isBusy() and self.mirror.state() != .awaiting_approval) 1 else 0;
+}
+
+/// The text between two transcript positions, drawn the way the transcript
+/// draws it, including blocks no longer on screen. Caller owns the result.
+pub fn transcriptText(self: *Model, allocator: std.mem.Allocator, from: transcript_map.Position, to: transcript_map.Position) !?[]u8 {
+    const area = self.transcript_area orelse return null;
+    const width = area.right - area.left + 1;
+    const height = area.bottom - area.top + 1;
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = height },
+        .cell_size = self.cell_size,
+    };
+    const constraints = ctx.withConstraints(.{ .width = width }, .{ .width = width, .height = height });
+
+    var children: std.ArrayList(vxfw.SubSurface) = .empty;
+    var start: ?Selection.Point = null;
+    var end: ?Selection.Point = null;
+    var rows: u32 = 0;
+    for (try enumerateBlocks(self, arena, pendingBlocks(self))) |block| {
+        const id = blockId(block);
+        if (id.order(from.block) == .lt) continue;
+        if (id.order(to.block) == .gt) break;
+        const surface = try drawBlock(self, ctx, constraints, width, block) orelse continue;
+        if (surface.size.height == 0) continue;
+        if (children.items.len > 0) rows += Model.block_gap;
+        if (rows + surface.size.height > std.math.maxInt(u16)) break;
+
+        const top: u16 = @intCast(rows);
+        if (start == null) start = if (id.order(from.block) == .eq)
+            .{ .row = top + @min(from.row, surface.size.height - 1), .col = from.col }
+        else
+            .{ .row = top, .col = 0 };
+        end = if (id.order(to.block) == .eq)
+            .{ .row = top + @min(to.row, surface.size.height - 1), .col = to.col }
+        else
+            .{ .row = top + surface.size.height - 1, .col = width - 1 };
+
+        try children.append(arena, .{ .origin = .{ .row = top, .col = 0 }, .surface = surface });
+        rows += surface.size.height;
+    }
+
+    const first = start orelse return null;
+    const last = end orelse return null;
+    const stacked: vxfw.Surface = .{
+        .size = .{ .width = width, .height = @intCast(rows) },
+        .widget = self.plainWidget(),
+        .buffer = &.{},
+        .children = children.items,
+    };
+
+    var grid: Selection = .init(allocator);
+    defer grid.deinit();
+    try grid.capture(stacked);
+    try grid.addRegion(.everything);
+    _ = grid.begin(first);
+    grid.extend(last);
+    return grid.text(allocator);
+}
+
 pub fn drawTranscript(
     self: *Model,
     ctx: vxfw.DrawContext,
     width: u16,
     height: u16,
 ) !?vxfw.Surface {
+    self.transcript_layout.clearRetainingCapacity();
     const messages = self.shown().messages.items;
-    const pending: usize = if (self.mirror.isBusy() and
-        self.mirror.state() != .awaiting_approval) 1 else 0;
+    const pending = pendingBlocks(self);
     if (height == 0) return null;
     if (messages.len + pending + self.mirror.pendingSteering().len == 0) {
         if (self.viewing != null) return null;
@@ -618,14 +723,14 @@ pub fn drawTranscript(
         else
             true;
 
-        var placed: Placed = .{ .height = cached orelse 0, .surface = null };
+        var placed: Placed = .{ .id = blockId(blocks[i]), .height = cached orelse 0, .surface = null };
         if (build) {
             const surface = try drawBlock(self, ctx, constraints, width, blocks[i]);
             if (key) |k| {
                 try self.block_heights.put(self.allocator, k, if (surface) |sf| sf.size.height else 0);
             }
             const shape = surface orelse continue;
-            placed = .{ .height = shape.size.height, .surface = shape };
+            placed = .{ .id = placed.id, .height = shape.size.height, .surface = shape };
         } else if (placed.height == 0) {
             continue;
         }
@@ -661,6 +766,13 @@ pub fn drawTranscript(
 
     var y: i32 = if (overflow <= 0) Model.transcript_top else height - total;
     y += self.scroll;
+
+    self.layout_scroll = self.scroll;
+    var top = y;
+    for (shown.items) |block| {
+        try self.transcript_layout.append(self.allocator, .{ .id = block.id, .top = top, .height = block.height });
+        top += @as(i32, block.height) + Model.block_gap;
+    }
 
     var children: std.ArrayList(vxfw.SubSurface) = .empty;
     for (shown.items) |block| {
@@ -2243,4 +2355,106 @@ test "copying a reply with a table leaves out its rule and the table's lines" {
     const copied = (try selection.text(testing.allocator)).?;
     defer testing.allocator.free(copied);
     try testing.expectEqualStrings("Final build\nPart  Price\nGPU   $1,494.99\nCase  $129.99", copied);
+}
+
+test "copying from the transcript reaches blocks scrolled off screen" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var userdata: u8 = 0;
+    var model: Model = undefined;
+    try chromeFixture(&model, &userdata, null);
+    defer model.deinit();
+
+    for (0..12) |i| {
+        const text = try std.fmt.allocPrint(arena, "message {d}", .{i});
+        if (i % 2 == 0) {
+            _ = try model.conversation.addUser(text, &.{}, &.{});
+        } else {
+            _ = try model.conversation.addAssistant(text, null, null);
+        }
+    }
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = 60, .height = 16 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    _ = try draw(&model, ctx);
+
+    const layout = model.transcriptLayout().?;
+    try testing.expect(layout.blocks[0].top < 0);
+
+    const messages = model.conversation.messages.items;
+    const from: transcript_map.Position = .{ .block = .ofMessage(messages[0].seq, 1), .row = 0, .col = 0 };
+    const to: transcript_map.Position = .{ .block = .ofMessage(messages[11].seq, 1), .row = 0, .col = 59 };
+    const copied = (try transcriptText(&model, testing.allocator, from, to)).?;
+    defer testing.allocator.free(copied);
+
+    try testing.expect(std.mem.startsWith(u8, copied, "message 0"));
+    try testing.expect(std.mem.endsWith(u8, copied, "message 11"));
+    try testing.expect(std.mem.indexOf(u8, copied, "message 6") != null);
+    try testing.expect(std.mem.indexOf(u8, copied, w.solid_rule) == null);
+    try testing.expect(std.mem.indexOf(u8, copied, w.prompt_mark) == null);
+}
+
+test "a transcript drag follows the wheel and copies what it scrolled over" {
+    const testing = std.testing;
+    const keys = @import("keys.zig");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var userdata: u8 = 0;
+    var model: Model = undefined;
+    try chromeFixture(&model, &userdata, null);
+    defer model.deinit();
+
+    for (0..30) |i| {
+        const text = try std.fmt.allocPrint(arena, "message {d}", .{i});
+        if (i % 2 == 0) {
+            _ = try model.conversation.addUser(text, &.{}, &.{});
+        } else {
+            _ = try model.conversation.addAssistant(text, null, null);
+        }
+    }
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = 60, .height = 20 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    _ = try draw(&model, ctx);
+
+    var events: vxfw.EventContext = .{ .io = testing.io, .alloc = testing.allocator, .cmds = .empty };
+    defer events.cmds.deinit(testing.allocator);
+    const Step = struct { button: vaxis.Mouse.Button, type: vaxis.Mouse.Type, row: i16 };
+    const steps = [_]Step{
+        .{ .button = .left, .type = .press, .row = 12 },
+        .{ .button = .left, .type = .drag, .row = 13 },
+        .{ .button = .wheel_up, .type = .press, .row = 13 },
+        .{ .button = .wheel_up, .type = .press, .row = 13 },
+    };
+    for (steps) |step| {
+        try keys.trackSelection(&model, &events, .{ .col = 4, .row = step.row, .button = step.button, .mods = .{}, .type = step.type });
+        _ = try draw(&model, ctx);
+    }
+    try testing.expectEqual(@as(u16, 6), model.scroll);
+    try testing.expect(model.transcript_drag != null);
+
+    try keys.trackSelection(&model, &events, .{ .col = 4, .row = 13, .button = .left, .mods = .{}, .type = .release });
+    try testing.expect(model.transcript_drag == null);
+
+    var copied: ?[]const u8 = null;
+    for (events.cmds.items) |cmd| switch (cmd) {
+        .copy_to_clipboard => |text| copied = text,
+        else => {},
+    };
+    std.debug.print("COPIED<<{s}>>\n", .{copied orelse "(none)"});
 }

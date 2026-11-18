@@ -26,6 +26,22 @@ image comes along as a picture, and a name with spaces is written
 saved. The value is run through a shell, so `EDITOR="code -w"` works as long as
 it waits.
 
+## Copying
+
+Drag with the mouse to select, and let go to copy: the text goes to the
+clipboard over OSC 52, which works over ssh too. A selection stays in the part
+of the screen it started in, so dragging from the transcript never picks up the
+sidebar or the composer, and the bars, rules and hints drawn around the text are
+left out of what is copied.
+
+In the transcript a selection can reach past the screen: scroll with the wheel
+while dragging, or hold the pointer at the top or bottom edge and the view
+scrolls by itself. What is copied is what the transcript draws, so a collapsed
+card copies as its one line; expand it first to copy what it holds.
+
+Most terminals select on their own while a modifier is held, usually `shift`,
+and that selection is the terminal's, not synth's.
+
 ## Searching
 
 `synth session search <text>`, or `/search <text>` inside the TUI, looks through

@@ -35,6 +35,7 @@ const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
 const Rename = @import("rename.zig");
 const Selection = @import("selection.zig");
+const transcript_map = @import("transcript_map.zig");
 const SessionPicker = @import("session_picker.zig");
 const Slash = @import("slash.zig");
 const theme = @import("theme.zig");
@@ -231,8 +232,20 @@ slash: Slash = undefined,
 /// was under the press.
 press_point: ?Selection.Point = null,
 /// Column the sidebar starts at, or the screen width when there is none.
-/// Selection is confined to one side of it.
 sidebar_col: u16 = std.math.maxInt(u16),
+/// Where the transcript's blocks were laid out last frame, and the area they
+/// were drawn in. Null area before the transcript is first drawn.
+transcript_layout: std.ArrayList(transcript_map.Placed) = .empty,
+transcript_area: ?Selection.Rect = null,
+/// `scroll` when the layout was made.
+layout_scroll: u16 = 0,
+/// A selection being dragged in the transcript, held to its text rather than to
+/// the screen so it survives scrolling.
+transcript_drag: ?TranscriptDrag = null,
+/// Whether an edge-scroll tick is already scheduled.
+drag_tick_pending: bool = false,
+/// The cell size of the last frame, for drawing blocks outside one to copy them.
+cell_size: vxfw.Size = .{},
 
 /// Whether a spinner tick is already scheduled. Every place that starts work
 /// wants the spinner running, and vxfw has no way to ask whether a timer is
@@ -288,6 +301,18 @@ transcript_exhausted: bool = true,
 /// of the last draw. Growth there moves everything above it up, so a reader
 /// who has scrolled back needs the offset grown to match.
 tail_height: u16 = 0,
+
+/// A transcript drag: the end it started at, where the pointer is now, and the
+/// edge it is holding, if any, which scrolls the view while it is held.
+pub const TranscriptDrag = struct {
+    anchor: transcript_map.Position,
+    pointer: Selection.Point,
+    start_row: u16,
+    edge: enum { none, top, bottom } = .none,
+    /// Whether the pointer has left the row it started on. Until it has, a drag
+    /// along the area's first or last row is selecting there, not scrolling.
+    left_start_row: bool = false,
+};
 
 /// A widget for decorative surfaces: no handlers, so hit testing ignores it.
 /// A message with a held-back paste keeps its own expanded flag.
@@ -405,6 +430,15 @@ pub fn hasSubagent(self: *Model, msg: *Conversation.Message, call_index: usize) 
 }
 
 /// The transcript on screen, which is a subagent's while one is open.
+/// The transcript as last frame laid it out, or null before it was drawn.
+pub fn transcriptLayout(self: *const Model) ?transcript_map.Layout {
+    return .{
+        .blocks = self.transcript_layout.items,
+        .area = self.transcript_area orelse return null,
+        .shift = @as(i32, self.scroll) - self.layout_scroll,
+    };
+}
+
 pub fn shown(self: *Model) *Conversation {
     if (self.viewing) |*view| return &view.convo;
     return &self.conversation;
@@ -553,6 +587,7 @@ pub fn deinit(self: *Model) void {
     self.permission_picker.deinit();
     self.rewind_picker.deinit();
     self.block_heights.deinit(self.allocator);
+    self.transcript_layout.deinit(self.allocator);
     self.notification.deinit();
     self.slash.deinit();
     self.clearHistory();
