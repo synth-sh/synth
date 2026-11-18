@@ -74,7 +74,9 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
             for (definitions[0..index]) |earlier| {
                 if (std.mem.eql(u8, earlier.source, hook.source)) source_index += 1;
             }
-            const user_hook = if (user_source) |path| std.mem.eql(u8, path, hook.source) else false;
+            const source_path = try std.fs.path.resolve(arena, &.{ root, hook.source });
+            const source_is_user = (if (user_source) |path| std.mem.eql(u8, path, hook.source) else false) or !@import("paths.zig").inside(root, source_path);
+            const user_hook = source_is_user and independentCommand(hook.command);
             const encoded = try std.json.Stringify.valueAlloc(arena, .{ if (user_hook) "" else root, event.name(), source_index, hook.* }, .{});
             var hash: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
@@ -86,6 +88,20 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
         @field(set, field.name) = definitions;
     }
     return set;
+}
+
+fn independentCommand(command: []const u8) bool {
+    if (std.mem.indexOfAny(u8, command, ";&|<>()$`\\") != null) return false;
+    var words = std.mem.tokenizeAny(u8, command, " \t\r\n");
+    const program = std.mem.trim(u8, words.next() orelse return false, "\"'");
+    if (!std.fs.path.isAbsolute(program)) return false;
+    while (words.next()) |word| {
+        const value = std.mem.trim(u8, word, "\"'");
+        if (std.fs.path.isAbsolute(value)) continue;
+        const plain_option = std.mem.startsWith(u8, value, "-") and std.mem.indexOfAny(u8, value, "=/\\$`\"'") == null;
+        if (!plain_option) return false;
+    }
+    return true;
 }
 
 fn loadFile(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: []const u8) !void {
@@ -143,7 +159,8 @@ pub fn change(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: ?[]co
     const filename = path orelse return error.HookTrustStoreUnavailable;
     var store = try Store.init(arena, io, filename);
     defer store.deinit();
-    if (id.len < 8) return error.HookIdTooShort;
+    const minimum_id: usize = if (action == .trust or action == .enable) 32 else 8;
+    if (id.len < minimum_id) return error.HookIdTooShort;
     var selected: ?[]const u8 = null;
     inline for (std.meta.fields(Hooks.Set)) |field| {
         for (@field(set.*, field.name)) |hook| {
@@ -277,7 +294,7 @@ test "user hook trust survives project changes and accepts unique id prefixes" {
     var home = std.testing.tmpDir(.{});
     defer home.cleanup();
     try home.dir.createDirPath(io, ".synth");
-    try home.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"true\"}]}" });
+    try home.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"/bin/true\"}]}" });
     const path = try home.dir.realPathFileAlloc(io, ".", scratch);
     var store = try Store.init(a, io, null);
     defer store.deinit();
@@ -285,10 +302,27 @@ test "user hook trust survives project changes and accepts unique id prefixes" {
     const id = initial.pre_tool_use[0].id;
     const state_path = try std.fs.path.join(scratch, &.{ path, "trust.json" });
     var updated = initial;
-    try change(scratch, io, &updated, state_path, .trust, id[0..8]);
+    try change(scratch, io, &updated, state_path, .trust, id[0..32]);
     var saved = try Store.init(a, io, state_path);
     defer saved.deinit();
     const moved = try discover(scratch, io, .{}, "/second-project", path, saved);
     try std.testing.expect(moved.pre_tool_use[0].trusted);
     try std.testing.expectEqualStrings(id, moved.pre_tool_use[0].id);
+}
+
+test "relative user commands cannot reuse another checkout's trust" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".synth");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"bash ./guard.sh\"}]}" });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var store = try Store.init(std.testing.allocator, std.testing.io, null);
+    defer store.deinit();
+    const first = try discover(a, std.testing.io, .{}, "/checkout-one", home, store);
+    try store.put(first.pre_tool_use[0].id, .{ .trusted = true });
+    const next = try discover(a, std.testing.io, .{}, "/checkout-two", home, store);
+    try std.testing.expect(!next.pre_tool_use[0].trusted);
 }

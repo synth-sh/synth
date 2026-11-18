@@ -263,9 +263,9 @@ pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, tar
         for (@field(hooks, field.name)) |hook| {
             if (!hook.enabled or !hook.trusted) continue;
             if (try samePath(arena, io, root, hook.source, lexical, resolved)) return true;
-            var words = safety.arguments(hook.command);
+            var words = safety.shellWords(hook.command);
             while (words.next()) |word| {
-                const candidate = std.mem.trim(u8, word, "\"'");
+                const candidate = try safety.literalWord(arena, word) orelse continue;
                 if (candidate.len == 0 or candidate[0] == '-') continue;
                 if (try samePath(arena, io, root, candidate, lexical, resolved)) return true;
             }
@@ -284,4 +284,26 @@ fn samePath(arena: std.mem.Allocator, io: std.Io, root: []const u8, file: []cons
         else => return false,
     };
     return std.mem.eql(u8, actual, resolved);
+}
+
+test "hook script protection accounts for shell operators and quoting" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    for ([_][]const u8{ "bash ./scripts/check.sh; true", "bash ./scripts/check.sh&&true", "bash ./scripts/check.sh>/dev/null", "bash ./scripts/'check.sh'", "bash ./scripts/check\\.sh" }) |command| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        try testing.expect(try protectedPath(arena.allocator(), std.testing.io, root, "scripts/check.sh", &.{}, .{ .pre_tool_use = &.{.{ .command = command }} }));
+    }
+    for ([_]struct { command: []const u8, path: []const u8 }{
+        .{ .command = "bash ./scripts/check\\ file.sh", .path = "scripts/check file.sh" },
+        .{ .command = "bash ./scripts/check\\;name.sh", .path = "scripts/check;name.sh" },
+        .{ .command = "bash \"./scripts/check\\q.sh\"", .path = "scripts/check\\q.sh" },
+    }) |case| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        try testing.expect(try protectedPath(arena.allocator(), std.testing.io, root, case.path, &.{}, .{ .pre_tool_use = &.{.{ .command = case.command }} }));
+    }
 }

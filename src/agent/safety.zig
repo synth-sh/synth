@@ -204,17 +204,54 @@ pub fn arguments(text: []const u8) ArgumentIterator {
     return .{ .text = text };
 }
 
+pub fn shellWords(text: []const u8) ArgumentIterator {
+    return .{ .text = text, .operators = true };
+}
+
+pub fn literalWord(arena: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (c == '\\' and quote != '\'') {
+            if (i + 1 < raw.len and quote == '"' and std.mem.indexOfScalar(u8, "$`\"\\\n", raw[i + 1]) == null) {
+                try out.append(arena, c);
+                continue;
+            }
+            i += 1;
+            if (i >= raw.len) return null;
+            if (raw[i] != '\n') try out.append(arena, raw[i]);
+        } else if ((c == '\'' or c == '"') and (quote == 0 or quote == c)) {
+            quote = if (quote == c) 0 else c;
+        } else if ((c == '$' or c == '`') and quote != '\'') {
+            return null;
+        } else try out.append(arena, c);
+    }
+    if (quote != 0) return null;
+    return out.items;
+}
+
 pub const ArgumentIterator = struct {
     text: []const u8,
     at: usize = 0,
+    operators: bool = false,
+
+    fn separator(self: *const ArgumentIterator, c: u8) bool {
+        return isSpace(c) or (self.operators and std.mem.indexOfScalar(u8, ";&|<>()", c) != null);
+    }
 
     pub fn next(self: *ArgumentIterator) ?[]const u8 {
-        while (self.at < self.text.len and isSpace(self.text[self.at])) self.at += 1;
+        while (self.at < self.text.len and self.separator(self.text[self.at])) self.at += 1;
         if (self.at >= self.text.len) return null;
 
         const start = self.at;
-        while (self.at < self.text.len and !isSpace(self.text[self.at])) {
+        while (self.at < self.text.len and !self.separator(self.text[self.at])) {
             const c = self.text[self.at];
+            if (self.operators and c == '\\') {
+                self.at += @min(2, self.text.len - self.at);
+                continue;
+            }
             if (c == '\'' or c == '"') {
                 self.at = skipQuoted(self.text, self.at) orelse self.text.len;
                 continue;
