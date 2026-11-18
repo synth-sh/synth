@@ -457,16 +457,6 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
-            if (key.matches(vaxis.Key.escape, .{}) and
-                (self.mirror.isBusy() or self.mirror.status.prompt_queued) and
-                self.mirror.state() != .awaiting_approval)
-            {
-                try self.mirror.cancel();
-                self.thinking.stream = null;
-                try self.scheduleTick(ctx);
-                return ctx.consumeAndRedraw();
-            }
-
             if (self.mirror.state() == .awaiting_approval) {
                 if (key.matches(vaxis.Key.left, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
                     self.approval.move(-1);
@@ -543,6 +533,16 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     try self.acceptMention();
                     return ctx.consumeAndRedraw();
                 }
+            }
+
+            if (key.matches(vaxis.Key.escape, .{}) and
+                (self.mirror.isBusy() or self.mirror.status.prompt_queued) and
+                self.mirror.state() != .awaiting_approval)
+            {
+                try self.mirror.cancel();
+                self.thinking.stream = null;
+                try self.scheduleTick(ctx);
+                return ctx.consumeAndRedraw();
             }
 
             if (key.matches(vaxis.Key.up, .{})) {
@@ -643,4 +643,19 @@ pub fn suspendToShell(self: *Model) void {
     writer.flush() catch {};
 
     app.vx.queueRefresh();
+}
+
+test "Escape closes slash completion without cancelling a queued prompt" {
+    const testing = std.testing;
+    var model: Model = undefined;
+    try @import("test_model.zig").offline(&model);
+    defer model.deinit();
+    model.mirror.status.prompt_queued = true;
+    try model.slash.update("/hooks", 6);
+    try testing.expect(model.slash.isOpen());
+    var ctx: vxfw.EventContext = .{ .phase = .at_target, .io = testing.io, .alloc = testing.allocator, .cmds = .empty };
+    defer ctx.cmds.deinit(testing.allocator);
+    try typeErasedEventHandler(&model, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.escape } });
+    try testing.expect(!model.slash.isOpen());
+    try testing.expect(model.mirror.status.prompt_queued);
 }
