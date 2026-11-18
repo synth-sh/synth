@@ -2687,7 +2687,8 @@ fn hookRequiresApproval(self: *const Loop, call: *const Conversation.ToolCall) b
             for ([_][]const u8{ "path", "file" }) |field| {
                 if (input.object.get(field)) |target| {
                     if (target != .string) continue;
-                    if (permission.protectedPath(arena, self.io, self.project_root, target.string, self.control_files, if (self.hooks) |runner| runner.set else .{}) catch true) return true;
+                    const resolved = self.resolveAgainstProject(arena, target.string) orelse return true;
+                    if (permission.protectedPath(arena, self.io, self.project_root, resolved, self.control_files, if (self.hooks) |runner| runner.set else .{}) catch true) return true;
                 }
             }
         }

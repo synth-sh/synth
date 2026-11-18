@@ -9,6 +9,9 @@
 //! matches only that path.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const Paths = @import("../core/paths.zig");
+const Hooks = @import("../core/hooks.zig");
 const testing = std.testing;
 
 const safety = @import("safety.zig");
@@ -244,22 +247,21 @@ test "allowances stored before word prefixes keep covering what they did" {
     try expectCovers("find", "find .", false);
 }
 
-pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, target: []const u8, control_files: []const []const u8, hooks: @import("../core/hooks.zig").Set) !bool {
-    const Paths = @import("../core/paths.zig");
+pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, target: []const u8, control_files: []const []const u8, hooks: Hooks.Set) !bool {
     const lexical = try std.fs.path.resolve(arena, &.{ root, target });
     const resolved = try Paths.resolve(io, arena, root, target);
     for ([_][]const u8{ lexical, resolved }) |path| {
         var parts = std.mem.tokenizeScalar(u8, path, '/');
         var previous: []const u8 = "";
         while (parts.next()) |part| {
-            if (std.mem.eql(u8, part, ".synth") or (std.mem.eql(u8, previous, ".git") and std.mem.eql(u8, part, "hooks"))) return true;
+            if (sameName(part, ".synth") or (sameName(previous, ".git") and sameName(part, "hooks"))) return true;
             previous = part;
         }
     }
     for (control_files) |file| {
         if (try samePath(arena, io, root, file, lexical, resolved)) return true;
     }
-    inline for (std.meta.fields(@import("../core/hooks.zig").Set)) |field| {
+    inline for (std.meta.fields(Hooks.Set)) |field| {
         for (@field(hooks, field.name)) |hook| {
             if (!hook.enabled or !hook.trusted) continue;
             if (try samePath(arena, io, root, hook.source, lexical, resolved)) return true;
@@ -276,14 +278,20 @@ pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, tar
 
 fn samePath(arena: std.mem.Allocator, io: std.Io, root: []const u8, file: []const u8, lexical: []const u8, resolved: []const u8) !bool {
     if (file.len == 0) return false;
-    const Paths = @import("../core/paths.zig");
     const named = std.fs.path.resolve(arena, &.{ root, file }) catch return false;
-    if (std.mem.eql(u8, named, lexical)) return true;
+    if (sameName(named, lexical)) return true;
     const actual = Paths.resolve(io, arena, root, file) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
     };
-    return std.mem.eql(u8, actual, resolved);
+    return sameName(actual, resolved);
+}
+
+fn sameName(a: []const u8, b: []const u8) bool {
+    return switch (builtin.os.tag) {
+        .macos, .windows => std.ascii.eqlIgnoreCase(a, b),
+        else => std.mem.eql(u8, a, b),
+    };
 }
 
 test "hook script protection accounts for shell operators and quoting" {
@@ -305,5 +313,19 @@ test "hook script protection accounts for shell operators and quoting" {
         var arena: std.heap.ArenaAllocator = .init(a);
         defer arena.deinit();
         try testing.expect(try protectedPath(arena.allocator(), std.testing.io, root, case.path, &.{}, .{ .pre_tool_use = &.{.{ .command = case.command }} }));
+    }
+}
+
+test "missing hook control files cannot bypass protection through case variants" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const trust = try std.fs.path.join(a, &.{ root, "hook-trust.json" });
+    for ([_][]const u8{ ".SYNTH/hooks.json", ".GIT/HOOKS/new", "HOOK-TRUST.json" }) |target| {
+        try testing.expect(try protectedPath(a, testing.io, root, target, &.{trust}, .{}));
     }
 }
