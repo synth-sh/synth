@@ -3,6 +3,9 @@ const std = @import("std");
 pub const max_temperature: f32 = 2;
 pub const max_probability: f32 = 1;
 pub const max_tokens: u32 = 1_048_576;
+pub const max_top_k: u32 = 1_048_576;
+pub const max_context_limit: u32 = 1_048_576;
+const supported_schemes = [_][]const u8{ "http", "https" };
 pub const max_penalty: f32 = 2;
 pub const max_stops = 16;
 pub const max_stop_bytes = 4096;
@@ -31,7 +34,7 @@ pub const Settings = struct {
     pub fn validate(self: Settings) !void {
         if (self.temperature) |v| if (!std.math.isFinite(v) or v < 0 or v > max_temperature) return error.InvalidModelSettings;
         if (self.top_p) |v| if (!std.math.isFinite(v) or v <= 0 or v > max_probability) return error.InvalidModelSettings;
-        if (self.top_k) |v| if (v == 0 or v > max_tokens) return error.InvalidModelSettings;
+        if (self.top_k) |v| if (v == 0 or v > max_top_k) return error.InvalidModelSettings;
         inline for (.{ "frequency_penalty", "presence_penalty" }) |field| if (@field(self, field)) |v| {
             if (!std.math.isFinite(v) or v < -max_penalty or v > max_penalty) return error.InvalidModelSettings;
         };
@@ -97,9 +100,13 @@ pub const Policy = struct {
     pub fn validate(self: Policy) !void {
         if (self.reviewer_timeout_ms == 0 or self.reviewer_timeout_ms > max_review_ms) return error.InvalidReviewerTimeout;
         for (self.routes, 0..) |value, i| {
-            if (value.id.len == 0 or value.model.len == 0 or value.purposes.len == 0 or value.context_limit > max_tokens) return error.InvalidModelRoute;
+            if (value.id.len == 0 or value.model.len == 0 or value.purposes.len == 0 or value.context_limit > max_context_limit) return error.InvalidModelRoute;
             const uri = std.Uri.parse(value.endpoint) catch return error.InvalidModelRoute;
-            if ((!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) or uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidModelRoute;
+            var supported_scheme = false;
+            for (supported_schemes) |scheme| if (std.mem.eql(u8, uri.scheme, scheme)) {
+                supported_scheme = true;
+            };
+            if (!supported_scheme or uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidModelRoute;
             for (self.routes[0..i]) |earlier| if (std.mem.eql(u8, earlier.id, value.id)) return error.DuplicateModelRoute;
             if (value.provider == .ollama and value.protocol != .chat) return error.InvalidModelRoute;
             try value.settings.validate();
@@ -118,6 +125,6 @@ test "routes are purpose restricted and settings are bounded" {
     _ = try policy.route("review", .approval_judge);
     try std.testing.expectError(error.ModelRoutePurposeDenied, policy.route("review", .agent));
     try std.testing.expectError(error.ModelRouteDenied, policy.route("remote", .agent));
-    try std.testing.expectError(error.InvalidModelSettings, (Settings{ .attempts = 5 }).validate());
+    try std.testing.expectError(error.InvalidModelSettings, (Settings{ .attempts = max_attempts + 1 }).validate());
     try std.testing.expectError(error.InvalidModelSettings, (Settings{ .temperature = std.math.nan(f32) }).validate());
 }

@@ -1,6 +1,7 @@
 //! File tools: read, write, edit, list, glob, grep.
 
 const std = @import("std");
+const path_util = @import("../core/paths.zig");
 const testing = std.testing;
 
 const files = @import("../core/files.zig");
@@ -241,7 +242,7 @@ fn candidates(ctx: Context, scope: []const u8) ![]const []const u8 {
     }
 
     for (everything) |path| {
-        if (!@import("../core/paths.zig").inside(scope, path)) continue;
+        if (!path_util.inside(scope, path)) continue;
         try kept.append(ctx.allocator, try ctx.allocator.dupe(u8, path));
     }
     return kept.toOwnedSlice(ctx.allocator);
@@ -262,9 +263,9 @@ fn scopeOf(ctx: Context, path: []const u8) ![]const u8 {
 fn searchBase(ctx: Context, path: []const u8) ![]const u8 {
     const resolved = try resolve(ctx, path);
     defer ctx.allocator.free(resolved);
-    if (@import("../core/paths.zig").inside(ctx.project_root, resolved)) return ctx.allocator.dupe(u8, ctx.project_root);
+    if (path_util.inside(ctx.project_root, resolved)) return ctx.allocator.dupe(u8, ctx.project_root);
     for (ctx.additional_roots) |root| {
-        if (@import("../core/paths.zig").inside(root, resolved)) return ctx.allocator.dupe(u8, root);
+        if (path_util.inside(root, resolved)) return ctx.allocator.dupe(u8, root);
     }
     const stat = try std.Io.Dir.cwd().statFile(ctx.io, resolved, .{});
     return ctx.allocator.dupe(u8, if (stat.kind == .directory) resolved else std.fs.path.dirname(resolved) orelse resolved);
@@ -760,10 +761,10 @@ test "grep finds matches and reports misses" {
 }
 
 test "a scope is compared segment by segment" {
-    try testing.expect(@import("../core/paths.zig").inside("src", "src/main.zig"));
-    try testing.expect(@import("../core/paths.zig").inside("src", "src"));
-    try testing.expect(!@import("../core/paths.zig").inside("src", "srcfoo/main.zig"));
-    try testing.expect(!@import("../core/paths.zig").inside("src", "other/src/main.zig"));
+    try testing.expect(path_util.inside("src", "src/main.zig"));
+    try testing.expect(path_util.inside("src", "src"));
+    try testing.expect(!path_util.inside("src", "srcfoo/main.zig"));
+    try testing.expect(!path_util.inside("src", "other/src/main.zig"));
 }
 
 test "read pages through a file with offset and limit" {

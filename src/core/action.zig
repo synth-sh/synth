@@ -1,11 +1,11 @@
 const std = @import("std");
 
-pub const resolve = @import("paths.zig").resolve;
+const paths = @import("paths.zig");
 
 pub fn verify(io: std.Io, a: std.mem.Allocator, cwd: []const u8, name: []const u8, arguments: []const u8, snapshot: []const u8) !void {
     const Action = struct { tool: []const u8, arguments: std.json.Value, cwd: []const u8, resolved_targets: []const []const u8 };
     const approved = try std.json.parseFromSliceLeaky(Action, a, snapshot, .{ .ignore_unknown_fields = true });
-    if (!std.mem.eql(u8, name, approved.tool) or !std.mem.eql(u8, try resolve(io, a, cwd, "."), approved.cwd)) return error.ApprovedActionChanged;
+    if (!std.mem.eql(u8, name, approved.tool) or !std.mem.eql(u8, try paths.resolve(io, a, cwd, "."), approved.cwd)) return error.ApprovedActionChanged;
     const input = try std.json.parseFromSliceLeaky(std.json.Value, a, arguments, .{});
     if (input != .object) return error.ApprovedActionChanged;
     const effective = try std.json.Stringify.valueAlloc(a, input, .{});
@@ -15,7 +15,7 @@ pub fn verify(io: std.Io, a: std.mem.Allocator, cwd: []const u8, name: []const u
     for ([_][]const u8{ "path", "file" }) |field| {
         if (input.object.get(field)) |value| {
             if (value != .string) continue;
-            const target = try resolve(io, a, cwd, value.string);
+            const target = try paths.resolve(io, a, cwd, value.string);
             if (i >= approved.resolved_targets.len or !std.mem.eql(u8, target, approved.resolved_targets[i])) return error.ApprovedActionChanged;
             i += 1;
         }
@@ -34,7 +34,7 @@ test "worker verification detects retargeted paths after approval" {
     try tmp.dir.createDirPath(io, "one");
     try tmp.dir.createDirPath(io, "two");
     try tmp.dir.symLink(io, "one", "link", .{ .is_directory = true });
-    const snapshot = try std.json.Stringify.valueAlloc(a, .{ .tool = "write", .arguments = .{ .path = "link/file", .content = "value" }, .cwd = root, .resolved_targets = [_][]const u8{try resolve(io, a, root, "link/file")} }, .{});
+    const snapshot = try std.json.Stringify.valueAlloc(a, .{ .tool = "write", .arguments = .{ .path = "link/file", .content = "value" }, .cwd = root, .resolved_targets = [_][]const u8{try paths.resolve(io, a, root, "link/file")} }, .{});
     const arguments = "{\"path\":\"link/file\",\"content\":\"value\"}";
     try verify(io, a, root, "write", arguments, snapshot);
     try tmp.dir.deleteFile(io, "link");
