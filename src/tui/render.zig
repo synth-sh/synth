@@ -2456,5 +2456,6 @@ test "a transcript drag follows the wheel and copies what it scrolled over" {
         .copy_to_clipboard => |text| copied = text,
         else => {},
     };
-    std.debug.print("COPIED<<{s}>>\n", .{copied orelse "(none)"});
+    defer if (copied) |text| testing.allocator.free(text);
+    try testing.expectEqualStrings("message 25\n\nmessage 26\n\nmessage 27", copied.?);
 }
