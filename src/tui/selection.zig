@@ -45,6 +45,36 @@ pub const Point = struct {
     }
 };
 
+/// A part of the screen drawn as its own document: the transcript, the sidebar,
+/// the composer, a dialog. Edges are inclusive.
+pub const Rect = struct {
+    top: u16,
+    left: u16,
+    bottom: u16,
+    right: u16,
+
+    pub const everything: Rect = .{ .top = 0, .left = 0, .bottom = std.math.maxInt(u16), .right = std.math.maxInt(u16) };
+
+    /// The rect covering `height` rows and `width` columns from (`row`, `col`),
+    /// or null when that is no area at all.
+    pub fn sized(row: u16, col: u16, height: u16, width: u16) ?Rect {
+        if (height == 0 or width == 0) return null;
+        return .{ .top = row, .left = col, .bottom = row + height - 1, .right = col + width - 1 };
+    }
+
+    fn holds(self: Rect, point: Point) bool {
+        return point.row >= self.top and point.row <= self.bottom and
+            point.col >= self.left and point.col <= self.right;
+    }
+
+    fn clamp(self: Rect, point: Point) Point {
+        return .{
+            .row = std.math.clamp(point.row, self.top, self.bottom),
+            .col = std.math.clamp(point.col, self.left, self.right),
+        };
+    }
+};
+
 allocator: std.mem.Allocator,
 /// Row-major snapshot of the last frame, rebuilt on every draw.
 cells: []GridCell = &.{},
@@ -60,12 +90,13 @@ height: u16 = 0,
 anchor: ?Point = null,
 head: ?Point = null,
 dragging: bool = false,
-/// Columns the selection is confined to: the pane the drag started in. Without
-/// this a linear selection spanning two rows swallows the sidebar, which is
-/// never what was meant - the panes are separate documents that happen to share
-/// a screen.
-left: u16 = 0,
-right: u16 = std.math.maxInt(u16),
+/// The region the drag started in, which it never leaves: a selection spanning
+/// the transcript and the sidebar is never what was meant, since they are
+/// separate documents that happen to share a screen.
+area: Rect = .everything,
+/// The regions last frame drew, bottom first, so the last that holds a point
+/// is the one on top.
+regions: std.ArrayList(Rect) = .empty,
 
 pub fn init(allocator: std.mem.Allocator) Selection {
     return .{ .allocator = allocator };
@@ -74,6 +105,7 @@ pub fn init(allocator: std.mem.Allocator) Selection {
 pub fn deinit(self: *Selection) void {
     self.allocator.free(self.cells);
     self.uris.deinit(self.allocator);
+    self.regions.deinit(self.allocator);
 }
 
 pub fn isActive(self: *const Selection) bool {
@@ -84,25 +116,39 @@ pub fn clear(self: *Selection) void {
     self.anchor = null;
     self.head = null;
     self.dragging = false;
-    self.left = 0;
-    self.right = std.math.maxInt(u16);
+    self.area = .everything;
 }
 
-/// Confine the selection to `[left, right]`, the pane it started in.
-pub fn confine(self: *Selection, left: u16, right: u16) void {
-    self.left = left;
-    self.right = right;
+/// Forget last frame's regions, before drawing the next.
+pub fn resetRegions(self: *Selection) void {
+    self.regions.clearRetainingCapacity();
 }
 
-pub fn begin(self: *Selection, point: Point) void {
+/// Record a region drawn above every one recorded before it this frame.
+pub fn addRegion(self: *Selection, region: ?Rect) !void {
+    try self.regions.append(self.allocator, region orelse return);
+}
+
+/// Start a selection at `point`, confined to the topmost region under it.
+/// Returns false, selecting nothing, where no region was drawn.
+pub fn begin(self: *Selection, point: Point) bool {
+    var i = self.regions.items.len;
+    const area = while (i > 0) {
+        i -= 1;
+        if (self.regions.items[i].holds(point)) break self.regions.items[i];
+    } else return false;
+    self.area = area;
     self.anchor = point;
     self.head = point;
     self.dragging = true;
+    return true;
 }
 
+/// Move the selection's free end to `point`, held inside the region it started
+/// in however far the pointer strays.
 pub fn extend(self: *Selection, point: Point) void {
     if (self.anchor == null) return;
-    self.head = point;
+    self.head = self.area.clamp(point);
 }
 
 pub fn end(self: *Selection) void {
@@ -130,7 +176,7 @@ pub fn range(self: *const Selection) ?Bounds {
 /// editor, not rectangular: full rows between the endpoints are included.
 pub fn contains(self: *const Selection, row: u16, col: u16) bool {
     const bounds = self.range() orelse return false;
-    if (col < self.left or col > self.right) return false;
+    if (col < self.area.left or col > self.area.right) return false;
     if (row < bounds.start.row or row > bounds.end.row) return false;
     if (row == bounds.start.row and col < bounds.start.col) return false;
     if (row == bounds.end.row and col > bounds.end.col) return false;
@@ -147,7 +193,7 @@ pub fn rowSpan(self: *const Selection, row: u16) ?struct { from: u16, to: u16 } 
 
     const limit = self.rowLimit(bounds, row);
     var from: u16 = if (row == bounds.start.row)
-        @max(self.left, bounds.start.col)
+        @max(self.area.left, bounds.start.col)
     else
         self.bodyLeft(bounds);
     if (from <= limit and self.gridCell(row, from).decoration) {
@@ -167,7 +213,7 @@ pub fn rowSpan(self: *const Selection, row: u16) ?struct { from: u16, to: u16 } 
 /// The last column of `row` the selection could reach.
 fn rowLimit(self: *const Selection, bounds: Bounds, row: u16) u16 {
     return @min(
-        self.right,
+        self.area.right,
         if (row == bounds.end.row) @min(bounds.end.col, self.width -| 1) else self.width -| 1,
     );
 }
@@ -180,7 +226,7 @@ fn bodyLeft(self: *const Selection, bounds: Bounds) u16 {
     var row = bounds.start.row +| 1;
     while (row <= bounds.end.row and row < self.height) : (row += 1) {
         const limit = self.rowLimit(bounds, row);
-        var col = self.left;
+        var col = self.area.left;
         while (col <= limit and col < self.width) : (col += 1) {
             if (self.gridCell(row, col).isChrome()) continue;
             shared = @min(shared orelse col, col);
@@ -188,13 +234,13 @@ fn bodyLeft(self: *const Selection, bounds: Bounds) u16 {
         }
     }
 
-    return shared orelse self.left;
+    return shared orelse self.area.left;
 }
 
 /// Whether the selected part of `row` is drawn decoration and nothing else, like
 /// the line under a table's header: it copies as no line at all.
 fn isRuleRow(self: *const Selection, bounds: Bounds, row: u16) bool {
-    var col = if (row == bounds.start.row) @max(self.left, bounds.start.col) else self.bodyLeft(bounds);
+    var col = if (row == bounds.start.row) @max(self.area.left, bounds.start.col) else self.bodyLeft(bounds);
     const limit = self.rowLimit(bounds, row);
     while (col <= limit) : (col += 1) {
         if (self.gridCell(row, col).decoration) return true;
@@ -334,7 +380,8 @@ test "linear selection spans whole rows between endpoints" {
     selection.width = 4;
     selection.height = 3;
 
-    selection.begin(.{ .row = 0, .col = 2 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 0, .col = 2 }));
     selection.extend(.{ .row = 2, .col = 1 });
 
     try std.testing.expect(!selection.contains(0, 1));
@@ -349,7 +396,8 @@ test "dragging backwards selects the same range" {
     var selection: Selection = .init(std.testing.allocator);
     defer selection.deinit();
 
-    selection.begin(.{ .row = 2, .col = 1 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 2, .col = 1 }));
     selection.extend(.{ .row = 0, .col = 2 });
 
     const bounds = selection.range().?;
@@ -369,7 +417,8 @@ test "text trims the padding panels draw" {
     for ("hi  ", 0..) |c, i| selection.put(0, @intCast(i), &.{c}, "");
     for ("yo  ", 0..) |c, i| selection.put(1, @intCast(i), &.{c}, "");
 
-    selection.begin(.{ .row = 0, .col = 0 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 0, .col = 0 }));
     selection.extend(.{ .row = 1, .col = 3 });
 
     const copied = (try selection.text(std.testing.allocator)).?;
@@ -381,7 +430,8 @@ test "a click without movement selects nothing" {
     var selection: Selection = .init(std.testing.allocator);
     defer selection.deinit();
 
-    selection.begin(.{ .row = 1, .col = 1 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 1, .col = 1 }));
     selection.end();
     try std.testing.expect(!selection.isActive());
 }
@@ -399,9 +449,10 @@ test "a selection stays inside the pane it started in" {
     for ("SIDE", 0..) |c, i| selection.put(0, @intCast(6 + i), &.{c}, "");
     for ("efgh", 0..) |c, i| selection.put(1, @intCast(i), &.{c}, "");
 
-    selection.begin(.{ .row = 0, .col = 0 });
-    selection.confine(0, 4);
-    selection.extend(.{ .row = 1, .col = 3 });
+    try selection.addRegion(.{ .top = 0, .left = 0, .bottom = 1, .right = 4 });
+    try selection.addRegion(.{ .top = 0, .left = 5, .bottom = 1, .right = 9 });
+    try std.testing.expect(selection.begin(.{ .row = 0, .col = 0 }));
+    selection.extend(.{ .row = 1, .col = 7 });
 
     try std.testing.expect(selection.contains(0, 3));
     try std.testing.expect(!selection.contains(0, 7));
@@ -424,7 +475,8 @@ test "copied rows lose the chrome they share, not their own indentation" {
     for ("    pub fn main() {", 0..) |c, i| selection.put(1, @intCast(i), &.{c}, "");
     for ("        print();", 0..) |c, i| selection.put(2, @intCast(i), &.{c}, "");
 
-    selection.begin(.{ .row = 0, .col = 4 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 0, .col = 4 }));
     selection.extend(.{ .row = 2, .col = 19 });
 
     const copied = (try selection.text(std.testing.allocator)).?;
@@ -445,7 +497,8 @@ test "rows after the first hug the text, not the pane" {
     for ("        print();", 0..) |c, i| selection.put(1, @intCast(i), &.{c}, "");
     for ("    }", 0..) |c, i| selection.put(2, @intCast(i), &.{c}, "");
 
-    selection.begin(.{ .row = 0, .col = 4 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 0, .col = 4 }));
     selection.extend(.{ .row = 2, .col = 19 });
 
     try std.testing.expectEqual(@as(u16, 4), selection.rowSpan(0).?.from);
@@ -472,7 +525,8 @@ test "a card's bar is chrome, not the start of the text" {
     selection.put(1, 0, w.block_rule, "");
     for ("  second line", 0..) |c, i| selection.put(1, @intCast(2 + i), &.{c}, "");
 
-    selection.begin(.{ .row = 0, .col = 4 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 0, .col = 4 }));
     selection.extend(.{ .row = 1, .col = 19 });
 
     const copied = (try selection.text(std.testing.allocator)).?;
@@ -549,7 +603,8 @@ test "decoration between and around text is neither highlighted nor copied" {
     selection.put(2, 2, message[0..3], "");
     for (" quoted", 0..) |c, i| selection.put(2, @intCast(3 + i), &.{c}, "");
 
-    selection.begin(.{ .row = 0, .col = 0 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 0, .col = 0 }));
     selection.extend(.{ .row = 2, .col = 19 });
 
     try std.testing.expectEqual(@as(u16, 2), selection.rowSpan(0).?.from);
@@ -573,10 +628,31 @@ test "a blank line inside a barred block still copies as a blank line" {
     for ("one", 0..) |c, i| selection.put(0, @intCast(2 + i), &.{c}, "");
     for ("two", 0..) |c, i| selection.put(2, @intCast(2 + i), &.{c}, "");
 
-    selection.begin(.{ .row = 0, .col = 0 });
+    try selection.addRegion(.everything);
+    try std.testing.expect(selection.begin(.{ .row = 0, .col = 0 }));
     selection.extend(.{ .row = 2, .col = 9 });
 
     const copied = (try selection.text(std.testing.allocator)).?;
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualStrings("one\n\ntwo", copied);
+}
+
+test "a drag starts only where a region was drawn, and never leaves it" {
+    var selection: Selection = .init(std.testing.allocator);
+    defer selection.deinit();
+
+    try selection.addRegion(Rect.sized(2, 2, 5, 10));
+    try selection.addRegion(Rect.sized(4, 4, 2, 3));
+
+    try std.testing.expect(!selection.begin(.{ .row = 0, .col = 0 }));
+    try std.testing.expect(!selection.isActive());
+
+    try std.testing.expect(selection.begin(.{ .row = 4, .col = 5 }));
+    selection.extend(.{ .row = 20, .col = 0 });
+    try std.testing.expectEqual(Point{ .row = 5, .col = 4 }, selection.head.?);
+
+    selection.clear();
+    try std.testing.expect(selection.begin(.{ .row = 2, .col = 3 }));
+    selection.extend(.{ .row = 0, .col = 30 });
+    try std.testing.expectEqual(Point{ .row = 2, .col = 11 }, selection.head.?);
 }

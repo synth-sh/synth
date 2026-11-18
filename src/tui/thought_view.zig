@@ -62,7 +62,7 @@ pub const View = struct {
                     .left => {},
                     else => return ctx.consumeEvent(),
                 }
-                if (mouse.type == .press and mouse.row == 0) {
+                if (mouse.type == .release and mouse.row == 0) {
                     self.expanded = !self.expanded;
                     return ctx.consumeAndRedraw();
                 }

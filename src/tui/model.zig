@@ -317,7 +317,7 @@ pub const PasteToggle = struct {
                     .left => {},
                     else => return ctx.consumeEvent(),
                 }
-                if (mouse.type == .press) {
+                if (mouse.type == .release) {
                     self.expanded = !self.expanded;
                     return ctx.consumeAndRedraw();
                 }
@@ -598,17 +598,6 @@ pub fn acceptCommand(self: *Model) !void {
     self.input.clear();
     try self.input.insertText(completion);
     self.slash.close();
-}
-
-/// Keep a selection inside the pane it started in. The transcript and the
-/// sidebar are separate documents that happen to share a screen, and a linear
-/// selection spanning two rows would otherwise swallow both.
-pub fn confineToPane(self: *Model, start: Selection.Point) void {
-    if (start.col >= self.sidebar_col) {
-        self.selection.confine(self.sidebar_col, std.math.maxInt(u16));
-    } else {
-        self.selection.confine(0, self.sidebar_col -| 1);
-    }
 }
 
 /// Ask for one spinner tick, unless one is already on its way.

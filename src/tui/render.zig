@@ -42,6 +42,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     // Rows past the root's clamped height are not addressable by vaxis.
     const max = root.size;
     w.fill(root, theme.base.cell);
+    self.selection.resetRegions();
     if (max.width == 0 or max.height == 0) return root;
 
     // The title row and the rule under it, which the frame starts below.
@@ -65,6 +66,10 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
 
     const body_h = max.height -| (title_h + bottom.size.height);
 
+    try self.selection.addRegion(Selection.Rect.sized(0, 0, title_h, max.width));
+    try self.selection.addRegion(Selection.Rect.sized(title_h + body_h, 0, max.height -| (title_h + body_h), max.width));
+    try self.selection.addRegion(Selection.Rect.sized(title_h, Model.gutter, body_h -| Model.block_gap, column_w));
+
     var children: std.ArrayList(vxfw.SubSurface) = .empty;
 
     try children.append(ctx.arena, .{
@@ -83,20 +88,24 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     if (column_w > 0 and body_h > 0) {
         if (self.slash.isOpen()) {
             const popup = try self.slash.draw(ctx, self.plainWidget(), column_w);
+            const row = title_h + (body_h -| popup.size.height);
             try children.append(ctx.arena, .{
-                .origin = .{ .row = @intCast(title_h + (body_h -| popup.size.height)), .col = Model.gutter },
+                .origin = .{ .row = @intCast(row), .col = Model.gutter },
                 .surface = popup,
                 .z_index = 1,
             });
+            try self.selection.addRegion(Selection.Rect.sized(row, Model.gutter, popup.size.height, popup.size.width));
         }
 
         if (self.mentions.isOpen()) {
             const popup = try self.mentions.draw(ctx, self.plainWidget(), column_w);
+            const row = title_h + (body_h -| popup.size.height);
             try children.append(ctx.arena, .{
-                .origin = .{ .row = @intCast(title_h + (body_h -| popup.size.height)), .col = Model.gutter },
+                .origin = .{ .row = @intCast(row), .col = Model.gutter },
                 .surface = popup,
                 .z_index = 1,
             });
+            try self.selection.addRegion(Selection.Rect.sized(row, Model.gutter, popup.size.height, popup.size.width));
         }
 
         if (try drawTranscript(self, ctx, column_w, body_h -| Model.block_gap)) |transcript| {
@@ -118,6 +127,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .origin = .{ .row = title_h, .col = @intCast(main_w) },
             .surface = sidebar,
         });
+        try self.selection.addRegion(Selection.Rect.sized(title_h, main_w, sidebar.size.height, sidebar.size.width));
     } else {
         // Nothing drew the plan, so last frame's rows would catch a stray click.
         self.plan_top = 0;
@@ -133,6 +143,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
         root.cursor = null;
     }
 
@@ -143,6 +154,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
         root.cursor = dialog.cursor;
     }
 
@@ -153,6 +165,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
     }
 
     if (try self.permission_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
@@ -162,6 +175,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
         root.cursor = dialog.cursor;
     }
 
@@ -172,6 +186,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
         root.cursor = dialog.cursor;
     }
 
@@ -182,6 +197,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
     }
 
     if (try self.theme_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
@@ -191,6 +207,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
         root.cursor = dialog.cursor;
     }
 
@@ -201,6 +218,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
         root.cursor = dialog.cursor;
     }
 
@@ -211,17 +229,20 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
             .surface = dialog.surface,
             .z_index = 3,
         });
+        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
         root.cursor = dialog.cursor;
     }
 
     if (column_w > 0 and body_h > 0) {
         const area: vxfw.Size = .{ .width = column_w, .height = body_h };
         for (try self.notification.draw(ctx, area)) |toast| {
-            try children.append(ctx.arena, .{
+            const origin: vxfw.SubSurface = .{
                 .origin = .{ .row = title_h + toast.origin.row, .col = Model.gutter + toast.origin.col },
                 .surface = toast.surface,
                 .z_index = 4,
-            });
+            };
+            try children.append(ctx.arena, origin);
+            try self.selection.addRegion(regionOf(origin));
         }
     }
 
@@ -252,6 +273,12 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     }
 
     return root;
+}
+
+/// The screen a child placed on the root covers, as a selection region.
+fn regionOf(child: vxfw.SubSurface) ?Selection.Rect {
+    if (child.origin.row < 0 or child.origin.col < 0) return null;
+    return Selection.Rect.sized(@intCast(child.origin.row), @intCast(child.origin.col), child.surface.size.height, child.surface.size.width);
 }
 
 /// Redraw the selected cells in reverse video, on top of everything else. The
@@ -2209,7 +2236,8 @@ test "copying a reply with a table leaves out its rule and the table's lines" {
     var selection: Selection = .init(testing.allocator);
     defer selection.deinit();
     try selection.capture(surface);
-    selection.begin(.{ .row = 0, .col = 0 });
+    try selection.addRegion(.everything);
+    try testing.expect(selection.begin(.{ .row = 0, .col = 0 }));
     selection.extend(.{ .row = surface.size.height - 1, .col = width - 1 });
 
     const copied = (try selection.text(testing.allocator)).?;

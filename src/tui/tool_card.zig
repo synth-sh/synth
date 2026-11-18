@@ -91,7 +91,7 @@ fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.
                 .left => {},
                 else => return ctx.consumeEvent(),
             }
-            if (mouse.type != .press) return;
+            if (mouse.type != .release) return;
             if (self.open) |open| {
                 open.call(open.userdata, open.key, open.seq, open.index, self.name);
                 return ctx.consumeAndRedraw();
@@ -781,4 +781,19 @@ test "a finished call reports how long it took, in place of what it was doing" {
     card.status = .rejected;
     const refused = try rowText(arena, try card.draw(drawContext(arena, width)), 0);
     try testing.expect(std.mem.endsWith(u8, refused, "read"));
+}
+
+test "a card toggles when the click lets go, so a drag that starts on it changes nothing" {
+    var card: ToolCard = .{ .name = "list", .result = "a\nb\nc" };
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = std.testing.allocator, .cmds = .empty };
+    defer ctx.cmds.deinit(std.testing.allocator);
+
+    const at: vaxis.Mouse = .{ .col = 0, .row = 0, .button = .left, .mods = .{}, .type = .press };
+    try typeErasedEventHandler(&card, &ctx, .{ .mouse = at });
+    try std.testing.expect(!card.expanded);
+
+    var released = at;
+    released.type = .release;
+    try typeErasedEventHandler(&card, &ctx, .{ .mouse = released });
+    try std.testing.expect(card.expanded);
 }

@@ -115,8 +115,7 @@ pub fn trackSelection(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse)
         },
         .drag => {
             const start = self.press_point orelse point;
-            if (!self.selection.dragging) self.selection.begin(start);
-            self.confineToPane(start);
+            if (!self.selection.dragging and !self.selection.begin(start)) return;
             self.selection.extend(point);
             return ctx.consumeAndRedraw();
         },

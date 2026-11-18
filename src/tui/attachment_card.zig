@@ -42,7 +42,7 @@ fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.
                 .left => {},
                 else => return ctx.consumeEvent(),
             }
-            if (mouse.type == .press) {
+            if (mouse.type == .release) {
                 self.expanded = !self.expanded;
                 return ctx.consumeAndRedraw();
             }
