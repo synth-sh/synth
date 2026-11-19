@@ -157,8 +157,6 @@ pub const Action = enum { list, review, trust, revoke, enable, disable };
 pub fn change(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: ?[]const u8, action: Action, id: []const u8) !void {
     if (action == .list or action == .review) return;
     const filename = path orelse return error.HookTrustStoreUnavailable;
-    var store = try Store.init(arena, io, filename);
-    defer store.deinit();
     const minimum_id: usize = if (action == .trust or action == .enable) 32 else 8;
     if (id.len < minimum_id) return error.HookIdTooShort;
     var selected: ?[]const u8 = null;
@@ -170,28 +168,32 @@ pub fn change(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: ?[]co
         }
     }
     const full_id = selected orelse return error.HookNotFound;
-    var found = false;
+    try Config.ensureDir(io, filename);
+    const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{filename});
+    defer arena.free(lock_path);
+    const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive, .permissions = .fromMode(0o600) });
+    defer lock.close(io);
+    var store = try Store.init(arena, io, filename);
+    defer store.deinit();
+    var state = store.get(full_id);
+    switch (action) {
+        .trust => state.trusted = true,
+        .revoke => state.trusted = false,
+        .enable => state.disabled = false,
+        .disable => state.disabled = true,
+        else => unreachable,
+    }
+    try store.put(full_id, state);
     var updated = set.*;
     inline for (std.meta.fields(Hooks.Set)) |field| {
         const definitions = try arena.dupe(Hooks.Hook, @field(set, field.name));
         for (definitions) |*hook| {
-            if (!std.mem.eql(u8, hook.id, full_id)) continue;
-            found = true;
-            var state = store.get(hook.id);
-            switch (action) {
-                .trust => state.trusted = true,
-                .revoke => state.trusted = false,
-                .enable => state.disabled = false,
-                .disable => state.disabled = true,
-                else => unreachable,
-            }
-            try store.put(hook.id, state);
-            hook.trusted = state.trusted;
-            hook.enabled = !state.disabled;
+            const saved = store.get(hook.id);
+            hook.trusted = saved.trusted;
+            hook.enabled = !saved.disabled;
         }
         @field(updated, field.name) = definitions;
     }
-    if (!found) return error.HookNotFound;
     try store.save(io, filename);
     set.* = updated;
 }
