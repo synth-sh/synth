@@ -29,7 +29,7 @@ pub const nest: u16 = 2;
 const decoration_store = ("\u{256d}\u{2500}\u{2510}\u{250c}\u{2500}\u{2514}\u{2500}\u{2518}\u{2502}\u{258c}\u{2506}\u{203a}\u{25cf}" ++
     " \u{25be} \u{25b8} " ++
     "\u{280b}\u{2819}\u{2839}\u{2838}\u{283c}\u{2834}\u{2826}\u{2827}\u{2807}\u{280f}" ++
-    "click to expand|click to collapse|click to open transcript|esc to cancel|running...").*;
+    "click to expand|click to collapse|click to open transcript|esc to cancel|running...|waiting...").*;
 
 /// `text`, drawn as decoration. A compile error when it is not in the store.
 pub fn decoration(comptime text: []const u8) []const u8 {

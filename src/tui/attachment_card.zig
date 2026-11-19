@@ -97,8 +97,8 @@ pub fn draw(self: *AttachmentCard, ctx: vxfw.DrawContext) std.mem.Allocator.Erro
         .{std.mem.count(u8, std.mem.trimEnd(u8, self.body, "\n"), "\n") + 1},
     ), theme.on_card(theme.fg_dim).cell);
     if (self.has_mouse) {
-        const hint = if (self.expanded) "  click to collapse" else "  click to expand";
-        _ = w.writeText(surface, col, 0, hint, theme.on_card(theme.fg_dim).cell);
+        const hint = if (self.expanded) w.decoration("click to collapse") else w.decoration("click to expand");
+        _ = w.writeText(surface, col + 2, 0, hint, theme.on_card(theme.fg_dim).cell);
     }
 
     for (body, 0..) |line, i| {

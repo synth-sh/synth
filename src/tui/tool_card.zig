@@ -213,7 +213,7 @@ fn trailingText(self: *const ToolCard, arena: std.mem.Allocator) []const u8 {
     }
     switch (self.status) {
         .running => return w.decoration("running..."),
-        .pending => return "waiting...",
+        .pending => return w.decoration("waiting..."),
         else => {},
     }
     const ms = self.elapsed_ms orelse return "";
