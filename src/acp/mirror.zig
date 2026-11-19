@@ -128,6 +128,14 @@ const Awaited = union(enum) {
     /// The call whose subagent, by the TUI's own numbering.
     subagent: struct { seq: u64, call: u32 },
     detach,
+
+    fn deinit(self: Awaited, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .search => |text| allocator.free(text),
+            .typed_model, .prompt => |text| allocator.free(text),
+            else => {},
+        }
+    }
 };
 
 /// What a request the TUI made came back with, for it to show.
@@ -394,11 +402,7 @@ fn forgetConnection(self: *Mirror) void {
         if (inbound != self.lost) inbound.destroy();
     }
     var waited = self.waiting.valueIterator();
-    while (waited.next()) |awaited| switch (awaited.*) {
-        .search => |query| self.allocator.free(query),
-        .typed_model, .prompt => |draft| self.allocator.free(draft),
-        else => {},
-    };
+    while (waited.next()) |awaited| awaited.deinit(self.allocator);
     self.waiting.clearRetainingCapacity();
     self.forgetAsked();
     self.forgetEarly();
@@ -481,11 +485,7 @@ fn destroy(self: *Mirror) void {
     for (self.answers.items) |unshown| unshown.deinit(self.allocator);
     self.answers.deinit(self.allocator);
     var awaited = self.waiting.valueIterator();
-    while (awaited.next()) |entry| switch (entry.*) {
-        .search => |query| self.allocator.free(query),
-        .typed_model, .prompt => |draft| self.allocator.free(draft),
-        else => {},
-    };
+    while (awaited.next()) |entry| entry.deinit(self.allocator);
     self.waiting.deinit(self.allocator);
     if (self.failed_draft) |draft| self.allocator.free(draft);
     self.thinking.deinit();
@@ -843,11 +843,7 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
         .string => return,
     };
     const awaited = (self.waiting.fetchRemove(number) orelse return).value;
-    defer switch (awaited) {
-        .search => |query| self.allocator.free(query),
-        .typed_model, .prompt => |draft| self.allocator.free(draft),
-        else => {},
-    };
+    defer awaited.deinit(self.allocator);
     if (message.err) |err| {
         if (awaited == .models) self.models_failed = true;
         if (awaited == .prompt and std.mem.eql(u8, err.message, Hooks.review_notice)) {
