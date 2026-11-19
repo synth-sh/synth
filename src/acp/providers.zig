@@ -108,9 +108,15 @@ pub fn endpoint(self: *const Providers, arena: std.mem.Allocator, db: *Database,
     return hostOf(arena, db, entry);
 }
 
+pub const ModelSelection = union(enum) {
+    automatic,
+    select: []const u8,
+    keep: []const u8,
+};
+
 /// Store `key` when one is given and point the session at the provider.
 /// Returns what the session now answers as.
-pub fn connect(self: *Providers, entry: catalog.Entry, host: []const u8, key: ?[]const u8, model: ?[]const u8) !Provider {
+pub fn connect(self: *Providers, entry: catalog.Entry, host: []const u8, key: ?[]const u8, model: ModelSelection) !Provider {
     const same_endpoint = std.mem.eql(u8, entry.id, self.active_id) and std.mem.eql(u8, host, self.backend.currentHost());
     const credential: ?[]const u8 = key orelse self.auth.key(entry.id) orelse if (same_endpoint) self.backend.currentKey() else null;
     if (entry.key == .required and (credential == null or credential.?.len == 0)) return error.ProviderKeyRequired;
@@ -125,10 +131,24 @@ pub fn connect(self: *Providers, entry: catalog.Entry, host: []const u8, key: ?[
     options.api_key = null;
     replacement.* = .init(entry.kind, options);
     errdefer replacement.deinit();
-    const provider = try replacement.connect(entry, host, credential);
-    if (model) |name| {
-        const set = provider.set_model orelse return error.ModelFixed;
-        _ = try set(provider.userdata, name);
+    if (model == .keep and same_endpoint and entry.kind == .openai) {
+        const openai = &replacement.client.openai;
+        const previous_limit = self.backend.current().context_limit;
+        // An existing model may still answer even when the new key's /models view omits it.
+        try openai.setModel(model.keep);
+        try openai.reconnect(.{ .host = host, .label = entry.label, .api_key = credential });
+        if (previous_limit > 0 and (openai.model_listing == null or openai.is_model_unlisted)) {
+            openai.context_limit = previous_limit;
+        }
+    } else {
+        const provider = try replacement.connect(entry, host, credential);
+        switch (model) {
+            .automatic => {},
+            .select, .keep => |name| {
+                const set = provider.set_model orelse return error.ModelFixed;
+                _ = try set(provider.userdata, name);
+            },
+        }
     }
     if (key != null) try self.saveCredential(entry, key);
     self.deinit();

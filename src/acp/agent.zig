@@ -1814,7 +1814,7 @@ const Session = struct {
         const switching = if (chosen.provider) |wanted| !std.mem.eql(u8, wanted, provider_id) else false;
         if (switching) {
             const entry = catalog.find(chosen.provider.?) orelse return error.UnknownProvider;
-            try self.useProvider(entry, null, null, chosen.model);
+            try self.useProvider(entry, null, null, .{ .select = chosen.model });
         } else {
             try loop.switchModel(chosen.model);
         }
@@ -2241,10 +2241,17 @@ const Session = struct {
         }
         const model = self.stack.loop.provider.model;
         const keep_model = active and !request.activate and model.len != 0;
-        try self.configureProvider(entry, request.host, request.key, activate, if (keep_model) model else null);
+        try self.configureProvider(entry, request.host, request.key, activate, if (keep_model) .{ .keep = model } else .automatic);
     }
 
-    fn configureProvider(self: *Session, entry: catalog.Entry, host: ?[]const u8, key: ?[]const u8, activate: bool, model: ?[]const u8) !void {
+    fn configureProvider(
+        self: *Session,
+        entry: catalog.Entry,
+        host: ?[]const u8,
+        key: ?[]const u8,
+        activate: bool,
+        model: Providers.ModelSelection,
+    ) !void {
         if (activate) {
             try self.useProvider(entry, host, key, model);
             self.announceProvider();
@@ -2258,7 +2265,13 @@ const Session = struct {
 
     /// Point the session at a provider, at `host` or the one it was last
     /// reached at, and remember it as the choice for sessions to come.
-    fn useProvider(self: *Session, entry: catalog.Entry, at: ?[]const u8, key: ?[]const u8, model: ?[]const u8) !void {
+    fn useProvider(
+        self: *Session,
+        entry: catalog.Entry,
+        at: ?[]const u8,
+        key: ?[]const u8,
+        model: Providers.ModelSelection,
+    ) !void {
         const providers = try self.providerSource();
         const db = self.agent.options.db;
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -2299,7 +2312,7 @@ const Session = struct {
         const entry = catalog.find(task.id).?;
         const token = task.finish(self.allocator) catch |err| return self.notice(.warning, "{s}", .{SignInTask.explain(err)});
         defer if (token) |value| self.allocator.free(value);
-        self.configureProvider(entry, null, token, self.activate_after_sign_in, null) catch |err| {
+        self.configureProvider(entry, null, token, self.activate_after_sign_in, .automatic) catch |err| {
             return self.notice(.warning, "Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
         };
         if (std.mem.eql(u8, entry.id, catalog.chatgpt_id)) self.welcomeToPlanUsage();
@@ -2426,13 +2439,9 @@ const Session = struct {
     fn startListings(self: *Session, arena: std.mem.Allocator) !void {
         const providers = self.agent.options.source.providers;
         for (catalog.all, 0..) |entry, i| {
-            const reach = try self.modelListingReach(arena, providers, entry);
-            if (self.model_jobs[i]) |job| {
-                if (reach) |current| if (job.reach.matches(current)) continue;
-                self.model_jobs[i] = null;
-                job.abandon();
-            }
-            if (reach) |current| self.model_jobs[i] = try ModelListing.start(self.allocator, self.agent.io, entry, current);
+            if (self.model_jobs[i] != null) continue;
+            const reach = (try self.modelListingReach(arena, providers, entry)) orelse continue;
+            self.model_jobs[i] = try ModelListing.start(self.allocator, self.agent.io, entry, reach);
         }
     }
 
@@ -2487,22 +2496,36 @@ const Session = struct {
 
     fn finishListings(self: *Session) void {
         if (self.agent.options.source != .providers) return;
+        const providers = self.agent.options.source.providers;
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         var changed = false;
         for (&self.model_jobs, 0..) |*slot, i| {
             const job = slot.* orelse continue;
             if (!job.isFinished()) continue;
             job.join();
             slot.* = null;
-            if (job.models) |_| {
-                if (self.model_cached[i]) |old| old.destroy();
-                self.model_cached[i] = job;
-            } else job.destroy();
             changed = true;
+            self.finishListing(arena, providers, i, job) catch |err| {
+                self.notice(.warning, "Could not refresh the model list: {s}", .{@errorName(err)});
+            };
         }
-        if (!changed) return;
-        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
-        defer arena_state.deinit();
-        self.publishModels(arena_state.allocator());
+        if (changed) self.publishModels(arena);
+    }
+
+    fn finishListing(self: *Session, arena: std.mem.Allocator, providers: *Providers, index: usize, job: *ModelListing) !void {
+        errdefer job.destroy();
+        if (try self.modelListingReach(arena, providers, job.entry)) |reach| {
+            if (!job.reach.matches(reach)) {
+                self.model_jobs[index] = try ModelListing.start(self.allocator, self.agent.io, job.entry, reach);
+            } else if (job.models != null) {
+                if (self.model_cached[index]) |old| old.destroy();
+                self.model_cached[index] = job;
+                return;
+            }
+        }
+        job.destroy();
     }
 
     /// Every connected provider's models, each provider asked in turn.
