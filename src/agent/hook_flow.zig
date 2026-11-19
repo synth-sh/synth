@@ -29,11 +29,8 @@ instruction_generation: u64 = 0,
 watch: HookWatch = .{},
 idle_since: ?i64 = null,
 idle_notified: bool = false,
-pre_seq: ?u64 = null,
-pre_index: usize = 0,
+policy: struct { pre_tool_use: usize = 0, permission_evaluate: usize = 0, permission_request: usize = 0 } = .{},
 asks: std.ArrayList([]const u8) = .empty,
-permission_index: usize = 0,
-evaluate_index: usize = 0,
 context: ?[]u8 = null,
 session_started: bool = false,
 session_source: enum { startup, clear, @"resume", compact } = .startup,
@@ -46,7 +43,7 @@ failure: ?[]u8 = null,
 export_path: ?[]u8 = null,
 session_handle: ?[]const u8 = null,
 
-pub fn setNotice(self: *Flow, allocator: std.mem.Allocator, notice: []u8) void {
+pub fn setNotice(self: *Flow, allocator: std.mem.Allocator, notice: ?[]u8) void {
     if (self.notice) |old| allocator.free(old);
     self.notice = notice;
 }
@@ -54,10 +51,7 @@ pub fn setNotice(self: *Flow, allocator: std.mem.Allocator, notice: []u8) void {
 pub fn reset(self: *Flow) void {
     self.compaction = .manual;
     self.compaction_veto_seq = null;
-    self.pre_seq = null;
-    self.pre_index = 0;
-    self.permission_index = 0;
-    self.evaluate_index = 0;
+    self.policy = .{};
     self.task_seq = null;
     self.task_cursor = 0;
     self.permission_notice = null;
@@ -153,8 +147,17 @@ pub fn exportHookInput(self: *Loop, invocation: Hooks.Invocation) !Hooks.Invocat
     return input;
 }
 
-pub fn dispatchHook(self: *Loop, invocation: Hooks.Invocation) !*Hooks.Dispatch {
-    return Hooks.Dispatch.start(self.allocator, self.hooks.?.*, try exportHookInput(self, invocation));
+pub fn begin(self: *Loop, runner: Hooks.Runner, input: Hooks.Invocation, pending: Pending) !void {
+    self.hook_flow.dispatch = try Hooks.Dispatch.start(self.allocator, runner, input);
+    self.hook_flow.pending = pending;
+    self.state = .running_hooks;
+}
+
+pub fn start(self: *Loop, invocation: Hooks.Invocation, pending: Pending) !bool {
+    const runner = self.hooks orelse return false;
+    if (runner.set.forEvent(invocation.event).len == 0) return false;
+    try begin(self, runner.*, try exportHookInput(self, invocation), pending);
+    return true;
 }
 
 pub fn observeHook(self: *Loop, invocation: Hooks.Invocation) void {
@@ -209,14 +212,9 @@ pub fn trackModel(self: *Loop, source: []const u8) !void {
 }
 
 pub fn lifecycle(self: *Loop, event: Hooks.Event, next: Resume) !bool {
-    const runner = self.hooks orelse return false;
-    if (runner.set.forEvent(event).len == 0) return false;
-    self.hook_flow.dispatch = try dispatchHook(self, .{
+    return start(self, .{
         .event = event,
         .source = @tagName(self.hook_flow.session_source),
         .trigger = if (self.hook_flow.compaction != .manual) "auto" else "manual",
-    });
-    self.hook_flow.pending = .{ .lifecycle = next };
-    self.state = .running_hooks;
-    return true;
+    }, .{ .lifecycle = next });
 }

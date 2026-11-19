@@ -42,26 +42,28 @@ pub const Store = struct {
 };
 
 pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, root: []const u8, home: ?[]const u8, store: Store) !Hooks.Set {
-    var set: Hooks.Set = .{};
-    try set.append(arena, inline_set);
+    var set = inline_set;
     const user_source = if (home) |dir| try std.fs.path.join(arena, &.{ dir, ".synth", "hooks.json" }) else null;
     if (user_source) |path| try loadFile(arena, io, &set, path);
     try loadFile(arena, io, &set, try std.fs.path.join(arena, &.{ root, ".synth", "hooks.json" }));
+    var source_counts: std.StringHashMapUnmanaged(usize) = .empty;
+    defer source_counts.deinit(arena);
     inline for (std.meta.fields(Hooks.Set)) |field| {
+        source_counts.clearRetainingCapacity();
         const definitions = try arena.dupe(Hooks.Hook, @field(set, field.name));
-        for (definitions, 0..) |*hook, index| {
+        for (definitions) |*hook| {
             const event = @field(Hooks.Event, field.name);
-            var source_index: usize = 0;
-            for (definitions[0..index]) |earlier| {
-                if (std.mem.eql(u8, earlier.source, hook.source)) source_index += 1;
-            }
+            const count = try source_counts.getOrPut(arena, hook.source);
+            if (!count.found_existing) count.value_ptr.* = 0;
             const source_path = try std.fs.path.resolve(arena, &.{ root, hook.source });
             const source_is_user = (if (user_source) |path| std.mem.eql(u8, path, hook.source) else false) or !@import("paths.zig").inside(root, source_path);
             const user_hook = source_is_user and independentCommand(hook.command);
-            const encoded = try std.json.Stringify.valueAlloc(arena, .{ if (user_hook) "" else root, event.name(), source_index, hook.* }, .{});
-            var hash: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
-            hook.id = try arena.dupe(u8, &std.fmt.bytesToHex(hash, .lower));
+            var buffer: [512]u8 = undefined;
+            var hash = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&buffer);
+            try std.json.Stringify.value(.{ if (user_hook) "" else root, event.name(), count.value_ptr.*, hook.* }, .{}, &hash.writer);
+            try hash.writer.flush();
+            hook.id = try arena.dupe(u8, &std.fmt.bytesToHex(hash.hasher.finalResult(), .lower));
+            count.value_ptr.* += 1;
             const state = store.get(hook.id);
             hook.trusted = state.trusted;
             hook.enabled = !state.disabled;
@@ -91,8 +93,7 @@ fn loadFile(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: []const
         else => return err,
     };
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, source, .{});
-    const hooks = if (parsed == .object) parsed.object.get("hooks") orelse parsed else parsed;
-    try set.append(arena, try Hooks.parse(arena, hooks, path));
+    try set.append(arena, try Hooks.parse(arena, parsed, path));
 }
 
 test "trust is invalidated by definition changes and project identity" {
@@ -188,7 +189,7 @@ pub fn report(allocator: std.mem.Allocator, set: Hooks.Set, timeout_ms: u64, rev
             count += 1;
             const event = @field(Hooks.Event, field.name);
             try writer.writer.print("{s}\n  {s}  {s}  {s}  {s}  {s} timeout={d}ms\n  source: {s}\n  matcher: {s}\n", .{
-                hook.id, event.name(), if (hook.legacy) "legacy serial" else if (hook.async) "background" else "grouped sync", if (hook.trusted) "trusted" else "NEEDS REVIEW", if (hook.enabled) "enabled" else "disabled", @tagName(hook.type), Hooks.effectiveTimeout(event, timeout_ms, hook), hook.source, hook.matcher,
+                hook.id, event.name(), if (hook.async) "background" else "synchronous", if (hook.trusted) "trusted" else "NEEDS REVIEW", if (hook.enabled) "enabled" else "disabled", @tagName(hook.type), Hooks.effectiveTimeout(event, timeout_ms, hook), hook.source, hook.matcher,
             });
             if (hook.when) |filter| {
                 try writer.writer.writeAll("  when: ");
@@ -231,8 +232,8 @@ test "discovery is additive and unrelated sources keep stable ids" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "home/.synth");
     try tmp.dir.createDirPath(std.testing.io, "project/.synth");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"user\"}]}" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/.synth/hooks.json", .data = "{\"hooks\":{\"PreToolUse\":[{\"command\":\"project\"},{\"command\":\"project\"}]}}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.synth/hooks.json", .data = "{\"PreToolUse\":[{\"hooks\":[{\"command\":\"user\"}]}]}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/.synth/hooks.json", .data = "{\"PreToolUse\":[{\"hooks\":[{\"command\":\"project\"},{\"command\":\"project\"}]}]}" });
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, "project", a);
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", a);
     var store = try Store.init(std.testing.allocator, std.testing.io, null);
@@ -277,7 +278,7 @@ test "user hook trust survives project changes and accepts unique id prefixes" {
     var home = std.testing.tmpDir(.{});
     defer home.cleanup();
     try home.dir.createDirPath(io, ".synth");
-    try home.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"/bin/true\"}]}" });
+    try home.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"hooks\":[{\"command\":\"/bin/true\"}]}]}" });
     const path = try home.dir.realPathFileAlloc(io, ".", scratch);
     var store = try Store.init(a, io, null);
     defer store.deinit();
@@ -300,7 +301,7 @@ test "relative user commands cannot reuse another checkout's trust" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".synth");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"bash ./guard.sh\"}]}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"hooks\":[{\"command\":\"bash ./guard.sh\"}]}]}" });
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     var store = try Store.init(std.testing.allocator, std.testing.io, null);
     defer store.deinit();

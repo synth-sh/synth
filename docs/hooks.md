@@ -26,8 +26,8 @@ Hooks run commands or MCP tools when Synth events occur.
 ## Configuration and trust
 
 Synth combines `config.json`'s `hooks`, `~/.synth/hooks.json`, and the
-original project's `.synth/hooks.json` in that order. Standalone files
-accept an event map or a `{"hooks": {...}}` wrapper.
+original project's `.synth/hooks.json` in that order. Use an event map at
+the top level of each standalone file.
 
 Commands run as you from `$SYNTH_PROJECT_DIR`, without Bash profiles.
 Use the payload's `cwd` for relative tool paths. Trust covers the
@@ -43,8 +43,10 @@ file arguments can share trust across checkouts.
 
 ## Handlers and matching
 
-Grouped `matcher` values are regexes. Use tool names or aliases such as
-`Bash` and `Edit`. For `FileChanged`, use project-root filenames separated
+Each event takes an array of groups. Put the handlers in each group's
+`hooks` array, with optional `matcher` and `when` fields alongside it.
+Matchers use regular expressions and recognize tool names and aliases such
+as `Bash` and `Edit`. For `FileChanged`, use project-root filenames separated
 by `|`. An omitted matcher runs for every occurrence of the event.
 
 Use `timeout_ms` (milliseconds) or `timeout` (seconds) to override
@@ -92,7 +94,7 @@ Tool events include `tool_name`, `tool_input`, and `tool_call_id`. Decode
 JSON strings such as `action` and `http` before reading their fields.
 
 Exit 2 blocks supported operations with a reason from stderr. With exit 0,
-grouped handlers can write structured output, for example:
+handlers can write structured JSON to stdout:
 
 ```json
 {
@@ -143,12 +145,5 @@ Set a header to `null` to remove it. Set `stream: true` on each
 - **Hook fails or times out.** Use `/hooks list` to inspect recent runs.
   Check `PATH`, script paths, and timeouts. Missing commands and malformed
   synchronous policy output can block the operation.
-- **JSON has no effect.** Use a grouped handler, exit 0, and emit only JSON
-  on stdout. Check that the effect is supported by the event.
-
-## Upgrade existing hooks
-
-Review and trust or disable existing hooks before submitting prompts.
-Legacy `[{"matcher":"write","command":"..."}]` lists still match exact tool
-names and ignore stdout. Switch to grouped handlers for structured output.
-See [HTTP adapters](#http-adapters) for streamed records.
+- **JSON has no effect.** Exit 0 and emit only JSON on stdout. Check that
+  the effect is supported by the event.

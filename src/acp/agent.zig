@@ -416,19 +416,10 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         for (files) |*file| file.path = projectRelative(session.stack.loop.project_root, file.path);
         if (asked.apply and files.len > 0) self.noticeFmt(.info, "Put back {d} file{s} as before that prompt", .{ files.len, if (files.len == 1) "" else "s" });
         return connection.reply(id, files);
-    } else if (eql(u8, method, m.change_directory)) {
+    } else if (eql(u8, method, m.change_directory) or eql(u8, method, m.add_directory)) {
         const asked = try rpc.parse(synth.Directory, arena, params);
-        session.stack.loop.changeDirectory(asked.path) catch |err| {
-            self.noticeFmt(.warning, "Cannot change directory to {s}: {s}", .{ asked.path, paths.directoryError(err) });
-            return err;
-        };
-        try session.publish(arena, true);
-    } else if (eql(u8, method, m.add_directory)) {
-        const asked = try rpc.parse(synth.Directory, arena, params);
-        session.stack.loop.addDirectory(asked.path, @tagName(asked.source)) catch |err| {
-            self.noticeFmt(.warning, "Cannot add directory {s}: {s}", .{ asked.path, paths.directoryError(err) });
-            return err;
-        };
+        const action: Session.DirectoryAction = if (eql(u8, method, m.change_directory)) .change else .add;
+        try session.applyDirectory(action, asked.path, asked.source, false);
         try session.publish(arena, true);
     } else if (eql(u8, method, m.hooks)) {
         const asked = try rpc.parse(synth.Hooks, arena, params);
@@ -1698,7 +1689,7 @@ const Session = struct {
         if (loop.takeSteering()) |taken| {
             var next = taken;
             defer next.deinit(loop.allocator);
-            loop.submit(next.prompt, next.asExtras()) catch |err| self.notice(.warning, "Could not start the next turn: {s}", .{@errorName(err)});
+            loop.submit(next.prompt, next.extras) catch |err| self.notice(.warning, "Could not start the next turn: {s}", .{@errorName(err)});
         }
     }
 
@@ -1725,6 +1716,24 @@ const Session = struct {
         if (!try loop.steer(text.items, extras)) try loop.submit(text.items, extras);
     }
 
+    const DirectoryAction = enum { change, add };
+
+    fn applyDirectory(self: *Session, action: DirectoryAction, path: []const u8, source: synth.Directory.Source, from_slash: bool) !void {
+        const loop = &self.stack.loop;
+        const applied = switch (action) {
+            .change => loop.changeDirectory(path),
+            .add => loop.addDirectory(path, @tagName(source)),
+        };
+        applied catch |err| {
+            const verb = if (action == .change) "change directory to" else "add directory";
+            const text = std.fmt.allocPrint(self.allocator, "Cannot {s} {s}: {s}", .{ verb, path, paths.directoryError(err) }) catch return err;
+            defer self.allocator.free(text);
+            self.agent.notice(.warning, text);
+            if (from_slash) loop.notifyHook("notice", text);
+            return err;
+        };
+    }
+
     fn slashCommand(self: *Session, arena: std.mem.Allocator, line: []const u8, attachments: *std.ArrayList(mention.Attachment), images: []const []const u8) !bool {
         const split = std.mem.indexOfAny(u8, line, " \t\r\n") orelse line.len;
         const name = line[0..split];
@@ -1735,16 +1744,10 @@ const Session = struct {
                 self.notice(.info, "{s}", .{loop.workingDirectory()});
                 return true;
             }
-            loop.changeDirectory(arguments) catch |err| {
-                self.notice(.warning, "Cannot change directory to {s}: {s}", .{ arguments, paths.directoryError(err) });
-                return true;
-            };
+            self.applyDirectory(.change, arguments, .slash_command, true) catch return true;
             self.notice(.info, "Working directory: {s}", .{loop.workingDirectory()});
         } else if (std.mem.eql(u8, name, "/add-dir")) {
-            loop.addDirectory(arguments, "slash_command") catch |err| {
-                self.notice(.warning, "Cannot add directory {s}: {s}", .{ arguments, paths.directoryError(err) });
-                return true;
-            };
+            self.applyDirectory(.add, arguments, .slash_command, true) catch return true;
             self.notice(.info, "Directory added to this session", .{});
         } else if (skill.findIn(self.stack.skills.skills, skill.idOf(name))) |found| {
             if (loop.isBusy()) return error.Busy;
@@ -1754,7 +1757,7 @@ const Session = struct {
         } else if (std.mem.eql(u8, name, "/hooks")) {
             const command = try HookStore.parseCommand(line);
             const report = try self.stack.manageHooks(arena, command.action, command.id);
-            self.agent.noticeFmt(.info, "{s}", .{report});
+            self.agent.notice(.info, report);
         } else if (std.mem.eql(u8, name, "/compact") and arguments.len == 0) {
             if (loop.isBusy()) return error.Busy;
             try loop.compact();

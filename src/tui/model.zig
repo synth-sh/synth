@@ -1493,7 +1493,7 @@ test "hook review rejection restores the submitted text to the composer" {
     defer served.destroy();
     const model = served.model;
     try served.fixture.tmp.dir.createDirPath(testing.io, "project/.synth");
-    try served.fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "project/.synth/hooks.json", .data = "{\"PreToolUse\":[{\"command\":\"true\"}]}" });
+    try served.fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "project/.synth/hooks.json", .data = "{\"PreToolUse\":[{\"hooks\":[{\"command\":\"true\"}]}]}" });
     try model.mirror.hooks(.list, "");
     try served.pollUntil(struct {
         fn ready(m: *Model) bool {

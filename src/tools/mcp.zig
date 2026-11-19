@@ -1442,7 +1442,7 @@ test "hook MCP execution reuses a connected server without recursive scheduling"
     var executor: Executor = .{ .host = &host, .reads = &reads };
     var runtime: Hooks.Runtime = .{ .allocator = a, .io = testing.io };
     defer runtime.deinit();
-    const hook: Hooks.Hook = .{ .legacy = false, .type = .mcp_tool, .arguments = .{ .object = .empty }, .server = "policy", .tool = "guard", .source = "test server", .timeout_ms = 50 };
+    const hook: Hooks.Hook = .{ .type = .mcp_tool, .arguments = .{ .object = .empty }, .server = "policy", .tool = "guard", .source = "test server", .timeout_ms = 50 };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = ".", .runtime = &runtime, .mcp_executor = .{ .userdata = &executor, .call = Executor.execute }, .set = .{ .pre_tool_use = &.{hook} } };
     var result = try runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash" });
     defer result.deinit(a);

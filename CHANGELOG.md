@@ -8,6 +8,3 @@
   for agent turns, approval review, and compaction.
 - Use [`/cd` and `/add-dir`](docs/usage.md#hooks-and-workspace) to change the
   session's working directory and add permitted file roots independently.
-- Review and trust or disable existing hooks before submitting a prompt. See
-  [Upgrade existing hooks](docs/hooks.md#upgrade-existing-hooks) for legacy
-  commands and streamed response adapters.

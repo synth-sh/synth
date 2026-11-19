@@ -6,6 +6,7 @@ const HookSchema = @import("../core/hook_schema.zig");
 const HookToolInput = @import("../core/hook_tool_input.zig");
 const HumanIntent = @import("../core/human_intent.zig");
 const paths = @import("../core/paths.zig");
+const action_paths = @import("../core/action.zig");
 const testing = std.testing;
 
 const Config = @import("../core/config.zig");
@@ -146,7 +147,6 @@ control_files: []const []const u8 = &.{},
 stream_display: bool = true,
 interrupted: bool = false,
 stop_hook_active: bool = false,
-approved_ask_index: ?usize = null,
 hook_submission: ?Submission = null,
 /// Root every tool resolves against. Borrowed.
 project_root: []const u8,
@@ -473,7 +473,6 @@ pub fn resetForNewSession(self: *Loop) bool {
     self.hook_flow.session_started = false;
     self.hook_flow.session_source = .clear;
     self.stop_hook_active = false;
-    self.hook_flow.pre_seq = null;
     if (self.hook_flow.context) |context| self.allocator.free(context);
     self.hook_flow.context = null;
     self.session_id = null;
@@ -596,9 +595,9 @@ pub fn addDirectory(self: *Loop, path: []const u8, source: []const u8) !void {
     errdefer self.allocator.free(reference);
     var arena: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena.deinit();
-    const primary = self.followLinks(arena.allocator(), self.project_root) orelse self.project_root;
-    const covered = pathInside(primary, reference) or for (self.additional_roots.items) |root| {
-        if (pathInside(root, reference)) break true;
+    const primary = self.resolveAgainstProject(arena.allocator(), self.project_root) orelse self.project_root;
+    const covered = paths.inside(primary, reference) or for (self.additional_roots.items) |root| {
+        if (paths.inside(root, reference)) break true;
     } else false;
     if (covered) {
         self.allocator.free(reference);
@@ -875,65 +874,34 @@ pub const Extras = struct {
 
 /// A prompt and what came with it, owned.
 pub const Submission = struct {
-    command_name: []const u8 = "",
-    command_args: []const u8 = "",
-    expanded_prompt: []const u8 = "",
-    prompt: []u8,
-    attachments: []mention.Attachment,
-    images: [][]u8,
+    arena: std.heap.ArenaAllocator.State,
+    prompt: []const u8,
+    extras: Extras,
 
     fn init(allocator: std.mem.Allocator, prompt: []const u8, extras: Extras) !Submission {
-        const owned_prompt = try allocator.dupe(u8, prompt);
-        errdefer allocator.free(owned_prompt);
-
-        const attachments = try allocator.alloc(mention.Attachment, extras.attachments.len);
-        var attachments_built: usize = 0;
-        errdefer {
-            for (attachments[0..attachments_built]) |*attachment| attachment.deinit(allocator);
-            allocator.free(attachments);
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const attachments = try a.dupe(mention.Attachment, extras.attachments);
+        for (attachments) |*attachment| {
+            attachment.path = try a.dupe(u8, attachment.path);
+            attachment.content = try a.dupe(u8, attachment.content);
         }
-        for (extras.attachments, attachments) |source, *dest| {
-            const path = try allocator.dupe(u8, source.path);
-            errdefer allocator.free(path);
-            dest.* = .{
-                .path = path,
-                .content = try allocator.dupe(u8, source.content),
-                .content_bytes = source.content_bytes,
-            };
-            attachments_built += 1;
-        }
-
-        const images = try allocator.alloc([]u8, extras.images.len);
-        var images_built: usize = 0;
-        errdefer {
-            for (images[0..images_built]) |image| allocator.free(image);
-            allocator.free(images);
-        }
-        for (extras.images, images) |source, *dest| {
-            dest.* = try allocator.dupe(u8, source);
-            images_built += 1;
-        }
-
-        const command_name = try allocator.dupe(u8, extras.command_name);
-        errdefer allocator.free(command_name);
-        const command_args = try allocator.dupe(u8, extras.command_args);
-        errdefer allocator.free(command_args);
-        return .{ .prompt = owned_prompt, .attachments = attachments, .images = images, .command_name = command_name, .command_args = command_args, .expanded_prompt = try allocator.dupe(u8, extras.expanded_prompt) };
-    }
-
-    pub fn asExtras(self: *const Submission) Extras {
-        return .{ .attachments = self.attachments, .images = self.images, .command_name = self.command_name, .command_args = self.command_args, .expanded_prompt = self.expanded_prompt };
+        const images = try a.dupe([]const u8, extras.images);
+        for (images) |*image| image.* = try a.dupe(u8, image.*);
+        const owned_prompt = try a.dupe(u8, prompt);
+        const owned: Extras = .{
+            .attachments = attachments,
+            .images = images,
+            .command_name = try a.dupe(u8, extras.command_name),
+            .command_args = try a.dupe(u8, extras.command_args),
+            .expanded_prompt = try a.dupe(u8, extras.expanded_prompt),
+        };
+        return .{ .arena = arena.state, .prompt = owned_prompt, .extras = owned };
     }
 
     pub fn deinit(self: *Submission, allocator: std.mem.Allocator) void {
-        allocator.free(self.command_name);
-        allocator.free(self.command_args);
-        allocator.free(self.expanded_prompt);
-        allocator.free(self.prompt);
-        for (self.attachments) |*attachment| attachment.deinit(allocator);
-        allocator.free(self.attachments);
-        for (self.images) |image| allocator.free(image);
-        allocator.free(self.images);
+        self.arena.promote(allocator).deinit();
     }
 };
 
@@ -1055,10 +1023,12 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.checkHookTrust();
     if (!self.hook_flow.session_started) {
         self.hook_flow.session_started = true;
-        if (try self.lifecycle(if (self.parent == null) .session_start else .subagent_start, .begin_prompt)) {
-            self.hook_submission = try Submission.init(self.allocator, prompt, extras);
-            return;
-        }
+        errdefer self.hook_flow.session_started = false;
+        if (try self.gatePrompt(.{
+            .event = if (self.parent == null) .session_start else .subagent_start,
+            .source = @tagName(self.hook_flow.session_source),
+            .trigger = if (self.hook_flow.compaction == .manual) "manual" else "auto",
+        }, .{ .lifecycle = .begin_prompt }, prompt, extras)) return;
     }
     try self.submitPrompt(prompt, extras);
 }
@@ -1068,21 +1038,18 @@ fn checkHookTrust(self: *const Loop) !void {
 }
 
 fn submitPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
-    if (self.hooks) |runner| {
-        if (runner.set.forEvent(.user_prompt_submit).len == 0) return self.expandPrompt(prompt, extras);
-
-        self.hook_submission = try Submission.init(self.allocator, prompt, extras);
-        errdefer self.discardHookSubmission();
-        self.hook_flow.dispatch = try self.dispatchHook(.{
-            .event = .user_prompt_submit,
-            .prompt = self.hook_submission.?.prompt,
-        });
-        self.hook_flow.pending = .prompt;
-        self.state = .running_hooks;
-        return;
-    }
-
+    if (try self.gatePrompt(.{ .event = .user_prompt_submit, .prompt = prompt }, .prompt, prompt, extras)) return;
     try self.expandPrompt(prompt, extras);
+}
+
+fn gatePrompt(self: *Loop, input: Hooks.Invocation, pending: HookFlow.Pending, prompt: []const u8, extras: Extras) !bool {
+    const runner = self.hooks orelse return false;
+    if (runner.set.forEvent(input.event).len == 0) return false;
+    var submission = try Submission.init(self.allocator, prompt, extras);
+    errdefer submission.deinit(self.allocator);
+    try HookFlow.begin(self, runner.*, try self.exportHookInput(input), pending);
+    self.hook_submission = submission;
+    return true;
 }
 
 fn discardHookSubmission(self: *Loop) void {
@@ -1091,18 +1058,13 @@ fn discardHookSubmission(self: *Loop) void {
 }
 
 fn expandPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
-    if (extras.command_name.len > 0) {
-        if (self.hooks) |runner| {
-            if (runner.set.user_prompt_expansion.len > 0) {
-                self.hook_submission = try Submission.init(self.allocator, prompt, extras);
-                errdefer self.discardHookSubmission();
-                self.hook_flow.dispatch = try self.dispatchHook(.{ .event = .user_prompt_expansion, .prompt = prompt, .command_name = extras.command_name, .command_args = extras.command_args, .expanded_prompt = extras.expanded_prompt });
-                self.hook_flow.pending = .expansion;
-                self.state = .running_hooks;
-                return;
-            }
-        }
-    }
+    if (extras.command_name.len > 0 and try self.gatePrompt(.{
+        .event = .user_prompt_expansion,
+        .prompt = prompt,
+        .command_name = extras.command_name,
+        .command_args = extras.command_args,
+        .expanded_prompt = extras.expanded_prompt,
+    }, .expansion, prompt, extras)) return;
     try self.finishSubmit(prompt, extras);
 }
 
@@ -1137,16 +1099,10 @@ fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
         mention.resolve(self.allocator, self.io, self.workingDirectory(), prompt) catch .{};
     defer mentioned.deinit(self.allocator);
 
-    const files = mentioned.attachments;
-    const attachments = try self.allocator.alloc(mention.Attachment, files.len + extras.attachments.len);
+    const attachments = try std.mem.concat(self.allocator, mention.Attachment, &.{ mentioned.attachments, extras.attachments });
     defer self.allocator.free(attachments);
-    @memcpy(attachments[0..files.len], files);
-    @memcpy(attachments[files.len..], extras.attachments);
-
-    const images = try self.allocator.alloc([]const u8, mentioned.images.len + extras.images.len);
+    const images = try std.mem.concat(self.allocator, []const u8, &.{ mentioned.images, extras.images });
     defer self.allocator.free(images);
-    @memcpy(images[0..mentioned.images.len], mentioned.images);
-    @memcpy(images[mentioned.images.len..], extras.images);
 
     const submitted = try self.conversation.addUser(prompt, attachments, images);
     if (self.parent != null) submitted.origin = .agent else try self.recordHuman(prompt, false);
@@ -1159,10 +1115,7 @@ fn startConfigChange(self: *Loop, continuation: HookFlow.Resume) !bool {
     const runner = self.hooks orelse return false;
     if (runner.set.config_change.len == 0) return false;
     const change = self.hook_flow.watch.take(.config_change) orelse return false;
-    self.hook_flow.dispatch = try self.dispatchHook(.{ .event = .config_change, .source = change.source, .file_path = change.path });
-    self.hook_flow.pending = .{ .lifecycle = continuation };
-    self.state = .running_hooks;
-    return true;
+    return self.startHook(.{ .event = .config_change, .source = change.source, .file_path = change.path }, .{ .lifecycle = continuation });
 }
 
 const observeHook = HookFlow.observeHook;
@@ -1197,7 +1150,7 @@ const prepareHookIdentity = HookFlow.prepareHookIdentity;
 
 pub const exportHookInput = HookFlow.exportHookInput;
 
-const dispatchHook = HookFlow.dispatchHook;
+const startHook = HookFlow.start;
 
 const lifecycle = HookFlow.lifecycle;
 
@@ -1219,7 +1172,7 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch, next: HookFlow.Resume) 
             self.finish(.failed);
             return true;
         }
-        if (dispatch.takeBlocked()) |reason| {
+        if (dispatch.result.takeBlocked()) |reason| {
             defer self.allocator.free(reason);
             if (!dispatch.result.stop) {
                 self.stop_hook_active = true;
@@ -1234,12 +1187,11 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch, next: HookFlow.Resume) 
         self.finish(.done);
         return true;
     }
-    if (dispatch.invocation.event != .subagent_start and (dispatch.failed != null or dispatch.blocked != null or dispatch.result.stop)) {
-        if (self.hook_flow.notice) |old| self.allocator.free(old);
-        self.hook_flow.notice = if (dispatch.failed) |err|
+    if (dispatch.invocation.event != .subagent_start and (dispatch.failed != null or dispatch.result.blocked != null or dispatch.result.stop)) {
+        self.hook_flow.setNotice(self.allocator, if (dispatch.failed) |err|
             try std.fmt.allocPrint(self.allocator, "Lifecycle hook failed: {s}", .{@errorName(err)})
         else
-            dispatch.takeBlocked();
+            dispatch.result.takeBlocked());
         self.discardHookSubmission();
         if (dispatch.invocation.event == .session_start) self.hook_flow.session_started = false;
         self.state = .idle;
@@ -1254,7 +1206,7 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch, next: HookFlow.Resume) 
             var pending = self.hook_submission orelse return false;
             self.hook_submission = null;
             defer pending.deinit(self.allocator);
-            try self.submitPrompt(pending.prompt, pending.asExtras());
+            try self.submitPrompt(pending.prompt, pending.extras);
         },
         .ask_model => try self.ask(),
         .config_idle => {},
@@ -1289,15 +1241,15 @@ fn pollHooks(self: *Loop) !bool {
                 self.say("{s} hook failed: {s}", .{ dispatch.invocation.event.name(), @errorName(err) });
                 return true;
             }
-            if (dispatch.takeBlocked()) |reason| {
+            if (dispatch.result.takeBlocked()) |reason| {
                 self.hook_flow.setNotice(self.allocator, reason);
                 return true;
             }
             try self.acceptHookResult(&dispatch.result);
             if (self.hook_flow.pending == .prompt)
-                try self.expandPrompt(pending.prompt, pending.asExtras())
+                try self.expandPrompt(pending.prompt, pending.extras)
             else
-                try self.finishSubmit(pending.prompt, pending.asExtras());
+                try self.finishSubmit(pending.prompt, pending.extras);
         },
         .auto_denied => |index| {
             try self.acceptHookResult(&dispatch.result);
@@ -1315,9 +1267,9 @@ fn pollHooks(self: *Loop) !bool {
         .task_policy => |index| {
             const message_index = self.pendingIndex() orelse return false;
             const call = &self.conversation.messages.items[message_index].tool_calls[index];
-            if (dispatch.failed != null or dispatch.blocked != null) {
+            if (dispatch.failed != null or dispatch.result.blocked != null) {
                 call.status = .rejected;
-                call.result = dispatch.takeBlocked() orelse try std.fmt.allocPrint(self.allocator, "Task hook failed: {s}", .{@errorName(dispatch.failed.?)});
+                call.result = dispatch.result.takeBlocked() orelse try std.fmt.allocPrint(self.allocator, "Task hook failed: {s}", .{@errorName(dispatch.failed.?)});
                 call.result_bytes = call.result.?.len;
                 try self.persistToolCall(message_index, index);
             } else try self.acceptHookResult(&dispatch.result);
@@ -1329,11 +1281,11 @@ fn pollHooks(self: *Loop) !bool {
             defer pending.deinit(self.allocator);
             if (dispatch.failed) |err| {
                 self.say("UserPromptSubmit hook failed: {s}", .{@errorName(err)});
-            } else if (dispatch.takeBlocked()) |reason| {
+            } else if (dispatch.result.takeBlocked()) |reason| {
                 self.hook_flow.setNotice(self.allocator, reason);
             } else {
                 try self.acceptHookResult(&dispatch.result);
-                try self.recordUserPrompt(pending.prompt, pending.asExtras());
+                try self.recordUserPrompt(pending.prompt, pending.extras);
             }
             try self.ask();
         },
@@ -1348,14 +1300,16 @@ fn finishPolicyHook(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool 
     const reason = if (dispatch.failed) |err|
         try std.fmt.allocPrint(self.allocator, "hook failed: {s}", .{@errorName(err)})
     else
-        dispatch.takeBlocked();
+        dispatch.result.takeBlocked();
     if (reason) |blocked| {
-        const copy = try self.allocator.dupe(u8, blocked);
-        if (self.hook_flow.failure) |old| self.allocator.free(old);
-        self.hook_flow.failure = copy;
         call.status = .rejected;
         call.result = blocked;
         call.result_bytes = blocked.len;
+        if (self.parent != null) {
+            const copy = try self.allocator.dupe(u8, blocked);
+            if (self.hook_flow.failure) |old| self.allocator.free(old);
+            self.hook_flow.failure = copy;
+        }
     } else {
         const rewritten = if (dispatch.result.replacement) |replacement|
             self.replaceHookInput(call, replacement, dispatch.runner.rewrite_author == null) catch |err| {
@@ -1381,7 +1335,7 @@ fn finishPolicyHook(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool 
         }
         if (dispatch.invocation.event == .permission_evaluate and dispatch.result.permission == .ask) {
             try self.hook_flow.asks.append(self.allocator, call.id);
-            self.hook_flow.permission_index = @max(self.hook_flow.permission_index, index + 1);
+            self.hook_flow.policy.permission_request = @max(self.hook_flow.policy.permission_request, index + 1);
         }
     }
     try self.persistToolCall(message_index, index);
@@ -1418,44 +1372,32 @@ fn startPolicyHook(self: *Loop, event: Hooks.Event, index: usize, rewrite_author
     const call = self.conversation.messages.items[message_index].tool_calls[index];
     var runner = self.hooks.?.*;
     runner.rewrite_author = rewrite_author;
-    self.hook_flow.dispatch = try Hooks.Dispatch.start(self.allocator, runner, try self.exportHookInput(.{
+    try HookFlow.begin(self, runner, try self.exportHookInput(.{
         .event = event,
         .permission_effect = if (self.needsNoDecision(&call)) "allow" else "ask",
         .action = call.prepared_action orelse "",
         .tool_name = call.name,
         .tool_input = call.arguments,
         .tool_call_id = call.id,
-        .model = self.provider.model,
-        .permission_mode = @tagName(self.approvals),
-    }));
-    self.hook_flow.pending = .{ .policy = index };
-    self.state = .running_hooks;
+    }), .{ .policy = index });
 }
 
 const acceptHookResult = HookFlow.acceptHookResult;
 
-fn startOwnerPost(self: *Loop, index: usize, response: []const u8) !void {
-    const message_index = self.pendingIndex() orelse return;
-    const call = self.conversation.messages.items[message_index].tool_calls[index];
-    self.hook_flow.dispatch = try self.dispatchHook(.{
-        .event = if (call.status == .failed) .post_tool_use_failure else .post_tool_use,
-        .error_message = if (call.status == .failed) response else "",
+fn startOwnerPost(self: *Loop, index: usize, call: Conversation.ToolCall) !bool {
+    return self.startHook(.{
+        .event = .post_tool_use,
         .tool_name = call.name,
         .tool_call_id = call.id,
         .tool_input = call.arguments,
-        .tool_response = response,
-    });
-    self.hook_flow.pending = .{ .owner_post = index };
-    self.state = .running_hooks;
+        .tool_response = call.result.?,
+    }, .{ .owner_post = index });
 }
 
 fn pollOwnerHooks(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool {
     const message_index = self.pendingIndex() orelse return false;
     try self.acceptHookResult(&dispatch.result);
-    if (dispatch.takeBlocked()) |feedback| {
-        defer self.allocator.free(feedback);
-        try self.applyPostFeedback(message_index, index, feedback);
-    } else if (dispatch.result.feedback) |feedback| {
+    if (dispatch.result.blocked orelse dispatch.result.feedback) |feedback| {
         try self.applyPostFeedback(message_index, index, feedback);
     }
     if (dispatch.failed) |err| self.say("PostToolUse hook failed: {s}", .{@errorName(err)});
@@ -1553,19 +1495,7 @@ pub fn loadToolResult(self: *Loop, msg: *Conversation.Message, call_index: usize
 fn ask(self: *Loop) !void {
     try self.pollHookFiles(true);
     if (try self.startConfigChange(.ask_model)) return;
-    if (self.steering.items.len > 0) {
-        if (self.hooks) |runner| {
-            if (runner.set.forEvent(.user_prompt_submit).len > 0) {
-                self.hook_flow.dispatch = try self.dispatchHook(.{
-                    .event = .user_prompt_submit,
-                    .prompt = self.steering.items[0].prompt,
-                });
-                self.hook_flow.pending = .steering;
-                self.state = .running_hooks;
-                return;
-            }
-        }
-    }
+    if (self.steering.items.len > 0 and try self.startHook(.{ .event = .user_prompt_submit, .prompt = self.steering.items[0].prompt }, .steering)) return;
     try self.applySteering();
     if (self.hooks) |runner| {
         if (runner.runtime) |runtime| {
@@ -1616,7 +1546,7 @@ fn applySteering(self: *Loop) !void {
     while (self.steering.items.len > 0) {
         var pending = self.steering.orderedRemove(0);
         defer pending.deinit(self.allocator);
-        try self.recordUserPrompt(pending.prompt, pending.asExtras());
+        try self.recordUserPrompt(pending.prompt, pending.extras);
     }
 }
 
@@ -1819,7 +1749,7 @@ fn abandonPending(self: *Loop, reason: []const u8) !void {
         }
         try self.persistToolCall(index, i);
     }
-    try self.appendToolResults();
+    try self.appendToolResults(null);
 }
 
 /// Advance the loop. Called from the UI's tick; returns true if anything
@@ -1911,9 +1841,7 @@ fn pollRequest(self: *Loop) !bool {
                 input.model = failed.model;
                 input.provider = failed.provider;
                 input.attempt = request.attempt_number.load(.acquire);
-                self.hook_flow.dispatch = try Hooks.Dispatch.start(self.allocator, runner.*, input);
-                self.hook_flow.pending = .{ .lifecycle = .failed_turn };
-                self.state = .running_hooks;
+                try HookFlow.begin(self, runner.*, input, .{ .lifecycle = .failed_turn });
                 return true;
             }
         }
@@ -1967,6 +1895,8 @@ fn pollRequest(self: *Loop) !bool {
     }
 
     self.pending_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
+    self.hook_flow.policy = .{};
+    self.hook_flow.asks.clearRetainingCapacity();
     self.pending_index = 0;
     if (try self.repeating(reply.tool_calls)) {
         try self.stop("Stopped: the same tool call came back three times running.");
@@ -2065,23 +1995,16 @@ fn action(self: *Loop, call: *const Conversation.ToolCall) ![]u8 {
     const a = arena.allocator();
     const input = try std.json.parseFromSliceLeaky(std.json.Value, a, call.arguments, .{});
     if (input != .object) return error.InvalidToolInput;
-    var targets: std.ArrayList([]const u8) = .empty;
-    for ([_][]const u8{ "path", "file" }) |field| {
-        if (input.object.get(field)) |value| {
-            if (value != .string) continue;
-            try targets.append(a, self.resolveAgainstProject(a, value.string) orelse return error.UnresolvedActionTarget);
-        }
-    }
     var roots: std.ArrayList([]const u8) = .empty;
-    try roots.append(a, self.followLinks(a, self.project_root) orelse return error.UnresolvedActionTarget);
-    for (self.additional_roots.items) |root| try roots.append(a, self.followLinks(a, root) orelse return error.UnresolvedActionTarget);
+    try roots.append(a, self.resolveAgainstProject(a, self.project_root) orelse return error.UnresolvedActionTarget);
+    for (self.additional_roots.items) |root| try roots.append(a, self.resolveAgainstProject(a, root) orelse return error.UnresolvedActionTarget);
     return std.json.Stringify.valueAlloc(self.allocator, .{
         .call_id = call.id,
         .tool = call.name,
         .arguments = input,
         .cwd = try paths.resolve(self.io, a, self.workingDirectory(), "."),
         .allowed_roots = roots.items,
-        .resolved_targets = targets.items,
+        .resolved_targets = try action_paths.resolvedTargets(self.io, a, self.workingDirectory(), input.object),
         .agent_id = &self.hook_flow.identity,
         .parent_agent_id = if (self.parent) |parent| @as([]const u8, &parent.hook_flow.identity) else "",
         .parent_tool_call_id = self.hook_flow.parent_call_id,
@@ -2147,31 +2070,11 @@ fn autoApprove(self: *Loop) !void {
             continue;
         }
         if (self.hooks) |runner| {
-            if (self.hook_flow.pre_seq != self.pending_seq) {
-                self.hook_flow.pre_seq = self.pending_seq;
-                self.hook_flow.pre_index = 0;
-                self.hook_flow.permission_index = 0;
-                self.hook_flow.evaluate_index = 0;
-                self.hook_flow.asks.clearRetainingCapacity();
-            }
-            if (i >= self.hook_flow.pre_index) {
-                self.hook_flow.pre_index = i + 1;
-                if (runner.set.forEvent(.pre_tool_use).len > 0) {
-                    try self.startPolicyHook(.pre_tool_use, i, null);
-                    return;
-                }
-            }
-            if (i >= self.hook_flow.evaluate_index) {
-                self.hook_flow.evaluate_index = i + 1;
-                if (runner.set.permission_evaluate.len > 0) {
-                    try self.startPolicyHook(.permission_evaluate, i, null);
-                    return;
-                }
-            }
-            if (!self.needsNoDecision(call) and i >= self.hook_flow.permission_index) {
-                self.hook_flow.permission_index = i + 1;
-                if (runner.set.forEvent(.permission_request).len > 0) {
-                    try self.startPolicyHook(.permission_request, i, null);
+            inline for (.{ Hooks.Event.pre_tool_use, .permission_evaluate, .permission_request }) |event| {
+                const cursor = &@field(self.hook_flow.policy, @tagName(event));
+                if (i >= cursor.* and runner.set.forEvent(event).len > 0 and (event != .permission_request or !self.needsNoDecision(call))) {
+                    cursor.* = i + 1;
+                    try self.startPolicyHook(event, i, null);
                     return;
                 }
             }
@@ -2362,14 +2265,7 @@ fn block(self: *Loop, message_index: usize, call_index: usize, reason: []const u
     call.result_bytes = text.len;
     try self.persistToolCall(message_index, call_index);
 
-    if (self.hooks) |runner| {
-        if (runner.set.permission_denied.len > 0) {
-            self.hook_flow.dispatch = try self.dispatchHook(.{ .event = .permission_denied, .request_purpose = .approval_judge, .tool_name = call.name, .tool_input = call.arguments, .tool_call_id = call.id, .error_message = reason });
-            self.hook_flow.pending = .{ .auto_denied = call_index };
-            self.state = .running_hooks;
-            return;
-        }
-    }
+    if (try self.startHook(.{ .event = .permission_denied, .request_purpose = .approval_judge, .tool_name = call.name, .tool_input = call.arguments, .tool_call_id = call.id, .error_message = reason }, .{ .auto_denied = call_index })) return;
     try self.afterAutoBlock();
 }
 
@@ -2437,17 +2333,11 @@ pub fn answerWithSource(self: *Loop, response: Answer) !void {
             defer self.allocator.free(receipt);
             try self.recordHuman(receipt, true);
         }
-        self.approved_ask_index = null;
         call.settle(.ok, tool.monotonicMilliseconds(self.io));
         call.result = try self.allocator.dupe(u8, text);
         call.result_bytes = text.len;
         try self.persistToolCall(message_index, i);
-        if (self.hooks) |runner| {
-            if (runner.set.forEvent(.post_tool_use).len > 0) {
-                try self.startOwnerPost(i, call.result.?);
-                return;
-            }
-        }
+        if (try self.startOwnerPost(i, call.*)) return;
         break;
     }
 
@@ -2490,10 +2380,7 @@ fn checkTodoTasks(self: *Loop, message_index: usize, call_index: usize) !bool {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(item.text, &digest, .{});
         const task_id = std.fmt.bytesToHex(digest, .lower);
-        self.hook_flow.dispatch = try self.dispatchHook(.{ .event = event, .task_id = &task_id, .task_subject = item.text, .task_description = item.text, .tool_call_id = call.id });
-        self.hook_flow.pending = .{ .task_policy = call_index };
-        self.state = .running_hooks;
-        return true;
+        return self.startHook(.{ .event = event, .task_id = &task_id, .task_subject = item.text, .task_description = item.text, .tool_call_id = call.id }, .{ .task_policy = call_index });
     }
     return false;
 }
@@ -2681,12 +2568,11 @@ fn hookRequiresApproval(self: *const Loop, call: *const Conversation.ToolCall) b
         const arena = scratch.allocator();
         const input = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{}) catch return true;
         if (input == .object) {
-            for ([_][]const u8{ "path", "file" }) |field| {
-                if (input.object.get(field)) |target| {
-                    if (target != .string) continue;
-                    const resolved = self.resolveAgainstProject(arena, target.string) orelse return true;
-                    if (permission.protectedPath(arena, self.io, self.project_root, resolved, self.control_files, if (self.hooks) |runner| runner.set else .{}) catch true) return true;
-                }
+            for (action_paths.path_fields) |field| {
+                const target = input.object.get(field) orelse continue;
+                if (target != .string) continue;
+                const path = std.fs.path.resolve(arena, &.{ self.workingDirectory(), target.string }) catch return true;
+                if (permission.protectedPath(arena, self.io, self.project_root, path, self.control_files, if (self.hooks) |runner| runner.set else .{}) catch true) return true;
             }
         }
     };
@@ -2744,7 +2630,7 @@ fn outsidePath(
         else => return null,
     };
 
-    for ([_][]const u8{ "path", "file" }) |name| {
+    for (action_paths.path_fields) |name| {
         const value = fields.get(name) orelse continue;
         if (value != .string) continue;
         if (value.string.len == 0) continue;
@@ -2757,33 +2643,15 @@ fn outsidePath(
 }
 
 fn resolveAgainstProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    const joined = if (std.fs.path.isAbsolute(path))
-        arena.dupe(u8, path) catch return null
-    else
-        std.fs.path.join(arena, &.{ self.workingDirectory(), path }) catch return null;
-
-    const lexical = std.fs.path.resolve(arena, &.{joined}) catch return null;
-    return self.followLinks(arena, lexical);
-}
-
-/// `lexical` with the links in the part of it that exists followed, since the
-/// OS follows them when the call runs: `link/x` under a project is outside it
-/// when `link` points out. Null when that cannot be told, a dangling link
-/// included.
-fn followLinks(self: *const Loop, arena: std.mem.Allocator, lexical: []const u8) ?[]const u8 {
-    return paths.resolve(self.io, arena, self.workingDirectory(), lexical) catch null;
+    return paths.resolve(self.io, arena, self.workingDirectory(), path) catch null;
 }
 
 fn inside(self: *const Loop, arena: std.mem.Allocator, resolved: []const u8) bool {
-    for ([_][]const u8{self.project_root}) |root| {
-        const reference = self.followLinks(arena, root) orelse return false;
-        if (pathInside(reference, resolved)) return true;
-    }
-    for (self.additional_roots.items) |root| if (pathInside(root, resolved)) return true;
+    const primary = self.resolveAgainstProject(arena, self.project_root) orelse return false;
+    if (paths.inside(primary, resolved)) return true;
+    for (self.additional_roots.items) |root| if (paths.inside(root, resolved)) return true;
     return false;
 }
-
-const pathInside = paths.inside;
 
 /// Whether the preset list of read-only commands covers this call. Only `bash`
 /// has commands to classify; every other tool is settled by `read_only`.
@@ -3284,34 +3152,18 @@ fn runApproved(self: *Loop) !void {
         try self.persistToolCall(message_index, i);
     }
 
-    if (self.hooks) |runner| {
-        const calls_for_hooks = self.conversation.messages.items[message_index].tool_calls;
-        for (calls_for_hooks, 0..) |call, i| {
-            if (call.status != .running) continue;
-            const is_todo = std.mem.eql(u8, call.name, todo_tool.name);
-            const is_ask = std.mem.eql(u8, call.name, ask_user.name);
-            if (!is_todo and !is_ask) continue;
-            if (is_ask and self.approved_ask_index == i) continue;
-            if (is_todo) {
-                if (try self.checkTodoTasks(message_index, i)) return;
-                try self.applyTodo(message_index, i);
-                if (runner.set.forEvent(.post_tool_use).len > 0) {
-                    try self.startOwnerPost(i, calls_for_hooks[i].result.?);
-                    return;
-                }
-            } else {
-                self.approved_ask_index = i;
-                self.state = .awaiting_answer;
-                self.notifyHook("agent_needs_input", call.arguments);
-                return;
-            }
-        }
-    } else {
-        const calls_for_todos = self.conversation.messages.items[message_index].tool_calls;
-        for (calls_for_todos, 0..) |call, i| {
-            if (call.status != .running) continue;
-            if (std.mem.eql(u8, call.name, todo_tool.name)) try self.applyTodo(message_index, i);
-        }
+    for (calls, 0..) |*call, i| {
+        if (call.status != .running) continue;
+        if (self.hooks != null and std.mem.eql(u8, call.name, ask_user.name)) break;
+        if (!std.mem.eql(u8, call.name, todo_tool.name)) continue;
+        if (try self.checkTodoTasks(message_index, i)) return;
+        try self.applyTodo(message_index, i);
+        if (try self.startOwnerPost(i, call.*)) return;
+    }
+    if (self.firstAsk()) |question| {
+        self.notifyHook("agent_needs_input", question.arguments);
+        self.state = .awaiting_answer;
+        return;
     }
 
     var roots: std.ArrayList([]const u8) = .empty;
@@ -3324,13 +3176,10 @@ fn runApproved(self: *Loop) !void {
 
     for (calls, 0..) |call, i| {
         if (call.status != .running) continue;
-        if (std.mem.eql(u8, call.name, todo_tool.name)) continue;
+        var input = post_input;
+        input.tool_call_id = call.id;
         try batch.append(self.allocator, .{
-            .hook_input = blk: {
-                var input = post_input;
-                input.tool_call_id = call.id;
-                break :blk input;
-            },
+            .hook_input = input,
             .seq = self.conversation.messages.items[message_index].seq,
             .index = i,
             .name = call.name,
@@ -3339,13 +3188,6 @@ fn runApproved(self: *Loop) !void {
             .allow_outside = self.mayReachOutside(&call),
             .additional_roots = roots.items,
         });
-    }
-
-    // A question is answered, not run. The rest of the batch waits its turn.
-    if (self.firstAsk()) |question| {
-        self.notifyHook("agent_needs_input", question.arguments);
-        self.state = .awaiting_answer;
-        return;
     }
 
     if (batch.items.len == 0) {
@@ -3484,65 +3326,50 @@ fn pollTools(self: *Loop) !bool {
 /// Append one `.tool` message per settled call, then ask the model again with
 /// the results in hand.
 fn finishToolMessages(self: *Loop) !void {
-    var arena: std.heap.ArenaAllocator = .init(self.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var batch: std.ArrayList(struct { tool_name: []const u8, tool_input: std.json.Value, tool_use_id: []const u8, tool_response: []const u8, status: []const u8 }) = .empty;
-    if (self.hooks) |runner| {
-        if (runner.set.post_tool_batch.len > 0) {
-            if (self.pendingIndex()) |index| {
-                for (self.conversation.messages.items[index].tool_calls) |call| {
-                    const original = call.result orelse "";
-                    const trimmed = try self.trimForModel(call.name, original);
-                    defer if (trimmed.ptr != original.ptr) self.allocator.free(trimmed);
-                    try batch.append(a, .{ .tool_name = call.name, .tool_input = std.json.parseFromSliceLeaky(std.json.Value, a, call.arguments, .{}) catch .null, .tool_use_id = call.id, .tool_response = try a.dupe(u8, trimmed), .status = @tagName(call.status) });
-                }
-            }
-        }
-    }
-    const payload = try std.json.Stringify.valueAlloc(a, batch.items, .{});
-    try self.appendToolResults();
-    if (self.hooks) |runner| {
-        if (runner.set.post_tool_batch.len > 0) {
-            self.hook_flow.dispatch = try self.dispatchHook(.{ .event = .post_tool_batch, .tool_calls = payload });
-            self.hook_flow.pending = .{ .lifecycle = .ask_model };
-            self.state = .running_hooks;
-            return;
-        }
-    }
+    var payload: std.Io.Writer.Allocating = .init(self.allocator);
+    defer payload.deinit();
+    var json: std.json.Stringify = .{ .writer = &payload.writer };
+    if (self.hooks != null and self.hooks.?.set.post_tool_batch.len > 0) {
+        try json.beginArray();
+        try self.appendToolResults(&json);
+        try json.endArray();
+        if (try self.startHook(.{ .event = .post_tool_batch, .tool_calls = payload.written() }, .{ .lifecycle = .ask_model })) return;
+    } else try self.appendToolResults(null);
     try self.ask();
 }
 
 /// Keep the wire history complete even when a turn ends without another request.
-fn appendToolResults(self: *Loop) !void {
+fn appendToolResults(self: *Loop, batch: ?*std.json.Stringify) !void {
     const message_index = self.pendingIndex() orelse return;
-
     const calls = self.conversation.messages.items[message_index].tool_calls;
-    const settled = try self.allocator.alloc(struct {
-        name: []const u8,
-        id: []const u8,
-        result: []const u8,
-    }, calls.len);
-    defer self.allocator.free(settled);
+    const results = try self.allocator.alloc(Conversation.Message, calls.len);
+    defer self.allocator.free(results);
+    var ready: usize = 0;
+    var adopted: usize = 0;
+    defer for (results[adopted..ready]) |*message| message.deinit(self.allocator);
 
-    var count: usize = 0;
     for (calls) |call| {
+        const original = call.result orelse "";
+        const trimmed = try self.trimForModel(call.name, original);
+        defer if (trimmed.ptr != original.ptr) self.allocator.free(trimmed);
+        if (batch) |json| {
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, call.arguments, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            defer if (parsed) |value| value.deinit();
+            try json.write(.{ .tool_name = call.name, .tool_input = if (parsed) |value| value.value else std.json.Value.null, .tool_use_id = call.id, .tool_response = trimmed, .status = @tagName(call.status) });
+        }
         if (!call.status.isSettled()) continue;
-        settled[count] = .{
-            .name = call.name,
-            .id = call.id,
-            .result = call.result orelse "",
-        };
-        count += 1;
+        const result: Conversation.Message = .{ .seq = self.conversation.next_seq + ready, .role = .tool, .origin = .tool, .tool_name = call.name, .tool_call_id = call.id, .text = trimmed };
+        results[ready] = try result.clone(self.allocator);
+        ready += 1;
     }
-
-    for (settled[0..count]) |entry| {
-        const trimmed = try self.trimForModel(entry.name, entry.result);
-        defer if (trimmed.ptr != entry.result.ptr) self.allocator.free(trimmed);
-        _ = try self.conversation.addToolResult(entry.name, entry.id, trimmed);
+    while (adopted < ready) {
+        try self.conversation.adoptMessage(results[adopted]);
+        adopted += 1;
         try self.persistMessage(self.conversation.messages.items.len - 1);
     }
-
     self.pending_seq = null;
     self.pending_index = 0;
 }
@@ -3673,6 +3500,7 @@ fn settle(self: *Loop) !void {
 
 const Fixture = struct {
     tmp: testing.TmpDir,
+    scratch: std.heap.ArenaAllocator = .init(testing.allocator),
     root: []u8,
     convo: Conversation,
     registry: Registry,
@@ -3701,8 +3529,18 @@ const Fixture = struct {
         self.registry.deinit();
         self.convo.deinit();
         testing.allocator.free(self.root);
+        self.scratch.deinit();
         self.tmp.cleanup();
         testing.allocator.destroy(self);
+    }
+
+    fn readFile(self: *Fixture, path: []const u8) ![]const u8 {
+        return self.tmp.dir.readFileAlloc(testing.io, path, self.scratch.allocator(), .limited(64 * 1024));
+    }
+
+    fn readEvent(self: *Fixture, path: []const u8) !std.json.ObjectMap {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, self.scratch.allocator(), try self.readFile(path), .{});
+        return value.object;
     }
 
     fn loop(self: *Fixture) Loop {
@@ -3741,7 +3579,7 @@ test "a blocked prompt never enters the model transcript" {
     try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
     const notice = loop.takeHookNotice().?;
     defer testing.allocator.free(notice);
-    try testing.expectEqualStrings("prompt rejected", notice);
+    try testing.expectEqualStrings("[Hook config]\nprompt rejected", notice);
 }
 
 test "a rejected steering prompt never enters the transcript" {
@@ -3764,7 +3602,7 @@ test "a rejected steering prompt never enters the transcript" {
     }
     const notice = loop.takeHookNotice() orelse return error.TestExpectedNotice;
     defer testing.allocator.free(notice);
-    try testing.expectEqualStrings("steering denied", notice);
+    try testing.expectEqualStrings("[Hook config]\nsteering denied", notice);
 }
 
 test "a read-only tool call runs without asking" {
@@ -6008,6 +5846,11 @@ test "a call that runs comes out of the turn with a duration on it" {
     try testing.expect(stored[0].elapsed_ms != null);
 }
 
+fn submitAndSettle(loop: *Loop, prompt: []const u8) !void {
+    try loop.submit(prompt, .{});
+    try settle(loop);
+}
+
 test "a hook rewrite is approved using effective arguments and runs once" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -6015,33 +5858,16 @@ test "a hook rewrite is approved using effective arguments and runs once" {
     defer loop.deinit();
     fixture.fake.tool_name = "bash";
     fixture.fake.tool_arguments = "{\"command\":\"pwd\"}";
-    const hook: Hooks.Hook = .{ .legacy = false, .matcher = "bash", .command = "echo rewrite >> rewrites; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"rm -rf dangerous\"}}}'" };
+    const hook: Hooks.Hook = .{ .matcher = "bash", .command = "echo rewrite >> rewrites; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"rm -rf dangerous\"}}}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     try testing.expectEqual(State.awaiting_approval, loop.state);
     try testing.expectEqualStrings("{\"command\":\"rm -rf dangerous\"}", loop.pendingCall().?.arguments);
     try loop.decide(.deny);
     try settle(&loop);
-    const rewrites = try fixture.tmp.dir.readFileAlloc(testing.io, "rewrites", testing.allocator, .limited(1024));
-    defer testing.allocator.free(rewrites);
+    const rewrites = try fixture.readFile("rewrites");
     try testing.expectEqualStrings("rewrite\n", rewrites);
-}
-
-test "pre-tool policy denies before an approval can be shown" {
-    const fixture = try Fixture.init();
-    defer fixture.deinit();
-    var loop = fixture.loop();
-    defer loop.deinit();
-    fixture.fake.tool_name = "bash";
-    fixture.fake.tool_arguments = "{\"command\":\"touch should-not-exist\"}";
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "exit 2" }} } };
-    loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
-    try testing.expectEqual(State.idle, loop.state);
-    try testing.expectEqual(Conversation.ToolCall.Status.rejected, fixture.convo.messages.items[1].tool_calls[0].status);
 }
 
 test "hook allowances cannot bypass ordinary approval" {
@@ -6051,11 +5877,10 @@ test "hook allowances cannot bypass ordinary approval" {
     defer loop.deinit();
     fixture.fake.tool_name = "bash";
     fixture.fake.tool_arguments = "{\"command\":\"touch permitted\"}";
-    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" };
+    const hook: Hooks.Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_request = &.{hook} } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     try testing.expectEqual(State.awaiting_approval, loop.state);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "permitted", .{}));
     try loop.decide(.once);
@@ -6078,10 +5903,8 @@ test "lifecycle trace pairs model attempts and orders session and tool events" {
         .stop = &.{logger},
     } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
-    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "hook-events", testing.allocator, .limited(64 * 1024));
-    defer testing.allocator.free(trace);
+    try submitAndSettle(&loop, "go");
+    const trace = try fixture.readFile("hook-events");
     const expected = [_][]const u8{ "SessionStart", "PreModelRequest", "PostModelRequest", "PreToolUse", "PostToolUse", "PreModelRequest", "PostModelRequest", "Stop" };
     var lines = std.mem.tokenizeScalar(u8, trace, '\n');
     for (expected) |name| {
@@ -6102,8 +5925,7 @@ test "session-start denial cannot be bypassed by resubmitting a prompt" {
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .session_start = &.{.{ .command = "exit 2" }} } };
     loop.hooks = &runner;
     for (0..2) |_| {
-        try loop.submit("never persist", .{});
-        try settle(&loop);
+        try submitAndSettle(&loop, "never persist");
         try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
         try testing.expectEqual(@as(usize, 0), loop.requests_started);
     }
@@ -6114,14 +5936,13 @@ test "completion continuation keeps the existing turn budget" {
     defer fixture.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
-    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"continue checking\"}'" };
+    const hook: Hooks.Hook = .{ .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"continue checking\"}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .stop = &.{hook} } };
     loop.hooks = &runner;
     loop.max_turn_tokens = 250;
     fixture.fake.prompt_tokens = 100;
     fixture.fake.completion_tokens = 20;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     try testing.expectEqual(State.idle, loop.state);
     try testing.expect(loop.stop_hook_active);
     try testing.expect(loop.turn_tokens >= 250);
@@ -6130,9 +5951,7 @@ test "completion continuation keeps the existing turn budget" {
 test "rewritten file arguments drive checkpoints execution and persistence" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
-    const path = try std.fs.path.join(testing.allocator, &.{ fixture.root, "session.db" });
-    defer testing.allocator.free(path);
-    var db = try Database.init(testing.allocator, testing.io, path);
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
     defer db.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
@@ -6140,13 +5959,11 @@ test "rewritten file arguments drive checkpoints execution and persistence" {
     loop.approvals = .all;
     fixture.fake.tool_name = "write";
     fixture.fake.tool_arguments = "{\"path\":\"original.txt\",\"content\":\"original\"}";
-    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"file_path\":\"effective.txt\",\"content\":\"effective\"}}}'" };
+    const hook: Hooks.Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"file_path\":\"effective.txt\",\"content\":\"effective\"}}}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
-    const content = try fixture.tmp.dir.readFileAlloc(testing.io, "effective.txt", testing.allocator, .limited(1024));
-    defer testing.allocator.free(content);
+    try submitAndSettle(&loop, "go");
+    const content = try fixture.readFile("effective.txt");
     try testing.expectEqualStrings("effective", content);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(testing.io, "original.txt", .{}));
     const stored = try db.loadMessages(testing.allocator, loop.session_id.?, std.math.maxInt(i64), 100);
@@ -6168,9 +5985,7 @@ test "rewritten file arguments drive checkpoints execution and persistence" {
 test "post-tool feedback preserves side effects and the original stored result" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
-    const path = try std.fs.path.join(testing.allocator, &.{ fixture.root, "session.db" });
-    defer testing.allocator.free(path);
-    var db = try Database.init(testing.allocator, testing.io, path);
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
     defer db.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
@@ -6178,13 +5993,11 @@ test "post-tool feedback preserves side effects and the original stored result" 
     loop.approvals = .all;
     fixture.fake.tool_name = "write";
     fixture.fake.tool_arguments = "{\"path\":\"note.txt\",\"content\":\"kept\"}";
-    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"verify the file\"}'" };
+    const hook: Hooks.Hook = .{ .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"verify the file\"}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .post_tool_use = &.{hook} } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
-    const content = try fixture.tmp.dir.readFileAlloc(testing.io, "note.txt", testing.allocator, .limited(1024));
-    defer testing.allocator.free(content);
+    try submitAndSettle(&loop, "go");
+    const content = try fixture.readFile("note.txt");
     try testing.expectEqualStrings("kept", content);
     const call = fixture.convo.messages.items[1].tool_calls[0];
     try testing.expectEqual(Conversation.ToolCall.Status.ok, call.status);
@@ -6200,7 +6013,7 @@ test "pre-compaction stop leaves history intact and starts no model attempt" {
     var loop = fixture.loop();
     defer loop.deinit();
     try fixture.convo.add(.user, "keep history");
-    const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"continue\":false,\"stopReason\":\"keep history\"}'" };
+    const hook: Hooks.Hook = .{ .command = "printf '%s' '{\"continue\":false,\"stopReason\":\"keep history\"}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_compact = &.{hook} } };
     loop.hooks = &runner;
     loop.auto_compact_at = 0.01;
@@ -6229,8 +6042,7 @@ test "successful manual compaction emits post and a new session context" {
     loop.hooks = &runner;
     try loop.compact();
     try settle(&loop);
-    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "compact-events", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(trace);
+    const trace = try fixture.readFile("compact-events");
     var lines = std.mem.tokenizeScalar(u8, trace, '\n');
     for ([_][]const u8{ "PreCompact", "PostCompact", "SessionStart" }) |expected| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
@@ -6257,12 +6069,9 @@ test "teardown waits for the interrupt hook to read the effective route" {
         try loop.submit("go", .{});
         try loop.cancel();
     }
-    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "interrupt.json", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(trace);
-    const input = try std.json.parseFromSlice(std.json.Value, testing.allocator, trace, .{});
-    defer input.deinit();
-    try testing.expectEqualStrings("previous-model", input.value.object.get("model").?.string);
-    try testing.expectEqualStrings("previous-provider", input.value.object.get("provider").?.string);
+    const input = try fixture.readEvent("interrupt.json");
+    try testing.expectEqualStrings("previous-model", input.get("model").?.string);
+    try testing.expectEqualStrings("previous-provider", input.get("provider").?.string);
 }
 
 test "an explicit interruption emits one bounded cleanup event" {
@@ -6290,8 +6099,7 @@ test "an explicit interruption emits one bounded cleanup event" {
     try loop.cancel();
     try loop.cancel();
     try settle(&loop);
-    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "interrupt-events", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(trace);
+    const trace = try fixture.readFile("interrupt-events");
     var lines = std.mem.tokenizeScalar(u8, trace, '\n');
     for ([_][]const u8{ "PreModelRequest", "PostModelRequest", "Interrupt" }, 0..) |event, index| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
@@ -6364,9 +6172,7 @@ test "cancellation during shared pre-tool policy prevents tool execution" {
 test "session hooks distinguish startup clear and resume with persistent handles" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
-    const path = try std.fs.path.join(testing.allocator, &.{ fixture.root, "session.db" });
-    defer testing.allocator.free(path);
-    var db = try Database.init(testing.allocator, testing.io, path);
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
     defer db.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
@@ -6376,20 +6182,17 @@ test "session hooks distinguish startup clear and resume with persistent handles
     defer runtime.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{ .session_start = &.{logger}, .session_end = &.{.{ .command = "cat >> ends" }} } };
     loop.hooks = &runner;
-    try loop.submit("first", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "first");
     const original_session = loop.session_id.?;
     const original_handle = try db.sessionPublicId(original_session, testing.allocator);
     defer testing.allocator.free(original_handle);
     try testing.expect(loop.resetForNewSession());
-    try loop.submit("second", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "second");
     const next_handle = try db.sessionPublicId(loop.session_id.?, testing.allocator);
     defer testing.allocator.free(next_handle);
     try testing.expect(!std.mem.eql(u8, original_handle, next_handle));
     try loop.resumeSession(original_session, 100);
-    const ends = try fixture.tmp.dir.readFileAlloc(testing.io, "ends", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(ends);
+    const ends = try fixture.readFile("ends");
     var end_lines = std.mem.tokenizeScalar(u8, ends, '\n');
     for ([_][]const u8{ "clear", "resume" }, 0..) |reason, index| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, end_lines.next().?, .{});
@@ -6398,10 +6201,8 @@ test "session hooks distinguish startup clear and resume with persistent handles
         try testing.expectEqualStrings(if (index == 0) original_handle else next_handle, parsed.value.object.get("session_id").?.string);
     }
     try testing.expect(end_lines.next() == null);
-    try loop.submit("third", .{});
-    try settle(&loop);
-    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "starts", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(trace);
+    try submitAndSettle(&loop, "third");
+    const trace = try fixture.readFile("starts");
     var lines = std.mem.tokenizeScalar(u8, trace, '\n');
     for ([_][]const u8{ "startup", "clear", "resume" }, 0..) |source, index| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
@@ -6444,7 +6245,7 @@ test "idle background context does not create a turn" {
     defer runtime.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{ .pre_tool_use = &.{.{ .legacy = false, .async = true, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"later context\"}}'" }} } };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{ .pre_tool_use = &.{.{ .async = true, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"later context\"}}'" }} } };
     loop.hooks = &runner;
     var immediate = try runner.evaluate(testing.allocator, loop.hookInput(.{ .event = .pre_tool_use }));
     defer immediate.deinit(testing.allocator);
@@ -6453,8 +6254,7 @@ test "idle background context does not create a turn" {
     try testing.expectEqual(State.idle, loop.state);
     try testing.expectEqual(@as(u64, 0), loop.requests_started);
     try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
-    try loop.submit("inspect", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "inspect");
     const delivered = for (fixture.convo.messages.items) |message| {
         if (message.origin == .hook and std.mem.indexOf(u8, message.text, "later context") != null) break true;
     } else false;
@@ -6512,17 +6312,13 @@ test "PostToolBatch sees one complete parallel batch and can stop before another
     var loop = fixture.loop();
     defer loop.deinit();
     fixture.fake.parallel_calls = 3;
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .post_tool_batch = &.{.{ .legacy = false, .command = "cat > batch.json; printf '%s' '{\"decision\":\"block\",\"reason\":\"inspect batch\"}'" }} } };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .post_tool_batch = &.{.{ .command = "cat > batch.json; printf '%s' '{\"decision\":\"block\",\"reason\":\"inspect batch\"}'" }} } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     try testing.expectEqual(@as(usize, 1), loop.requests_started);
     try testing.expectEqual(Outcome.halted, loop.outcome.?);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "batch.json", testing.allocator, .limited(64 * 1024));
-    defer testing.allocator.free(payload);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const calls = parsed.value.object.get("tool_calls").?.array.items;
+    const parsed = try fixture.readEvent("batch.json");
+    const calls = parsed.get("tool_calls").?.array.items;
     try testing.expectEqual(@as(usize, 3), calls.len);
     for (calls) |call| {
         try testing.expectEqualStrings("ok", call.object.get("status").?.string);
@@ -6545,20 +6341,16 @@ test "an answered owner-thread question reaches PostToolBatch exactly once" {
     defer loop.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .post_tool_batch = &.{.{ .command = "cat >> batch.jsonl" }} } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     try testing.expectEqual(State.awaiting_answer, loop.state);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(testing.io, "batch.jsonl", .{}));
     try loop.answer("yes");
     try settle(&loop);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "batch.jsonl", testing.allocator, .limited(64 * 1024));
-    defer testing.allocator.free(payload);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("yes", parsed.value.object.get("tool_calls").?.array.items[0].object.get("tool_response").?.string);
+    const parsed = try fixture.readEvent("batch.jsonl");
+    try testing.expectEqualStrings("yes", parsed.get("tool_calls").?.array.items[0].object.get("tool_response").?.string);
 }
 
-test "task hooks guard normalized todo creation and completion before mutation" {
+test "task hooks guard and observe normalized todo transitions" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
     fixture.fake.tool_name = "todo";
@@ -6567,11 +6359,9 @@ test "task hooks guard normalized todo creation and completion before mutation" 
     defer loop.deinit();
     var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .task_created = &.{.{ .command = "cat > created.json; echo creation-denied >&2; exit 2" }} } };
     loop.hooks = &runner;
-    try loop.submit("plan", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "plan");
     try testing.expectEqual(@as(usize, 0), loop.todos.items.items.len);
-    const created = try fixture.tmp.dir.readFileAlloc(testing.io, "created.json", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(created);
+    const created = try fixture.readFile("created.json");
     const value = try std.json.parseFromSlice(std.json.Value, testing.allocator, created, .{});
     defer value.deinit();
     try testing.expectEqualStrings("protected task", value.value.object.get("task_subject").?.string);
@@ -6580,33 +6370,19 @@ test "task hooks guard normalized todo creation and completion before mutation" 
     fixture.fake.tool_arguments = "{\"items\":[{\"text\":\"protected task\",\"status\":\"done\"}]}";
     runner.set.task_created = &.{};
     runner.set.task_completed = &.{.{ .command = "cat > completed.json; echo completion-denied >&2; exit 2" }};
-    try loop.submit("finish", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "finish");
     try testing.expectEqual(todo.Status.active, loop.todos.items.items[0].status);
-    const completed = try fixture.tmp.dir.readFileAlloc(testing.io, "completed.json", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(completed);
+    const completed = try fixture.readFile("completed.json");
     try testing.expect(std.mem.indexOf(u8, completed, "TaskCompleted") != null);
-}
-
-test "accepted task transitions emit creation once and completion once" {
-    const fixture = try Fixture.init();
-    defer fixture.deinit();
-    fixture.fake.tool_name = "todo";
-    fixture.fake.tool_arguments = "{\"items\":[{\"text\":\"one task\",\"status\":\"pending\"}]}";
-    var loop = fixture.loop();
-    defer loop.deinit();
     const logger: Hooks.Hook = .{ .command = "cat >> tasks.jsonl" };
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .task_created = &.{logger}, .task_completed = &.{logger} } };
-    loop.hooks = &runner;
-    try loop.submit("plan", .{});
-    try settle(&loop);
-    try loop.submit("keep same plan", .{});
-    try settle(&loop);
+    runner.set = .{ .task_created = &.{logger}, .task_completed = &.{logger} };
+    try loop.todos.replace(&.{});
+    fixture.fake.tool_arguments = "{\"items\":[{\"text\":\"one task\",\"status\":\"pending\"}]}";
+    try submitAndSettle(&loop, "plan");
+    try submitAndSettle(&loop, "keep same plan");
     fixture.fake.tool_arguments = "{\"items\":[{\"text\":\"one task\",\"status\":\"done\"}]}";
-    try loop.submit("finish", .{});
-    try settle(&loop);
-    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "tasks.jsonl", testing.allocator, .limited(32 * 1024));
-    defer testing.allocator.free(trace);
+    try submitAndSettle(&loop, "finish");
+    const trace = try fixture.readFile("tasks.jsonl");
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "TaskCreated"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "TaskCompleted"));
     try testing.expectEqual(todo.Status.done, loop.todos.items.items[0].status);
@@ -6623,23 +6399,19 @@ test "StopFailure observes a terminal provider error without running Stop" {
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
-        .stop_failure = &.{.{ .legacy = false, .matcher = "authentication_failed", .command = "cat > failure.json" }},
+        .stop_failure = &.{.{ .matcher = "authentication_failed", .command = "cat > failure.json" }},
         .stop = &.{.{ .command = "touch normal-stop" }},
     } };
     var loop = fixture.loop();
     defer loop.deinit();
     loop.provider.respond = Failure.respond;
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     try settleHookObservers(&runtime);
     try testing.expectEqual(Outcome.failed, loop.outcome.?);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "failure.json", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(payload);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("authentication_failed", parsed.value.object.get("error").?.string);
-    try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("last_assistant_message").?.string, "NotSignedIn") != null);
+    const parsed = try fixture.readEvent("failure.json");
+    try testing.expectEqualStrings("authentication_failed", parsed.get("error").?.string);
+    try testing.expect(std.mem.indexOf(u8, parsed.get("last_assistant_message").?.string, "NotSignedIn") != null);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(testing.io, "normal-stop", .{}));
 }
 
@@ -6653,16 +6425,14 @@ test "PermissionDenied observes auto denial and retry never grants permission" {
     var loop = fixture.loop();
     defer loop.deinit();
     loop.approvals = .auto;
-    const hook: Hooks.Hook = .{ .legacy = false, .matcher = "Bash", .command = "cat >> denied.jsonl; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionDenied\",\"retry\":true}}'" };
+    const hook: Hooks.Hook = .{ .matcher = "Bash", .command = "cat >> denied.jsonl; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionDenied\",\"retry\":true}}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_denied = &.{hook}, .post_tool_use = &.{.{ .command = "touch wrongly-executed" }} } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     const call = fixture.convo.messages.items[1].tool_calls[0];
     try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
     try testing.expect(std.mem.indexOf(u8, call.result.?, "may retry") != null);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "denied.jsonl", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(payload);
+    const payload = try fixture.readFile("denied.jsonl");
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, payload, "PermissionDenied"));
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(testing.io, "wrongly-executed", .{}));
 }
@@ -6674,8 +6444,8 @@ test "model switch hooks guard the provider and report only successful actual sw
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
-        .pre_model_switch = &.{.{ .legacy = false, .matcher = "blocked", .command = "echo model-denied >&2; exit 2" }},
-        .post_model_switch = &.{.{ .legacy = false, .matcher = "allowed", .command = "cat >> switched.jsonl" }},
+        .pre_model_switch = &.{.{ .matcher = "blocked", .command = "echo model-denied >&2; exit 2" }},
+        .post_model_switch = &.{.{ .matcher = "allowed", .command = "cat >> switched.jsonl" }},
     } };
     var loop = fixture.loop();
     defer loop.deinit();
@@ -6687,13 +6457,10 @@ test "model switch hooks guard the provider and report only successful actual sw
     try testing.expectError(error.NoSuchModel, loop.switchModel("gone"));
     try settleHookObservers(&runtime);
     try testing.expectEqual(@as(usize, 1), backend.switches);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "switched.jsonl", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(payload);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("configured-model", parsed.value.object.get("from_model").?.string);
-    try testing.expectEqualStrings("allowed", parsed.value.object.get("to_model").?.string);
-    try testing.expectEqualStrings("command", parsed.value.object.get("source").?.string);
+    const parsed = try fixture.readEvent("switched.jsonl");
+    try testing.expectEqualStrings("configured-model", parsed.get("from_model").?.string);
+    try testing.expectEqualStrings("allowed", parsed.get("to_model").?.string);
+    try testing.expectEqualStrings("command", parsed.get("source").?.string);
 }
 
 test "instruction loading reports the actual file once per cached load" {
@@ -6704,23 +6471,18 @@ test "instruction loading reports the actual file once per cached load" {
     defer project.deinit(testing.allocator);
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{ .instructions_loaded = &.{.{ .legacy = false, .matcher = "session_start", .command = "cat >> instructions.jsonl" }} } };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{ .instructions_loaded = &.{.{ .matcher = "session_start", .command = "cat >> instructions.jsonl" }} } };
     var loop = fixture.loop();
     defer loop.deinit();
     loop.project = &project;
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     try settleHookObservers(&runtime);
-    try loop.submit("continue", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "continue");
     try settleHookObservers(&runtime);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "instructions.jsonl", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(payload);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try testing.expect(std.mem.endsWith(u8, parsed.value.object.get("file_path").?.string, "/AGENTS.md"));
-    try testing.expectEqualStrings("Project", parsed.value.object.get("memory_type").?.string);
+    const parsed = try fixture.readEvent("instructions.jsonl");
+    try testing.expect(std.mem.endsWith(u8, parsed.get("file_path").?.string, "/AGENTS.md"));
+    try testing.expectEqualStrings("Project", parsed.get("memory_type").?.string);
 }
 
 test "skill expansion hook rejects before persistence or inference" {
@@ -6728,18 +6490,15 @@ test "skill expansion hook rejects before persistence or inference" {
     defer fixture.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_expansion = &.{.{ .legacy = false, .command = "cat > expansion.json; printf '%s' '{\"decision\":\"block\",\"reason\":\"skill denied\"}'" }} } };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_expansion = &.{.{ .command = "cat > expansion.json; printf '%s' '{\"decision\":\"block\",\"reason\":\"skill denied\"}'" }} } };
     loop.hooks = &runner;
     try loop.submit("/release 1.0", .{ .command_name = "release", .command_args = "1.0", .expanded_prompt = "Publish release 1.0" });
     try settle(&loop);
     try testing.expectEqual(@as(usize, 0), loop.requests_started);
     try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "expansion.json", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(payload);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("release", parsed.value.object.get("command_name").?.string);
-    try testing.expectEqualStrings("Publish release 1.0", parsed.value.object.get("expanded_prompt").?.string);
+    const parsed = try fixture.readEvent("expansion.json");
+    try testing.expectEqualStrings("release", parsed.get("command_name").?.string);
+    try testing.expectEqualStrings("Publish release 1.0", parsed.get("expanded_prompt").?.string);
 }
 
 test "external file and configuration changes fire while idle without starting inference" {
@@ -6748,13 +6507,13 @@ test "external file and configuration changes fire while idle without starting i
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
-        .file_changed = &.{.{ .legacy = false, .matcher = ".env", .command = "cat > file-change.json" }},
-        .config_change = &.{.{ .legacy = false, .matcher = "project_settings", .command = "cat > config-change.json" }},
+        .file_changed = &.{.{ .matcher = ".env", .command = "cat > file-change.json" }},
+        .config_change = &.{.{ .matcher = "project_settings", .command = "cat > config-change.json" }},
     } };
     var loop = fixture.loop();
     defer loop.deinit();
     loop.hooks = &runner;
-    try loop.hook_flow.watch.configure(testing.allocator, testing.io, fixture.root, "", null, runner.set, &.{});
+    try loop.hook_flow.watch.configure(testing.allocator, testing.io, fixture.root, "", null, runner.set, &.{}, &.{});
     try fixture.tmp.dir.createDir(testing.io, ".synth", .default_dir);
     try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = ".synth/hooks.json", .data = "{}" });
     try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = ".env", .data = "outside write" });
@@ -6763,13 +6522,9 @@ test "external file and configuration changes fire while idle without starting i
     try settleHookObservers(&runtime);
     try testing.expectEqual(@as(usize, 0), loop.requests_started);
     try testing.expect(loop.outcome == null);
-    const file = try fixture.tmp.dir.readFileAlloc(testing.io, "file-change.json", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(file);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, file, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("add", parsed.value.object.get("event").?.string);
-    const config = try fixture.tmp.dir.readFileAlloc(testing.io, "config-change.json", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(config);
+    const parsed = try fixture.readEvent("file-change.json");
+    try testing.expectEqualStrings("add", parsed.get("event").?.string);
+    const config = try fixture.readFile("config-change.json");
     try testing.expect(std.mem.indexOf(u8, config, "project_settings") != null);
 }
 
@@ -6780,12 +6535,11 @@ test "permission and idle notifications are filtered and emitted once" {
     fixture.fake.tool_arguments = "{\"path\":\"note.txt\",\"content\":\"note\"}";
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{ .notification = &.{.{ .legacy = false, .matcher = "permission_prompt|idle_prompt", .command = "cat >> notifications.jsonl" }} } };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{ .notification = &.{.{ .matcher = "permission_prompt|idle_prompt", .command = "cat >> notifications.jsonl" }} } };
     var loop = fixture.loop();
     defer loop.deinit();
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     _ = try loop.poll();
     try loop.decide(.deny);
     try settle(&loop);
@@ -6793,8 +6547,7 @@ test "permission and idle notifications are filtered and emitted once" {
     _ = try loop.poll();
     _ = try loop.poll();
     try settleHookObservers(&runtime);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "notifications.jsonl", testing.allocator, .limited(32 * 1024));
-    defer testing.allocator.free(payload);
+    const payload = try fixture.readFile("notifications.jsonl");
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, payload, "permission_prompt"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, payload, "idle_prompt"));
 }
@@ -6814,11 +6567,10 @@ test "display-only hook output does not alter the model transcript or SQLite" {
     var loop = fixture.loop();
     defer loop.deinit();
     loop.provider.respond = Text.respond;
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .message_display = &.{.{ .legacy = false, .command = "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"MessageDisplay\",\"displayContent\":\"visible answer\"}}'" }} } };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .message_display = &.{.{ .command = "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"MessageDisplay\",\"displayContent\":\"visible answer\"}}'" }} } };
     loop.hooks = &runner;
     try loop.attachDatabase(&db, "test", fixture.root, "fake");
-    try loop.submit("answer", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "answer");
     const reply = lastAssistant(&fixture.convo).?;
     try testing.expectEqualStrings("reference model answer", reply.text);
     try testing.expectEqualStrings("visible answer", reply.displayedText());
@@ -6863,13 +6615,10 @@ test "automatic model refresh reports a change once with the previous owned mode
     loop.syncProvider();
     loop.syncProvider();
     try settleHookObservers(&runtime);
-    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "automatic-model.jsonl", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(payload);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("configured-model", parsed.value.object.get("from_model").?.string);
-    try testing.expectEqualStrings("discovered-model", parsed.value.object.get("to_model").?.string);
-    try testing.expectEqualStrings("automatic", parsed.value.object.get("source").?.string);
+    const parsed = try fixture.readEvent("automatic-model.jsonl");
+    try testing.expectEqualStrings("configured-model", parsed.get("from_model").?.string);
+    try testing.expectEqualStrings("discovered-model", parsed.get("to_model").?.string);
+    try testing.expectEqualStrings("automatic", parsed.get("source").?.string);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(testing.io, "wrong-explicit-switch", .{}));
 }
 
@@ -6883,7 +6632,7 @@ test "directory registration updates approval boundaries and emits one source-ma
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
-        .directory_added = &.{.{ .legacy = false, .matcher = "register_repo_root", .command = "cat >> directories.jsonl" }},
+        .directory_added = &.{.{ .matcher = "register_repo_root", .command = "cat >> directories.jsonl" }},
     } };
     var loop = fixture.loop();
     defer loop.deinit();
@@ -6897,12 +6646,9 @@ test "directory registration updates approval boundaries and emits one source-ma
     try testing.expectEqual(@as(usize, 1), loop.additional_roots.items.len);
     try testing.expect(loop.needsNoDecision(&call));
     try settleHookObservers(&runtime);
-    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "directories.jsonl", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(trace);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, trace, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings(extra, parsed.value.object.get("directory").?.string);
-    try testing.expectEqualStrings("register_repo_root", parsed.value.object.get("source").?.string);
+    const parsed = try fixture.readEvent("directories.jsonl");
+    try testing.expectEqualStrings(extra, parsed.get("directory").?.string);
+    try testing.expectEqualStrings("register_repo_root", parsed.get("source").?.string);
     try fixture.tmp.dir.symLink(testing.io, "/", "escape", .{ .is_directory = true });
     const escaping: Conversation.ToolCall = .{ .id = "escape", .name = "read", .arguments = "{\"path\":\"escape/etc/passwd\"}" };
     try testing.expect(!loop.needsNoDecision(&escaping));
@@ -6916,7 +6662,7 @@ test "directory changes preserve worker paths and report session cwd from projec
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
-        .cwd_changed = &.{.{ .legacy = false, .command = "cat >> cwd.jsonl" }},
+        .cwd_changed = &.{.{ .command = "cat >> cwd.jsonl" }},
     } };
     var loop = fixture.loop();
     defer loop.deinit();
@@ -6927,17 +6673,13 @@ test "directory changes preserve worker paths and report session cwd from projec
     try testing.expectEqualStrings(next, loop.workingDirectory());
     try loop.changeDirectory(".");
     try settleHookObservers(&runtime);
-    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "cwd.jsonl", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(trace);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, trace, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings(fixture.root, parsed.value.object.get("old_cwd").?.string);
-    try testing.expectEqualStrings(next, parsed.value.object.get("new_cwd").?.string);
-    try testing.expectEqualStrings(next, parsed.value.object.get("cwd").?.string);
+    const parsed = try fixture.readEvent("cwd.jsonl");
+    try testing.expectEqualStrings(fixture.root, parsed.get("old_cwd").?.string);
+    try testing.expectEqualStrings(next, parsed.get("new_cwd").?.string);
+    try testing.expectEqualStrings(next, parsed.get("cwd").?.string);
     fixture.fake.tool_name = "read";
     fixture.fake.tool_arguments = "{\"path\":\"seed.txt\"}";
-    try loop.submit("read here", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "read here");
     var found = false;
     for (fixture.convo.messages.items) |message| for (message.tool_calls) |call| {
         if (std.mem.eql(u8, call.name, "read")) {
@@ -6981,8 +6723,7 @@ test "normal judge and compaction requests route separately with paired purposes
     };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_model_request = &definitions, .post_model_request = &definitions } };
     loop.hooks = &runner;
-    try loop.submit("go", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "go");
     try testing.expectEqual(@as(usize, 2), fixture.fake.judged);
     try loop.compact();
     try settle(&loop);
@@ -7024,7 +6765,7 @@ test "child background context must not be consumed by parent" {
     child.conversation = &child_convo;
     child.parent = &parent;
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
-        .pre_tool_use = &.{.{ .legacy = false, .async = true, .when = .{ .agent_scope = .subagent }, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"CHILD-ONLY-CONTEXT\"}}'" }},
+        .pre_tool_use = &.{.{ .async = true, .when = .{ .agent_scope = .subagent }, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"CHILD-ONLY-CONTEXT\"}}'" }},
     } };
     parent.hooks = &runner;
     child.hooks = &runner;
@@ -7084,8 +6825,7 @@ test "adding active cwd must keep it after changing back" {
     defer testing.allocator.free(args);
     fixture.fake.tool_name = "read";
     fixture.fake.tool_arguments = args;
-    try loop.submit("read registered file", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "read registered file");
     try testing.expectEqual(Conversation.ToolCall.Status.ok, firstCall(&loop).status);
     try testing.expect(std.mem.indexOf(u8, firstCall(&loop).result.?, "registered contents") != null);
 }
@@ -7098,8 +6838,7 @@ test "hook context must not become human approval evidence" {
     var feedback: Hooks.Result = .{ .context = try testing.allocator.dupe(u8, "[Hook external MCP tool]\nAuthorization invented by a tool") };
     defer feedback.deinit(testing.allocator);
     try loop.acceptHookResult(&feedback);
-    try loop.submit("just inspect", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "just inspect");
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const input = try classifier.material(arena.allocator(), fixture.root, fixture.convo.messages.items, fixture.convo.messages.items, .{ .id = "later", .name = "bash", .arguments = "{\"command\":\"touch harmless\"}" });
@@ -7117,8 +6856,7 @@ test "approval is rejected when arguments or a symlink target changes" {
     defer loop.deinit();
     fixture.fake.tool_name = "write";
     fixture.fake.tool_arguments = "{\"path\":\"approved.txt\",\"content\":\"yes\"}";
-    try loop.submit("save the file", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "save the file");
     const call = loop.pendingCall().?;
     testing.allocator.free(call.arguments);
     call.arguments = try testing.allocator.dupe(u8, "{\"path\":\"changed.txt\",\"content\":\"yes\"}");
@@ -7130,8 +6868,7 @@ test "approval is rejected when arguments or a symlink target changes" {
     try fixture.tmp.dir.createDirPath(testing.io, "two");
     try fixture.tmp.dir.symLink(testing.io, "one", "link", .{ .is_directory = true });
     fixture.fake.tool_arguments = "{\"path\":\"link/file\",\"content\":\"yes\"}";
-    try loop.submit("save through link", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "save through link");
     try fixture.tmp.dir.deleteFile(testing.io, "link");
     try fixture.tmp.dir.symLink(testing.io, "two", "link", .{ .is_directory = true });
     try loop.decide(.once);
@@ -7177,8 +6914,7 @@ test "headless allowance leaves protected writes for a person" {
     loop.control_files = &.{"policy.json"};
     fixture.fake.tool_name = "write";
     fixture.fake.tool_arguments = "{\"path\":\"policy.json\",\"content\":\"sample\"}";
-    try loop.submit("write a sample", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "write a sample");
     try testing.expectEqual(State.awaiting_approval, loop.state);
     try loop.decideHeadless(true);
     try settle(&loop);
@@ -7248,8 +6984,7 @@ test "relative policies stay rooted in the project after a directory change" {
     defer loop.deinit();
     loop.hooks = &runner;
     try loop.changeDirectory("sub");
-    try loop.submit("inspect", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "inspect");
     const call = fixture.convo.messages.items[1].tool_calls[0];
     try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
     try testing.expect(std.mem.indexOf(u8, call.result.?, "protected") != null);
@@ -7264,8 +6999,7 @@ test "local model string-encoded numeric arguments remain supported" {
     fixture.fake.tool_arguments = "{\"path\":\"lines.txt\",\"offset\":\"2\",\"limit\":\"1\"}";
     var loop = fixture.loop();
     defer loop.deinit();
-    try loop.submit("read the second line", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "read the second line");
     const call = fixture.convo.messages.items[1].tool_calls[0];
     try testing.expectEqual(Conversation.ToolCall.Status.ok, call.status);
     try testing.expect(std.mem.indexOf(u8, call.result.?, "second") != null);
@@ -7290,20 +7024,19 @@ test "explicit hook asks require a human across modes stages and later batch cal
         fixture.fake.tool_name = "bash";
         fixture.fake.tool_arguments = "{\"command\":\"touch requires-approval\"}";
         fixture.fake.parallel_calls = if (case.second) 2 else 1;
-        const pre: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"ask\"}}'" };
-        const evaluate: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionEvaluate\",\"effect\":\"ask\"}}'" };
-        const later: Hooks.Hook = .{ .legacy = false, .command =
+        const pre: Hooks.Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"ask\"}}'" };
+        const evaluate: Hooks.Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionEvaluate\",\"effect\":\"ask\"}}'" };
+        const later: Hooks.Hook = .{ .command =
             \\read payload; case "$payload" in *'"tool_call_id":"fake-2"'*) printf '%s' '{"hookSpecificOutput":{"hookEventName":"PermissionEvaluate","effect":"ask"}}';; esac
         };
         var set: Hooks.Set = .{
-            .permission_request = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" }},
+            .permission_request = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" }},
         };
         if (case.source == .pre_tool_use) set.pre_tool_use = &.{pre};
         if (case.source == .permission_evaluate) set.permission_evaluate = if (case.second) &.{later} else &.{evaluate};
         const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = set };
         loop.hooks = &runner;
-        try loop.submit("inspect only", .{});
-        try settle(&loop);
+        try submitAndSettle(&loop, "inspect only");
         try testing.expectEqual(State.awaiting_approval, loop.state);
         try testing.expectEqualStrings(if (case.second) "fake-2" else "fake-1", loop.pendingCall().?.id);
         try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "requires-approval", .{}));
@@ -7330,40 +7063,28 @@ test "steering with prompt hooks resolves mentions and retains human provenance"
 }
 
 test "adding a home root never grants automatic writes to hook control files" {
-    for ([_][]const u8{ ".synth/hooks.json", "state/hook-trust.json", "config.json", ".git/hooks/pre-commit", ".git/config", ".git/objects/new" }) |name| {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const a = fixture.scratch.allocator();
+    for ([_][]const u8{ "project", "home/.synth", "home/state", "home/.git/hooks", "home/templates" }) |dir| try fixture.tmp.dir.createDirPath(testing.io, dir);
+    try fixture.tmp.dir.symLink(testing.io, "../templates", "home/.synth/templates", .{ .is_directory = true });
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.project_root = try std.fs.path.join(a, &.{ fixture.root, "project" });
+    const home = try std.fs.path.join(a, &.{ fixture.root, "home" });
+    loop.control_files = &.{ try std.fs.path.join(a, &.{ home, "state/hook-trust.json" }), try std.fs.path.join(a, &.{ home, "config.json" }) };
+    try loop.addDirectory(home, "slash_command");
+    fixture.fake.tool_name = "write";
+    for ([_][]const u8{ ".synth/hooks.json", ".synth/templates/draft", "state/hook-trust.json", "config.json", ".git/hooks/pre-commit", ".git/config", ".git/objects/new" }) |name| {
+        const target = try std.fs.path.join(a, &.{ home, name });
+        fixture.fake.tool_arguments = try std.json.Stringify.valueAlloc(a, .{ .path = target, .content = "test" }, .{});
         for ([_]Config.Approvals{ .ask, .auto, .all }) |mode| {
-            const fixture = try Fixture.init();
-            defer fixture.deinit();
-            try fixture.tmp.dir.createDirPath(testing.io, "project");
-            try fixture.tmp.dir.createDirPath(testing.io, "home/.synth");
-            try fixture.tmp.dir.createDirPath(testing.io, "home/state");
-            try fixture.tmp.dir.createDirPath(testing.io, "home/.git/hooks");
-            const project = try std.fs.path.join(testing.allocator, &.{ fixture.root, "project" });
-            defer testing.allocator.free(project);
-            const home = try std.fs.path.join(testing.allocator, &.{ fixture.root, "home" });
-            defer testing.allocator.free(home);
-            const target = try std.fs.path.join(testing.allocator, &.{ home, name });
-            defer testing.allocator.free(target);
-            const trust = try std.fs.path.join(testing.allocator, &.{ home, "state/hook-trust.json" });
-            defer testing.allocator.free(trust);
-            const config = try std.fs.path.join(testing.allocator, &.{ home, "config.json" });
-            defer testing.allocator.free(config);
-            var loop = fixture.loop();
-            defer loop.deinit();
-            loop.project_root = project;
-            loop.control_files = &.{ trust, config };
             loop.approvals = mode;
-            try loop.addDirectory(home, "slash_command");
-            fixture.fake.tool_name = "write";
-            const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = target, .content = "forged policy" }, .{});
-            defer testing.allocator.free(args);
-            fixture.fake.tool_arguments = args;
-            try loop.submit("update the file", .{});
-            try settle(&loop);
+            try submitAndSettle(&loop, "update the file");
             try testing.expectEqual(State.awaiting_approval, loop.state);
-            try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, target, .{}));
             try loop.decide(.deny);
             try settle(&loop);
+            try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, target, .{}));
         }
     }
 }
@@ -7380,11 +7101,9 @@ test "a referenced hook script requires human approval before editing" {
     loop.hooks = &runner;
     fixture.fake.tool_name = "write";
     fixture.fake.tool_arguments = "{\"path\":\"scripts/check.sh\",\"content\":\"forged policy\"}";
-    try loop.submit("update the script", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "update the script");
     try testing.expectEqual(State.awaiting_approval, loop.state);
-    const original = try fixture.tmp.dir.readFileAlloc(testing.io, "scripts/check.sh", testing.allocator, .limited(1024));
-    defer testing.allocator.free(original);
+    const original = try fixture.readFile("scripts/check.sh");
     try testing.expectEqualStrings("cat >/dev/null\n", original);
     try loop.decide(.deny);
     try settle(&loop);
@@ -7405,8 +7124,7 @@ test "unreviewed hooks reject prompts without retaining or forwarding their text
     try settle(&loop);
     try testing.expectEqual(@as(u64, 0), loop.requests_started);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "leaked-notice", .{}));
-    try loop.submit("new accepted request", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "new accepted request");
     for (fixture.convo.messages.items) |message| try testing.expect(std.mem.indexOf(u8, message.text, "private rejected request") == null);
 }
 
@@ -7430,15 +7148,13 @@ test "reviewer context failures use a per-request human fallback" {
     loop.approvals = .auto;
     fixture.fake.tool_name = "bash";
     fixture.fake.tool_arguments = "{\"command\":\"touch reviewed-after-recovery\"}";
-    try loop.submit("inspect", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "inspect");
     try testing.expectEqual(State.awaiting_approval, loop.state);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "reviewed-after-recovery", .{}));
     try loop.decide(.deny);
     try settle(&loop);
     limited.reject_review = false;
-    try loop.submit("create the file", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "create the file");
     try testing.expectEqual(State.idle, loop.state);
     try fixture.tmp.dir.access(testing.io, "reviewed-after-recovery", .{});
 }
@@ -7451,8 +7167,7 @@ test "an answer within the instruction budget keeps automatic review working" {
     loop.approvals = .auto;
     fixture.fake.tool_name = "ask_user";
     fixture.fake.tool_arguments = "{\"question\":\"Any restrictions?\"}";
-    try loop.submit("inspect", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "inspect");
     try testing.expectEqual(State.awaiting_answer, loop.state);
     const answer_text = try testing.allocator.alloc(u8, 2048);
     defer testing.allocator.free(answer_text);
@@ -7461,8 +7176,7 @@ test "an answer within the instruction budget keeps automatic review working" {
     try settle(&loop);
     fixture.fake.tool_name = "bash";
     fixture.fake.tool_arguments = "{\"command\":\"touch reviewed-answer\"}";
-    try loop.submit("continue", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "continue");
     try testing.expectEqual(State.idle, loop.state);
     try testing.expect(fixture.fake.judged > 0);
     try fixture.tmp.dir.access(testing.io, "reviewed-answer", .{});
@@ -7481,8 +7195,7 @@ test "reading from an outside cwd still requires human approval" {
     try loop.changeDirectory(cwd);
     fixture.fake.tool_name = "read";
     fixture.fake.tool_arguments = "{\"path\":\"secret.txt\"}";
-    try loop.submit("read here", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "read here");
     try testing.expectEqual(State.awaiting_approval, loop.state);
     try loop.decide(.once);
     try settle(&loop);
@@ -7499,10 +7212,9 @@ test "conflicting hook argument spellings reject the call without stalling" {
     loop.approvals = .all;
     fixture.fake.tool_name = "write";
     fixture.fake.tool_arguments = "{\"path\":\"original\",\"content\":\"x\"}";
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"path\":\"one\",\"file_path\":\"two\",\"content\":\"x\"}}}'" }} } };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"path\":\"one\",\"file_path\":\"two\",\"content\":\"x\"}}}'" }} } };
     loop.hooks = &runner;
-    try loop.submit("write", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "write");
     try testing.expectEqual(State.idle, loop.state);
     const call = fixture.convo.messages.items[1].tool_calls[0];
     try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
@@ -7521,16 +7233,14 @@ test "automatic review survives receipt eviction and session resume" {
     fixture.fake.tool_name = "bash";
     fixture.fake.tool_arguments = "{\"command\":\"touch reviewed\"}";
     for (0..20) |_| {
-        try loop.submit("inspect", .{});
-        try settle(&loop);
+        try submitAndSettle(&loop, "inspect");
         try testing.expectEqual(State.awaiting_approval, loop.state);
         try loop.decide(.deny);
         try settle(&loop);
     }
     try loop.resumeSession(loop.session_id.?, 64);
     loop.approvals = .auto;
-    try loop.submit("create reviewed", .{});
-    try settle(&loop);
+    try submitAndSettle(&loop, "create reviewed");
     try testing.expectEqual(State.idle, loop.state);
     try testing.expect(fixture.fake.judged > 0);
     try fixture.tmp.dir.access(testing.io, "reviewed", .{});
@@ -7549,8 +7259,7 @@ test "picked and harness answers never become person instructions" {
         defer loop.deinit();
         fixture.fake.tool_name = "ask_user";
         fixture.fake.tool_arguments = "{\"question\":\"May I send data?\",\"options\":[\"model supplied option\"]}";
-        try loop.submit("inspect only", .{});
-        try settle(&loop);
+        try submitAndSettle(&loop, "inspect only");
         try loop.answerWithSource(response);
         try settle(&loop);
         const snapshot = try loop.human_intent.snapshot(testing.allocator);

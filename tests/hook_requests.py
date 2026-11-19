@@ -143,13 +143,13 @@ def main():
         assert 'Usage:' in result.stderr and 'stack trace' not in result.stderr.lower(), result.stderr
     print('PASS hook CLI usage errors exit 2 with usage')
     def inline_policy(config, _):
-        config['hooks'] = {'PreToolUse': [{'command': 'true'}]}
+        config['hooks'] = {'PreToolUse': [{'hooks': [{'command': 'true'}]}]}
     with session('config-source', lambda *_: chat('config hook trusted'), configure=inline_policy) as (_, result, requests, _):
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert len(requests) == 1
         expect(result, 'config hook trusted')
     print('PASS config-sourced hook trust survives separate CLI processes')
-    with session('missing-stop', lambda *_: chat('finished'), extra_hooks=lambda _: {'Stop': [{'command': '/synth-does-not-exist'}]}) as (_, result, requests, _):
+    with session('missing-stop', lambda *_: chat('finished'), extra_hooks=lambda _: {'Stop': [{'hooks': [{'command': '/synth-does-not-exist'}]}]}) as (_, result, requests, _):
         assert result.returncode != 0, (result.stdout, result.stderr)
         assert len(requests) == 1
         expect(result, 'HookCommandUnavailable')

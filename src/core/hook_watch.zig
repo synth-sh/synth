@@ -13,7 +13,7 @@ const Entry = struct {
     pending: ?[]const u8 = null,
 };
 
-pub const Change = struct { path: []const u8, event: Hooks.Event, source: []const u8, kind: []const u8 };
+pub const Change = struct { path: []const u8, source: []const u8, kind: []const u8 };
 
 entries: std.ArrayList(Entry) = .empty,
 last_poll_ms: ?i64 = null,
@@ -24,7 +24,7 @@ pub fn deinit(self: *Watch, allocator: std.mem.Allocator) void {
     self.* = .{};
 }
 
-pub fn configure(self: *Watch, allocator: std.mem.Allocator, io: std.Io, root: []const u8, config_path: []const u8, home: ?[]const u8, set: Hooks.Set, available: []const skills.Skill) !void {
+pub fn configure(self: *Watch, allocator: std.mem.Allocator, io: std.Io, root: []const u8, config_path: []const u8, home: ?[]const u8, set: Hooks.Set, available: []const skills.Skill, reviewed_config_paths: []const []const u8) !void {
     var next: Watch = .{};
     errdefer next.deinit(allocator);
     if (set.config_change.len > 0) {
@@ -50,6 +50,20 @@ pub fn configure(self: *Watch, allocator: std.mem.Allocator, io: std.Io, root: [
             const path = try std.fs.path.join(allocator, &.{ root, name });
             defer allocator.free(path);
             try next.add(allocator, io, path, .file_changed, "");
+        }
+    }
+    keep: for (next.entries.items) |*entry| {
+        if (entry.event == .config_change) {
+            for (reviewed_config_paths) |path| {
+                if (std.mem.eql(u8, entry.path, path)) continue :keep;
+            }
+        }
+        for (self.entries.items) |old| {
+            if (entry.event == old.event and std.mem.eql(u8, entry.path, old.path)) {
+                entry.stamp = old.stamp;
+                entry.pending = old.pending;
+                break;
+            }
         }
     }
     self.deinit(allocator);
@@ -90,7 +104,7 @@ pub fn take(self: *Watch, event: Hooks.Event) ?Change {
         if (entry.event != event) continue;
         const kind = entry.pending orelse continue;
         entry.pending = null;
-        return .{ .path = entry.path, .event = entry.event, .source = entry.source, .kind = kind };
+        return .{ .path = entry.path, .source = entry.source, .kind = kind };
     }
     return null;
 }
@@ -104,16 +118,30 @@ test "watched files report external add change and removal once" {
     const root = buf[0..try tmp.dir.realPath(io, &buf)];
     var watch: Watch = .{};
     defer watch.deinit(a);
-    try watch.configure(a, io, root, "", null, .{ .file_changed = &.{.{ .matcher = ".env", .command = "true" }} }, &.{});
+    const config_path = try std.fs.path.join(a, &.{ root, "config.json" });
+    defer a.free(config_path);
+    const set: Hooks.Set = .{ .file_changed = &.{.{ .matcher = ".env", .command = "true" }}, .config_change = &.{.{ .command = "true" }} };
+    try watch.configure(a, io, root, config_path, null, set, &.{}, &.{});
     try watch.poll(io, true);
     try std.testing.expect(watch.take(.file_changed) == null);
+
     try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "first" });
+    try watch.configure(a, io, root, config_path, null, set, &.{}, &.{});
     try watch.poll(io, true);
-    try std.testing.expectEqualStrings("add", watch.take(.file_changed).?.kind);
+    const added = watch.take(.file_changed) orelse return error.MissedFileAddition;
+    try std.testing.expectEqualStrings("add", added.kind);
     try std.testing.expect(watch.take(.file_changed) == null);
+
     try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "second value" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "reviewed" });
     try watch.poll(io, true);
-    try std.testing.expectEqualStrings("change", watch.take(.file_changed).?.kind);
+    try watch.configure(a, io, root, config_path, null, set, &.{}, &.{config_path});
+    const changed = watch.take(.file_changed) orelse return error.MissedFileChange;
+    try std.testing.expectEqualStrings("change", changed.kind);
+    try watch.poll(io, true);
+    try std.testing.expect(watch.take(.config_change) == null);
+    try std.testing.expect(watch.take(.file_changed) == null);
+
     try tmp.dir.deleteFile(io, ".env");
     try watch.poll(io, true);
     try std.testing.expectEqualStrings("unlink", watch.take(.file_changed).?.kind);

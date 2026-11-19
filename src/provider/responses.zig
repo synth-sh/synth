@@ -656,7 +656,7 @@ test "first-event adapter failures stay distinct from transport failures" {
     for (cases) |case| {
         var arena: std.heap.ArenaAllocator = .init(a);
         defer arena.deinit();
-        const runner: @import("../core/hooks.zig").Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .http_response = &.{.{ .legacy = false, .stream = true, .command = case.command }} } };
+        const runner: @import("../core/hooks.zig").Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .http_response = &.{.{ .stream = true, .command = case.command }} } };
         var http: HttpHooks.Exchange = .{ .runner = &runner, .input = .{ .event = .pre_model_request, .request_purpose = .approval_judge }, .url = "http://localhost/responses", .protocol = "responses", .stop = null };
         var stream: ResponseStream = .init(a, null);
         defer stream.deinit();

@@ -30,6 +30,12 @@ pub const Result = struct {
         self.* = .{};
     }
 
+    pub fn takeBlocked(self: *Result) ?[]u8 {
+        const reason_text = self.blocked;
+        self.blocked = null;
+        return reason_text;
+    }
+
     fn decide(self: *Result, value: Permission) void {
         if (value == .deny or self.permission == null or (value == .ask and self.permission != .deny)) self.permission = value;
     }
@@ -138,8 +144,9 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8, event: Event) !Re
             const decision = try text(value);
             if (!event.oneOf(&.{ .pre_tool_use, .post_tool_use, .user_prompt_submit, .stop, .subagent_stop, .post_tool_batch, .task_created, .task_completed, .pre_model_switch, .user_prompt_expansion, .config_change })) return error.UnsupportedHookEffect;
             if (std.mem.eql(u8, decision, "block")) {
+                const blocked = try reason(allocator, root, "reason");
                 if (result.blocked) |old| allocator.free(old);
-                result.blocked = try reason(allocator, root, "reason");
+                result.blocked = blocked;
             } else if (event == .pre_tool_use and std.mem.eql(u8, decision, "approve")) {
                 result.decide(.allow);
             } else return error.InvalidHookOutput;
@@ -273,56 +280,28 @@ fn oneOf(value: []const u8, choices: []const []const u8) bool {
     return false;
 }
 
-test "structured policy validates events types and effects" {
-    const a = std.testing.allocator;
-    var result = try parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"updatedInput\":{\"command\":\"echo ok\"},\"additionalContext\":\"context\"}}", .pre_tool_use);
-    defer result.deinit(a);
-    try std.testing.expect(result.blocked != null);
-    try std.testing.expectEqualStrings("{\"command\":\"echo ok\"}", result.replacement.?);
-    try std.testing.expectError(error.InvalidHookOutput, parse(a, "{\"continue\":1}", .stop));
-    try std.testing.expectError(error.InvalidHookEvent, parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"Stop\"}}", .pre_tool_use));
-    try std.testing.expectError(error.UnsupportedHookEffect, parse(a, "{\"unknown\":true}", .stop));
-}
-
-test "pinned event result compatibility fixtures" {
+test "hook result fixtures accept only the effects supported by each event" {
+    const Case = struct { event: []const u8, output: std.json.Value, expected: ?std.json.Value = null, error_name: ?[]const u8 = null };
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const fixtures = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/results.json"), .{});
-    for (fixtures.array.items) |fixture| {
-        const event = Event.fromName(fixture.object.get("event").?.string) orelse return error.InvalidHookEvent;
-        const encoded = try std.json.Stringify.valueAlloc(a, fixture.object.get("output").?, .{});
-        if (fixture.object.contains("invalid")) {
-            if (parse(a, encoded, event)) |_| return error.InvalidFixtureAccepted else |_| {}
+    const cases = try std.json.parseFromSliceLeaky([]Case, a, @embedFile("fixtures/hooks/results.json"), .{});
+    for (cases) |case| {
+        const event = Event.fromName(case.event) orelse return error.InvalidHookEvent;
+        const encoded = try std.json.Stringify.valueAlloc(a, case.output, .{});
+        var result = parse(std.testing.allocator, encoded, event) catch |err| {
+            if (case.expected != null or err == error.OutOfMemory) return err;
+            if (case.error_name) |name| try std.testing.expectEqualStrings(name, @errorName(err));
             continue;
-        }
-        var result = try parse(std.testing.allocator, encoded, event);
+        };
         defer result.deinit(std.testing.allocator);
-        try std.testing.expectEqual(fixture.object.contains("blocked"), result.blocked != null);
-        try std.testing.expectEqual(fixture.object.contains("context"), result.context != null);
-        try std.testing.expectEqual(fixture.object.contains("replacement"), result.replacement != null);
-        try std.testing.expectEqual(fixture.object.contains("feedback"), result.feedback != null);
-        try std.testing.expectEqual(fixture.object.contains("display"), result.display_content != null);
-        try std.testing.expectEqual(fixture.object.contains("retry"), result.retry);
-        var expected = fixture.object.get("expected").?.object.iterator();
-        while (expected.next()) |field| {
-            inline for (std.meta.fields(Result)) |member| {
-                if (std.mem.eql(u8, member.name, field.key_ptr.*)) {
-                    const value = @field(result, member.name);
-                    if (comptime member.type == ?[]u8) {
-                        if (field.value_ptr.* == .null) {
-                            try std.testing.expect(value == null);
-                        } else {
-                            const actual = value orelse return error.MissingHookResult;
-                            const want = if (field.value_ptr.* == .string) field.value_ptr.string else try std.json.Stringify.valueAlloc(a, field.value_ptr.*, .{});
-                            try std.testing.expectEqualStrings(want, actual);
-                        }
-                    } else {
-                        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, field.value_ptr.*, .{}), try std.json.Stringify.valueAlloc(a, value, .{}));
-                    }
-                }
-            }
+        const expected = case.expected orelse return error.InvalidFixtureAccepted;
+        for (expected.object.values()) |*value| {
+            if (value.* != .object and value.* != .array) continue;
+            const json = try std.json.Stringify.valueAlloc(a, value.*, .{});
+            value.* = .{ .string = json };
         }
+        try std.testing.expectEqualDeep(try std.json.parseFromValueLeaky(Result, a, expected, .{}), result);
     }
 }
 
@@ -370,12 +349,4 @@ test "null optional context fields do not erase restrictions during composition"
         try std.testing.expectEqualStrings("read", parsed.value.tools.?[0]);
         try std.testing.expectEqualStrings("prepared", parsed.value.system.?);
     }
-}
-
-test "a deferred pre-tool decision leaves ordinary permission review in control" {
-    const a = std.testing.allocator;
-    var result = try parse(a, "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"defer\"}}", .pre_tool_use);
-    defer result.deinit(a);
-    try std.testing.expect(result.permission == null);
-    try std.testing.expect(result.blocked == null);
 }

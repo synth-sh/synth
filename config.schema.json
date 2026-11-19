@@ -115,14 +115,7 @@
                 "SessionEnd": {
                     "type": "array",
                     "items": {
-                        "oneOf": [
-                            {
-                                "$ref": "#/$defs/hook"
-                            },
-                            {
-                                "$ref": "#/$defs/sessionEndHookGroup"
-                            }
-                        ]
+                        "$ref": "#/$defs/sessionEndHookGroup"
                     }
                 },
                 "UserPromptSubmit": {
@@ -231,7 +224,7 @@
                     "$ref": "#/$defs/hookList"
                 }
             },
-            "description": "Additive lifecycle hooks. Every definition needs explicit trust after upgrade or changes."
+            "description": "Additive lifecycle hooks. Each new or changed declaration requires explicit trust."
         },
         "hook_timeout_ms": {
             "type": "integer",
@@ -338,46 +331,6 @@
         }
     },
     "$defs": {
-        "hook": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "command"
-            ],
-            "properties": {
-                "matcher": {
-                    "type": "string",
-                    "default": "",
-                    "description": "Exact tool name to match. Empty or absent matches every tool."
-                },
-                "command": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Shell command run from the original project root."
-                },
-                "timeout_ms": {
-                    "$ref": "#/$defs/hookTimeoutMs"
-                },
-                "transcript": {
-                    "$ref": "#/$defs/hookTranscript"
-                },
-                "when": {
-                    "$ref": "#/$defs/hookWhen"
-                },
-                "stream": {
-                    "$ref": "#/$defs/hookStream"
-                },
-                "timeout": {
-                    "$ref": "#/$defs/hookTimeout"
-                }
-            },
-            "not": {
-                "required": [
-                    "timeout",
-                    "timeout_ms"
-                ]
-            }
-        },
         "mcpServer": {
             "type": "object",
             "minProperties": 1,
@@ -465,7 +418,8 @@
                 },
                 "command": {
                     "type": "string",
-                    "minLength": 1
+                    "minLength": 1,
+                    "description": "Shell command run from the original project root."
                 },
                 "timeout_ms": {
                     "$ref": "#/$defs/hookTimeoutMs"
@@ -728,14 +682,7 @@
         "hookList": {
             "type": "array",
             "items": {
-                "oneOf": [
-                    {
-                        "$ref": "#/$defs/hook"
-                    },
-                    {
-                        "$ref": "#/$defs/hookGroup"
-                    }
-                ]
+                "$ref": "#/$defs/hookGroup"
             }
         },
         "hookTimeoutMs": {

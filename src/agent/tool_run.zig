@@ -633,7 +633,7 @@ test "a running call's progress reaches the owner while it is still running" {
     try testing.expectEqualStrings("nearly there", seen.text());
 }
 
-test "grouped post hooks distinguish success and failure while legacy hooks retain both" {
+test "post hooks distinguish success and failure" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -645,10 +645,9 @@ test "grouped post hooks distinguish success and failure while legacy hooks reta
     defer reads.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{
         .post_tool_use = &.{
-            .{ .command = "cat >> legacy.jsonl" },
-            .{ .legacy = false, .command = "cat >> success.jsonl" },
+            .{ .command = "cat >> success.jsonl" },
         },
-        .post_tool_use_failure = &.{.{ .legacy = false, .command = "cat >> failure.jsonl" }},
+        .post_tool_use_failure = &.{.{ .command = "cat >> failure.jsonl" }},
     } };
     const calls = [_]Call{
         .{ .index = 0, .name = "list", .arguments = "{}", .hook_input = .{ .event = .post_tool_use, .tool_call_id = "ok" } },
@@ -661,8 +660,6 @@ test "grouped post hooks distinguish success and failure while legacy hooks reta
     defer a.free(success);
     const failure = try tmp.dir.readFileAlloc(testing.io, "failure.jsonl", a, .limited(16 * 1024));
     defer a.free(failure);
-    const old = try tmp.dir.readFileAlloc(testing.io, "legacy.jsonl", a, .limited(16 * 1024));
-    defer a.free(old);
     const ok = try std.json.parseFromSlice(std.json.Value, a, success, .{});
     defer ok.deinit();
     const bad = try std.json.parseFromSlice(std.json.Value, a, failure, .{});
@@ -672,6 +669,4 @@ test "grouped post hooks distinguish success and failure while legacy hooks reta
     try testing.expectEqualStrings("PostToolUseFailure", bad.value.object.get("hook_event_name").?.string);
     try testing.expectEqualStrings("bad", bad.value.object.get("tool_call_id").?.string);
     try testing.expectEqualStrings("unknown tool 'not-a-tool'", bad.value.object.get("error").?.string);
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, old, "hook_event_name"));
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, old, "\"PostToolUse\""));
 }

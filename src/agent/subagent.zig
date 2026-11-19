@@ -897,8 +897,8 @@ test "subagent lifecycle context and continuation retain child identity" {
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
     harness.parent.project_root = root;
-    const start_hook: Hooks.Hook = .{ .legacy = false, .command = "read -r payload; printf '%s\\n' \"$payload\" >> child-events; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\",\"additionalContext\":\"child context\"}}'" };
-    const stop_hook: Hooks.Hook = .{ .legacy = false, .command = "read -r payload; printf '%s\\n' \"$payload\" >> child-events; if [ ! -e continued ]; then : > continued; printf '%s' '{\"decision\":\"block\",\"reason\":\"check once more\"}'; fi" };
+    const start_hook: Hooks.Hook = .{ .command = "read -r payload; printf '%s\\n' \"$payload\" >> child-events; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\",\"additionalContext\":\"child context\"}}'" };
+    const stop_hook: Hooks.Hook = .{ .command = "read -r payload; printf '%s\\n' \"$payload\" >> child-events; if [ ! -e continued ]; then : > continued; printf '%s' '{\"decision\":\"block\",\"reason\":\"check once more\"}'; fi" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .subagent_start = &.{start_hook}, .subagent_stop = &.{stop_hook} } };
     harness.parent.hooks = &runner;
     harness.fake.script = &.{.{ .text = "done" }};

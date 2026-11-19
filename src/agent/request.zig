@@ -344,7 +344,7 @@ test "MessageDisplay streams complete lines and preserves provider reply text" {
     var marker: u8 = 0;
     const provider: Provider = .{ .name = "streaming", .userdata = &marker, .respond = Streaming.respond };
     const Hooks = @import("../core/hooks.zig");
-    const runner: Hooks.Runner = .{ .io = io, .root = root, .set = .{ .message_display = &.{.{ .legacy = false, .command = "cat >> displayed.jsonl; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"MessageDisplay\",\"displayContent\":\"shown\"}}'" }} } };
+    const runner: Hooks.Runner = .{ .io = io, .root = root, .set = .{ .message_display = &.{.{ .command = "cat >> displayed.jsonl; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"MessageDisplay\",\"displayContent\":\"shown\"}}'" }} } };
     var convo = Conversation.init(a);
     defer convo.deinit();
     const request = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner, .display_messages = true, .hook_input = .{ .event = .pre_model_request, .agent_id = "agent", .request_id = 2 } });
@@ -395,7 +395,7 @@ test "MessageDisplay failure is fail-open and internal requests do not display" 
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(io, &buf)];
-    const runner: Hooks.Runner = .{ .io = io, .root = root, .set = .{ .message_display = &.{.{ .legacy = false, .command = "touch displayed; printf malformed" }} } };
+    const runner: Hooks.Runner = .{ .io = io, .root = root, .set = .{ .message_display = &.{.{ .command = "touch displayed; printf malformed" }} } };
     var convo = Conversation.init(a);
     defer convo.deinit();
     const request = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner, .display_messages = true });
@@ -415,7 +415,7 @@ test "context edits preserve reference history and cannot rewrite reviewer evide
     const a = std.testing.allocator;
     const io = std.testing.io;
     const Hooks = @import("../core/hooks.zig");
-    const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{ .model_context = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelContext\",\"contextEdits\":[{\"seq\":42,\"text\":\"prepared\"}]}}'" }} } };
+    const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{ .model_context = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelContext\",\"contextEdits\":[{\"seq\":42,\"text\":\"prepared\"}]}}'" }} } };
     const Fake = struct {
         fn respond(_: *anyopaque, convo: *Conversation, _: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
             try std.testing.expectEqual(@as(u64, 42), convo.messages.items[0].seq);
@@ -447,8 +447,8 @@ test "request settings and retry hooks enforce bounds before transport" {
     const io = std.testing.io;
     const Hooks = @import("../core/hooks.zig");
     const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{
-        .model_settings = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelSettings\",\"settings\":{\"temperature\":0.25,\"max_output_tokens\":128,\"attempts\":2}}}'" }},
-        .model_retry = &.{.{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelRetry\",\"retryDelayMs\":7}}'" }},
+        .model_settings = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelSettings\",\"settings\":{\"temperature\":0.25,\"max_output_tokens\":128,\"attempts\":2}}}'" }},
+        .model_retry = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelRetry\",\"retryDelayMs\":7}}'" }},
     } };
     const Fake = struct {
         fn respond(_: *anyopaque, _: *Conversation, turn: Provider.Turn, _: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {

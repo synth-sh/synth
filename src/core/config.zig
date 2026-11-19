@@ -575,7 +575,7 @@ test "lifecycle hooks are read from the file" {
     defer testing.allocator.free(path);
 
     const source =
-        \\{"hook_timeout_ms":5000,"hooks":{"PreToolUse":[{"matcher":"bash","command":"./check.sh"}]}}
+        \\{"hook_timeout_ms":5000,"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"command":"./check.sh"}]}]}}
     ;
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = source });
 
@@ -593,7 +593,7 @@ test "configured hooks keep their source after the caller reuses the path" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"hooks\":{\"PreToolUse\":[{\"command\":\"true\"}]}}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"command\":\"true\"}]}]}}" });
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(root);
     const path = try std.fs.path.join(a, &.{ root, "config.json" });
