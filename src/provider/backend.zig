@@ -226,21 +226,14 @@ pub const Spawned = struct {
             if (!found) return error.UnsupportedModelSettings;
             if (selected_provider.set_effort) |set| set(selected_provider.userdata, effort) else return error.UnsupportedModelSettings;
         };
-        switch (self.backend.client) {
-            .copilot => |*client| {
-                if (value.attempts) |n| client.inner.retries.attempts = n;
-                if (value.retry_delay_ms) |n| {
-                    client.inner.retries.base_ms = n;
-                    client.inner.retries.max_ms = n;
-                }
-            },
-            inline else => |*client| {
-                if (value.attempts) |n| client.retries.attempts = n;
-                if (value.retry_delay_ms) |n| {
-                    client.retries.base_ms = n;
-                    client.retries.max_ms = n;
-                }
-            },
+        const retries = switch (self.backend.client) {
+            .copilot => |*client| &client.inner.retries,
+            inline else => |*client| &client.retries,
+        };
+        if (value.attempts) |n| retries.attempts = n;
+        if (value.retry_delay_ms) |n| {
+            retries.base_ms = n;
+            retries.max_ms = n;
         }
     }
 

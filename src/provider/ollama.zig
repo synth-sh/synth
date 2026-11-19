@@ -494,27 +494,6 @@ pub fn describeError(
     );
 }
 
-/// Whether a complaint is about the size of the request, which is the one kind
-/// the harness can do something about without being told.
-/// Whether a refused request is worth sending again, waiting if so.
-///
-/// The ollama package hands back an error rather than a status, so the
-/// rejection body is all there is to go on. It is only consulted for what a
-/// rate limit or an outage actually says, so a refusal is never mistaken for
-/// congestion.
-fn waitAndRetry(
-    self: *OllamaProvider,
-    attempt: usize,
-    why: []const u8,
-    sink: ?Provider.Sink,
-) bool {
-    return retry.wait(self.io, self.retries, sink, .{
-        .status = self.last_status,
-        .attempt = attempt,
-        .message = why,
-        .retryable = retry.transient(self.last_status) or retry.transientText(why),
-    });
-}
 fn isOverflow(why: []const u8) bool {
     return Provider.mentionsOverflow(why);
 }
@@ -757,7 +736,12 @@ fn respond(
             hook_attempt.?.error_message = @errorName(err);
             hook_attempt.?.finish();
 
-            if (err == error.HttpError and self.waitAndRetry(sends, why, sink)) {
+            if (err == error.HttpError and retry.wait(self.io, self.retries, sink, .{
+                .status = self.last_status,
+                .attempt = sends,
+                .message = why,
+                .retryable = retry.transient(self.last_status) or retry.transientText(why),
+            })) {
                 sends += 1;
                 continue;
             }
