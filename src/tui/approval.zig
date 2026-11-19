@@ -124,20 +124,7 @@ pub fn draw(self: *Approval, ctx: vxfw.DrawContext, parent: vxfw.Widget, args: D
         try changeSummary(ctx.arena, c)
     else
         try argumentLines(ctx.arena, args.arguments, @min(available, max_summary_width));
-    var lines: std.ArrayList(Line) = .empty;
-    if (args.prepared_action) |snapshot| {
-        const Action = struct { cwd: []const u8, resolved_targets: []const []const u8 };
-        const parsed = std.json.parseFromSliceLeaky(Action, ctx.arena, snapshot, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        if (parsed) |action| {
-            try lines.append(ctx.arena, .{ .kind = .value, .indent = 0, .text = try std.fmt.allocPrint(ctx.arena, "cwd: {s}", .{action.cwd}) });
-            for (action.resolved_targets) |target| try lines.append(ctx.arena, .{ .kind = .value, .indent = 0, .text = try std.fmt.allocPrint(ctx.arena, "target: {s}", .{target}) });
-        }
-    }
-    try lines.appendSlice(ctx.arena, argument_body);
-    const body = lines.items;
+    const body = try withPreparedTargets(ctx.arena, args.prepared_action, argument_body);
     const body_height: u16 = @intCast(body.len);
 
     const height: u16 = pad_top + 3 + body_height + 3 + pad_bottom;
@@ -187,6 +174,22 @@ pub fn draw(self: *Approval, ctx: vxfw.DrawContext, parent: vxfw.Widget, args: D
 
     self.drawButtons(surface, height - 1 - pad_bottom, self.selected == .always and args.proposals.len > 1);
     return surface;
+}
+
+fn withPreparedTargets(arena: std.mem.Allocator, snapshot: ?[]const u8, arguments: []const Line) ![]const Line {
+    const Action = struct { cwd: []const u8, resolved_targets: []const []const u8 };
+    const action = std.json.parseFromSliceLeaky(Action, arena, snapshot orelse return arguments, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return arguments,
+    };
+    const action_lines = 1 + action.resolved_targets.len;
+    const lines = try arena.alloc(Line, action_lines + arguments.len);
+    lines[0] = .{ .kind = .value, .indent = 0, .text = try std.fmt.allocPrint(arena, "cwd: {s}", .{action.cwd}) };
+    for (action.resolved_targets, lines[1..action_lines]) |target, *line| {
+        line.* = .{ .kind = .value, .indent = 0, .text = try std.fmt.allocPrint(arena, "target: {s}", .{target}) };
+    }
+    @memcpy(lines[action_lines..], arguments);
+    return lines;
 }
 
 /// What the highlighted choice does, and how loudly to say it. "Allow always"
