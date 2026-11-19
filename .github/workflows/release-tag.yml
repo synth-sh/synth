@@ -21,8 +21,6 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
@@ -47,25 +45,7 @@ jobs:
             exit 1
           fi
 
-          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${tag}^" 2>/dev/null || true)
-          if [ -n "$previous" ]; then
-            span="${previous}..${tag}"
-            from=$(git rev-parse --short "$previous")
-          else
-            span="$tag"
-            from=$(git rev-parse --short "$(git rev-list --max-parents=0 "$tag" | tail -1)")
-          fi
-
-          commits=$(git log --no-merges -n 20 --pretty=format:'- %s (%h)' "$span")
-          range="Full history: ${from}...$(git rev-parse --short "$tag")"
-
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "range=$range" >> "$GITHUB_OUTPUT"
-          {
-            echo "commits<<SYNTH_EOF"
-            echo "$commits"
-            echo "SYNTH_EOF"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Build every target
         run: zig build release
@@ -74,27 +54,10 @@ jobs:
         run: ./.github/scripts/package.sh "${{ steps.vars.outputs.version }}"
 
       - name: Publish Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: release/*
-          name: synth v${{ steps.vars.outputs.version }}
-          tag_name: ${{ github.ref_name }}
-          prerelease: false
-          make_latest: true
-          draft: false
-          fail_on_unmatched_files: true
-          overwrite_files: false
-          body: |
-            ## Changes
-
-            ${{ steps.vars.outputs.commits }}
-
-            ${{ steps.vars.outputs.range }}
-
-            ## Install
-
-            ```sh
-            tar -xzf synth-${{ steps.vars.outputs.version }}-<target>.tar.gz
-            install -m755 synth /usr/local/bin/synth
-            ```
-          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --verify-tag --latest \
+            --title "synth v${{ steps.vars.outputs.version }}" \
+            --generate-notes
