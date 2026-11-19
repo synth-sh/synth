@@ -2,6 +2,17 @@ const std = @import("std");
 
 const paths = @import("paths.zig");
 
+pub const path_fields = [_][]const u8{ "path", "file" };
+
+pub fn resolvedTargets(io: std.Io, arena: std.mem.Allocator, cwd: []const u8, input: std.json.ObjectMap) ![]const []const u8 {
+    var targets: std.ArrayList([]const u8) = .empty;
+    for (path_fields) |field| {
+        const value = input.get(field) orelse continue;
+        if (value == .string) try targets.append(arena, try paths.resolve(io, arena, cwd, value.string));
+    }
+    return targets.items;
+}
+
 pub fn verify(io: std.Io, a: std.mem.Allocator, cwd: []const u8, name: []const u8, arguments: []const u8, snapshot: []const u8) !void {
     const Action = struct { tool: []const u8, arguments: std.json.Value, cwd: []const u8, resolved_targets: []const []const u8 };
     const approved = try std.json.parseFromSliceLeaky(Action, a, snapshot, .{ .ignore_unknown_fields = true });
@@ -11,16 +22,11 @@ pub fn verify(io: std.Io, a: std.mem.Allocator, cwd: []const u8, name: []const u
     const effective = try std.json.Stringify.valueAlloc(a, input, .{});
     const expected = try std.json.Stringify.valueAlloc(a, approved.arguments, .{});
     if (!std.mem.eql(u8, effective, expected)) return error.ApprovedActionChanged;
-    var i: usize = 0;
-    for ([_][]const u8{ "path", "file" }) |field| {
-        if (input.object.get(field)) |value| {
-            if (value != .string) continue;
-            const target = try paths.resolve(io, a, cwd, value.string);
-            if (i >= approved.resolved_targets.len or !std.mem.eql(u8, target, approved.resolved_targets[i])) return error.ApprovedActionChanged;
-            i += 1;
-        }
+    const targets = try resolvedTargets(io, a, cwd, input.object);
+    if (targets.len != approved.resolved_targets.len) return error.ApprovedActionChanged;
+    for (targets, approved.resolved_targets) |actual, expected_target| {
+        if (!std.mem.eql(u8, actual, expected_target)) return error.ApprovedActionChanged;
     }
-    if (i != approved.resolved_targets.len) return error.ApprovedActionChanged;
 }
 
 test "worker verification detects retargeted paths after approval" {
