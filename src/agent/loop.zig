@@ -277,9 +277,8 @@ auto_compact_at: f64 = 0.85,
 /// Set while the outstanding request is a summarisation rather than a turn.
 compacting: bool = false,
 resume_after_compaction: bool = false,
-/// Whether this turn already bought itself room by compacting. One recovery is
-/// a full context; a second in the same turn means it will never fit.
-recovered_from_overflow: bool = false,
+/// A second attempt before a regular reply would just summarize the same context again.
+compacted_since_reply: bool = false,
 
 pub const Usage = struct {
     /// Latest reported input plus output, including opaque reasoning tokens.
@@ -778,7 +777,7 @@ fn startCompaction(self: *Loop, resume_turn: bool) !void {
     );
     self.requests_started += 1;
     self.compacting = true;
-    if (resume_turn) self.recovered_from_overflow = true;
+    if (resume_turn) self.compacted_since_reply = true;
     self.resume_after_compaction = resume_turn;
     self.state = .compacting;
 }
@@ -854,7 +853,7 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
 fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.recordUserPrompt(prompt, extras);
     self.steps = 0;
-    self.recovered_from_overflow = false;
+    self.compacted_since_reply = false;
     self.repeats = 0;
     self.outcome = null;
     self.turn_start_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
@@ -1007,7 +1006,7 @@ pub fn loadToolResult(self: *Loop, msg: *Conversation.Message, call_index: usize
 fn ask(self: *Loop) !void {
     try self.applySteering();
     if (self.overBudget()) |reason| return self.stop(reason);
-    const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
+    const may_recover = self.auto_compact_at > 0 and !self.compacted_since_reply;
     if (may_recover and self.shouldCompact()) return self.startCompaction(true);
     if (!try self.contextFits(self.turn(""))) {
         if (!may_recover) return self.stop(context_full_notice);
@@ -1261,7 +1260,7 @@ fn pollRequest(self: *Loop) !bool {
         self.last_error = err;
 
         const server_refused_the_size = err == error.ContextTooLarge and !self.compacting;
-        const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
+        const may_recover = self.auto_compact_at > 0 and !self.compacted_since_reply;
         if (server_refused_the_size and may_recover) {
             try self.startCompaction(true);
             return true;
@@ -1314,6 +1313,7 @@ fn pollRequest(self: *Loop) !bool {
         .provider_state = reply.provider_state,
     });
     try self.persistMessage(self.conversation.messages.items.len - 1);
+    self.compacted_since_reply = false;
 
     if (reply.tool_calls.len == 0) {
         self.finish(.done);
@@ -3800,20 +3800,25 @@ test "a turn carries the agent's prompt and tools, not the provider's" {
     try testing.expectEqualStrings("summarise", with_project.instruction);
 }
 
-test "a tool turn compacts with its task intact and continues without another user message" {
+test "a tool turn can compact more than once without another user message" {
     const Script = struct {
         calls: usize = 0,
         fail_compaction: bool = false,
         fn respond(ptr: *anyopaque, convo: *Conversation, asked: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            if (self.calls == 1) {
+            if (self.calls == 1 or self.calls == 3) {
                 try testing.expect(!asked.compacting);
+                if (self.calls == 3) try testing.expectEqual(Conversation.Role.system, convo.last().?.role);
                 const calls = try allocator.alloc(Conversation.ToolCall, 1);
-                calls[0] = .{ .id = try allocator.dupe(u8, "list-1"), .name = try allocator.dupe(u8, "list"), .arguments = try allocator.dupe(u8, "{\"path\":\".\"}") };
+                calls[0] = .{
+                    .id = try std.fmt.allocPrint(allocator, "list-{d}", .{self.calls}),
+                    .name = try allocator.dupe(u8, "list"),
+                    .arguments = try allocator.dupe(u8, "{\"path\":\".\"}"),
+                };
                 return .{ .text = try allocator.dupe(u8, "checking files"), .tool_calls = calls, .usage = .{ .prompt_tokens = 30000 } };
             }
-            if (self.calls == 2) {
+            if (self.calls == 2 or self.calls == 4) {
                 try testing.expect(asked.compacting);
                 try testing.expectEqualStrings("", asked.tools_json);
                 try testing.expectEqualStrings("Implement catalog caching. Keep the original task throughout the tool run.", convo.messages.items[0].text);
@@ -3848,12 +3853,38 @@ test "a tool turn compacts with its task intact and continues without another us
                 try testing.expectEqual(Outcome.failed, loop.outcome.?);
                 try testing.expectEqual(Conversation.Role.user, fixture.convo.messages.items[0].role);
             } else {
-                try testing.expectEqual(@as(usize, 3), script.calls);
+                try testing.expectEqual(@as(usize, 5), script.calls);
                 try testing.expectEqualStrings("implemented", lastAssistant(&fixture.convo).?.text);
                 try testing.expectEqual(Outcome.done, loop.outcome.?);
             }
         }
     }
+}
+
+test "an oversized compaction summary is not summarized again before a reply" {
+    const Script = struct {
+        calls: usize = 0,
+        fn respond(ptr: *anyopaque, _: *Conversation, asked: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try testing.expect(asked.compacting);
+            return .{ .text = try allocator.dupe(u8, "summary of progress " ** 1000) };
+        }
+    };
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var script: Script = .{};
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.system_prompt = "";
+    loop.auto_compact_at = 0.5;
+    loop.provider = .{ .name = "script", .userdata = &script, .respond = Script.respond, .context_limit = 4000 };
+
+    try loop.submit("task detail " ** 800, .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 1), script.calls);
+    try testing.expectEqual(Outcome.halted, loop.outcome.?);
+    try testing.expectEqualStrings(context_full_notice, lastAssistant(&fixture.convo).?.text);
 }
 
 test "a full context stops without sending a truncated request when auto-compaction is disabled" {
