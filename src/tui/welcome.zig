@@ -46,10 +46,10 @@ pub fn draw(ctx: vxfw.DrawContext, widget: vxfw.Widget, width: u16, height: u16)
     const surface = try w.surfaceClamped(ctx.arena, widget, size);
     w.fill(surface, theme.base.cell);
     const edge = theme.on_bg(theme.fg_muted).cell;
-    _ = w.writeText(surface, 0, 0, "┌─", edge);
-    _ = w.writeText(surface, size.width - 2, 0, "─┐", edge);
-    _ = w.writeText(surface, 0, size.height - 1, "└─", edge);
-    _ = w.writeText(surface, size.width - 2, size.height - 1, "─┘", edge);
+    _ = w.writeText(surface, 0, 0, w.decoration("┌─"), edge);
+    _ = w.writeText(surface, size.width - 2, 0, w.decoration("─┐"), edge);
+    _ = w.writeText(surface, 0, size.height - 1, w.decoration("└─"), edge);
+    _ = w.writeText(surface, size.width - 2, size.height - 1, w.decoration("─┘"), edge);
     _ = w.writeText(surface, 3, 1, "Welcome to", theme.on_bg(theme.fg).cell);
     if (large) {
         for (0..(pixels.len + 2) / 2) |row| {

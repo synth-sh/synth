@@ -476,7 +476,7 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
 
                 const in_use = std.mem.eql(u8, entry.name, self.current);
                 if (in_use) {
-                    _ = w.writeText(surface, pad, y, "●", base.withFg(theme.success).cell);
+                    _ = w.writeText(surface, pad, y, w.dot, base.withFg(theme.success).cell);
                 }
 
                 const x = w.writeText(surface, pad + 2, y, entry.name, base.withFg(theme.fg).cell);

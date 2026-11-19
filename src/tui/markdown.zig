@@ -577,11 +577,11 @@ fn drawTable(ctx: vxfw.DrawContext, widget: vxfw.Widget, table: Table, width: u1
     };
     const divider_cell = vaxis.Cell{
         .style = divider_style,
-        .char = .{ .grapheme = "─", .width = 1 },
+        .char = .{ .grapheme = w.decoration("─"), .width = 1 },
     };
     const gutter_cell = vaxis.Cell{
         .style = gutter_style,
-        .char = .{ .grapheme = "│", .width = 1 },
+        .char = .{ .grapheme = w.solid_rule, .width = 1 },
     };
 
     const drawRow = struct {

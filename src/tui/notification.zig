@@ -33,7 +33,7 @@ pub const Kind = enum {
 
     fn glyph(self: Kind) []const u8 {
         return switch (self) {
-            .info => "●",
+            .info => w.dot,
             .warn => "▲",
             .err => "✕",
         };
@@ -150,7 +150,7 @@ const Toast = struct {
 
         const accent = self.kind.color();
         for (0..height) |row| {
-            _ = w.writeText(surface, 0, @intCast(row), "▌", theme.on_card(accent).cell);
+            _ = w.writeText(surface, 0, @intCast(row), w.block_rule, theme.on_card(accent).cell);
         }
 
         _ = w.writeText(surface, 2, 1, self.kind.glyph(), theme.on_card(accent).cell);

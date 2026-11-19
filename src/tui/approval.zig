@@ -148,7 +148,7 @@ pub fn draw(self: *Approval, ctx: vxfw.DrawContext, parent: vxfw.Widget, args: D
     w.fill(surface, theme.card.cell);
     for (0..height) |row| {
         surface.writeCell(0, @intCast(row), .{
-            .char = .{ .grapheme = "▌", .width = 1 },
+            .char = .{ .grapheme = w.block_rule, .width = 1 },
             .style = theme.on_card(theme.warning).cell,
         });
     }

@@ -135,7 +135,7 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
         if (chosen) w.fillRow(surface, y, 1, width - 2, base.cell);
 
         const in_use = i == 0 and self.current_on_top;
-        if (in_use) _ = w.writeText(surface, pad, y, "●", base.withFg(theme.success).cell);
+        if (in_use) _ = w.writeText(surface, pad, y, w.dot, base.withFg(theme.success).cell);
         _ = w.writeText(surface, pad + 2, y, level, base.withFg(theme.fg).cell);
     }
 

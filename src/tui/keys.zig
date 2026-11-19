@@ -16,6 +16,8 @@ const bell = @import("bell.zig");
 const editor = @import("editor.zig");
 const Model = @import("model.zig");
 const Selection = @import("selection.zig");
+const transcript_map = @import("transcript_map.zig");
+const render = @import("render.zig");
 const widget_pool = @import("widget_pool.zig");
 const themes = @import("themes.zig");
 
@@ -71,6 +73,8 @@ pub fn typeErasedCaptureHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event:
 /// Consuming a press in the capture phase is what stops the two from toggling
 /// twice. Returns whether the event was the plan's.
 fn trackPlan(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) !bool {
+    if (self.transcript_drag != null or self.selection.dragging) return false;
+
     const row: u16 = @intCast(@max(mouse.row, 0));
     const col: u16 = @intCast(@max(mouse.col, 0));
 
@@ -100,12 +104,15 @@ fn trackPlan(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) !bool {
 
 /// Mouse selection, driven from whichever phase reaches the root.
 pub fn trackSelection(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) !void {
-    if (mouse.button != .left) return;
-
     const point: Selection.Point = .{
         .row = @intCast(@max(mouse.row, 0)),
         .col = @intCast(@max(mouse.col, 0)),
     };
+    if (self.transcript_drag != null) {
+        if (mouse.type == .press and mouse.button == .left) return endTranscriptDrag(self, ctx);
+        return dragTranscript(self, ctx, mouse, point);
+    }
+    if (mouse.button != .left) return;
 
     switch (mouse.type) {
         .press => {
@@ -115,9 +122,12 @@ pub fn trackSelection(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse)
         },
         .drag => {
             const start = self.press_point orelse point;
-            if (!self.selection.dragging) self.selection.begin(start);
-            self.confineToPane(start);
+            if (!self.selection.dragging) {
+                if (!self.selection.begin(start)) return;
+                startTranscriptDrag(self, start, point);
+            }
             self.selection.extend(point);
+            if (self.transcript_drag != null) return dragTranscript(self, ctx, mouse, point);
             return ctx.consumeAndRedraw();
         },
         .release => {
@@ -133,6 +143,116 @@ pub fn trackSelection(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse)
         },
         else => {},
     }
+}
+
+/// Hold a drag that started in the transcript to the text under it, when the
+/// transcript is what it started in.
+fn startTranscriptDrag(self: *Model, start: Selection.Point, point: Selection.Point) void {
+    const layout = self.transcriptLayout() orelse return;
+    if (!std.meta.eql(self.selection.area, layout.area)) return;
+    const anchor = layout.locate(start) orelse return;
+    self.transcript_drag = .{ .anchor = anchor, .pointer = point, .start_row = start.row };
+}
+
+/// Every mouse event while a transcript drag is held: the drag owns the mouse
+/// until it is let go, wherever the pointer goes. A motion with no button held
+/// is a release the terminal never reported, from letting go outside it.
+fn dragTranscript(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse, point: Selection.Point) !void {
+    const drag = &self.transcript_drag.?;
+    const area = (self.transcriptLayout() orelse return endTranscriptDrag(self, ctx)).area;
+
+    if (mouse.type == .release or (mouse.type == .motion and mouse.button == .none)) {
+        return endTranscriptDrag(self, ctx);
+    }
+    switch (mouse.button) {
+        .wheel_up => {
+            self.scrollBy(ctx, 3);
+            try self.pageHistoryIfNeeded();
+        },
+        .wheel_down => self.scrollBy(ctx, -3),
+        .left => {
+            drag.pointer = point;
+            if (point.row != drag.start_row) drag.left_start_row = true;
+            const held = drag.left_start_row or point.row < area.top or point.row > area.bottom;
+            drag.edge = if (held and point.row <= area.top)
+                .top
+            else if (held and point.row >= area.bottom)
+                .bottom
+            else
+                .none;
+            if (drag.edge != .none) try scheduleDragTick(self, ctx);
+        },
+        else => {},
+    }
+    ctx.consumeAndRedraw();
+}
+
+/// Let go of a transcript drag: copy what it covered, on screen or not. One
+/// that never got past the cell next to where it started is a click that
+/// wobbled, and is passed on for a card or link under it to take.
+fn endTranscriptDrag(self: *Model, ctx: *vxfw.EventContext) !void {
+    const drag = self.transcript_drag orelse return;
+    self.transcript_drag = null;
+    defer self.selection.clear();
+
+    const layout = self.transcriptLayout() orelse return ctx.consumeAndRedraw();
+    const head = layout.locate(drag.pointer) orelse return ctx.consumeAndRedraw();
+    if (!drag.left_start_row and isWobble(drag.anchor, head)) {
+        ctx.redraw = true;
+        return;
+    }
+    defer ctx.consumeAndRedraw();
+    const from, const to = if (drag.anchor.order(head) == .lt) .{ drag.anchor, head } else .{ head, drag.anchor };
+
+    const copied = try render.transcriptText(self, self.allocator, from, to) orelse return;
+    defer self.allocator.free(copied);
+    if (copied.len == 0) return;
+    try ctx.copyToClipboard(copied);
+    try self.notification.show(ctx, .info, "Copied to clipboard");
+}
+
+fn isWobble(anchor: transcript_map.Position, head: transcript_map.Position) bool {
+    if (anchor.block.order(head.block) != .eq or anchor.row != head.row) return false;
+    return @max(anchor.col, head.col) - @min(anchor.col, head.col) <= 1;
+}
+
+/// How often a drag held at the transcript's edge scrolls it by a row.
+const drag_scroll_ms = 50;
+
+fn scheduleDragTick(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (self.drag_tick_pending) return;
+    self.drag_tick_pending = true;
+    try ctx.tick(drag_scroll_ms, dragTicker(self));
+}
+
+/// What edge-scroll ticks are sent to, apart from the spinner's, so the two
+/// never run each other's work.
+fn dragTicker(self: *Model) vxfw.Widget {
+    return .{ .userdata = self, .eventHandler = onDragTick, .drawFn = noDraw };
+}
+
+fn noDraw(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+    unreachable;
+}
+
+fn onDragTick(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+    const self: *Model = @ptrCast(@alignCast(ptr));
+    if (event != .tick) return;
+    self.drag_tick_pending = false;
+    const drag = self.transcript_drag orelse return;
+    const before = self.scroll;
+    switch (drag.edge) {
+        .none => return,
+        .top => {
+            self.scrollBy(ctx, 1);
+            try self.pageHistoryIfNeeded();
+        },
+        .bottom => self.scrollBy(ctx, -1),
+    }
+    const more_above = drag.edge == .top and self.shown().dropped > 0;
+    if (self.scroll == before and !more_above) return;
+    try scheduleDragTick(self, ctx);
+    ctx.redraw = true;
 }
 
 /// Hand a clicked link to the desktop's opener.
@@ -255,7 +375,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
             // A server speaks whenever it likes, and vxfw has no way in but a tick.
             try self.scheduleTick(ctx);
-            if (changes.grew) self.scroll = 0;
+            if (changes.grew and self.transcript_drag == null) self.scroll = 0;
             ctx.redraw = true;
         },
         .key_press => |key| {
