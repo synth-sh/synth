@@ -843,18 +843,17 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
         .string => return,
     };
     const awaited = (self.waiting.fetchRemove(number) orelse return).value;
-    defer awaited.deinit(self.allocator);
+    var keep_draft = false;
+    defer if (!keep_draft) awaited.deinit(self.allocator);
     if (message.err) |err| {
         if (awaited == .models) self.models_failed = true;
-        if (awaited == .prompt and std.mem.eql(u8, err.message, Hooks.review_notice)) {
+        const review_prompt = awaited == .prompt and std.mem.eql(u8, err.message, Hooks.review_notice);
+        if (review_prompt or awaited == .typed_model) {
             if (self.failed_draft) |draft| self.allocator.free(draft);
-            self.failed_draft = try self.allocator.dupe(u8, awaited.prompt);
-            return self.say("{s}", .{Hooks.review_notice});
+            self.failed_draft = if (review_prompt) awaited.prompt else awaited.typed_model;
+            keep_draft = true;
         }
-        if (awaited == .typed_model) {
-            if (self.failed_draft) |draft| self.allocator.free(draft);
-            self.failed_draft = try self.allocator.dupe(u8, awaited.typed_model);
-        }
+        if (review_prompt) return self.say("{s}", .{Hooks.review_notice});
         if (awaited == .history) self.paging = false;
         // A turn that failed has said so in the transcript already.
         if (awaited == .prompt and self.status.outcome == .failed) return;
@@ -970,7 +969,8 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
         },
         .hooks => {
             const text = try rpc.parse([]const u8, arena, result);
-            try self.answers.append(self.allocator, .{ .hooks = try self.allocator.dupe(u8, text) });
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            self.answers.appendAssumeCapacity(.{ .hooks = try self.allocator.dupe(u8, text) });
         },
         .approvals => {
             try self.answers.ensureUnusedCapacity(self.allocator, 1);
