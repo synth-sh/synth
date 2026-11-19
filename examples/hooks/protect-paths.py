@@ -4,11 +4,12 @@ import os
 import sys
 
 try:
-    path = json.load(sys.stdin).get("tool_input", {}).get("path", "")
-    if not isinstance(path, str):
-        raise ValueError("path must be a string")
+    payload = json.load(sys.stdin)
+    path = payload["tool_input"]["path"]
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be a non-empty string")
     root = os.getcwd()
-    absolute = os.path.abspath(os.path.join(root, path))
+    absolute = os.path.abspath(os.path.join(payload.get("cwd", root), path))
     patterns = (".env", ".env.*", "*/.env", "*/.env.*", "*.lock", "*.lockb",
                 "package-lock.json", ".github/*", ".gitlab-ci.yml", "Jenkinsfile",
                 "src/core/migrations/*", "*.pem", "*.key", "*id_rsa*", "*id_ed25519*")
