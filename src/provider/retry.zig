@@ -170,6 +170,8 @@ test "a server that named a delay gets it, within reason" {
     try testing.expect(!tooLong(policy, 3_000));
     try testing.expect(!tooLong(policy, null));
     try testing.expect(tooLong(policy, 600_000));
+    try testing.expect(wait(testing.io, policy, null, .{ .status = .too_many_requests, .attempt = 1, .retry_after_ms = 0 }));
+    try testing.expect(!wait(testing.io, policy, null, .{ .status = .too_many_requests, .attempt = 1, .retry_after_ms = 600_000 }));
 }
 
 test "Retry-After is read as seconds, and anything else is ignored" {

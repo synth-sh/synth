@@ -37,9 +37,7 @@ supports_vision: bool = true,
 
 client: std.http.Client = undefined,
 started: bool = false,
-live_socket: std.posix.fd_t = no_socket,
-socket_lock: std.Io.Mutex = .init,
-aborted: bool = false,
+socket: @import("socket.zig") = .{},
 
 /// The account's model list, fetched once per client and kept for picking,
 /// windows and vision. Lives in `catalog_arena`.
@@ -63,7 +61,6 @@ effort_len: usize = 0,
 /// What the sidebar calls this backend. The guidelines ask that using the
 /// plan be visible beside the model.
 pub const default_label = "ChatGPT plan";
-const no_socket: std.posix.fd_t = -1;
 const max_body_bytes: usize = 4 * 1024 * 1024;
 const max_rejection_bytes: usize = 2 * 1024;
 const transfer_buffer_bytes: usize = 64 * 1024;
@@ -158,37 +155,7 @@ fn setEffortErased(ptr: *anyopaque, level: []const u8) void {
 }
 
 pub fn abort(self: *ChatGPTProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.aborted = true;
-    self.shutdownLocked();
-}
-
-fn shutdownLocked(self: *ChatGPTProvider) void {
-    if (self.live_socket == no_socket) return;
-    self.io.vtable.netShutdown(self.io.userdata, self.live_socket, .both) catch {};
-    self.live_socket = no_socket;
-}
-
-fn watch(self: *ChatGPTProvider, request: *std.http.Client.Request) void {
-    const connection = request.connection orelse return;
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.live_socket = connection.stream_reader.stream.socket.handle;
-    if (self.aborted) self.shutdownLocked();
-}
-
-fn armSocket(self: *ChatGPTProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.aborted = false;
-    self.live_socket = no_socket;
-}
-
-fn forgetSocket(self: *ChatGPTProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.live_socket = no_socket;
+    self.socket.abort(self.io);
 }
 
 fn abortErased(ptr: *anyopaque) void {
@@ -409,11 +376,11 @@ fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, url: []const u8, track_
             .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" } },
         });
         defer {
-            if (track_turn) self.forgetSocket();
+            if (track_turn) self.socket.forget(self.io);
             request.deinit();
         }
         try request.sendBodiless();
-        if (track_turn) self.watch(&request);
+        if (track_turn) self.socket.watch(self.io, &request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
@@ -445,7 +412,7 @@ fn respond(
     const store = self.store orelse return error.NotSignedIn;
     self.startClient();
     self.clearRejection();
-    self.armSocket();
+    self.socket.arm(self.io);
     if (self.model.len == 0 or self.context_limit == 0) self.ensureModelForTurn() catch {};
 
     var attempt: usize = 1;
@@ -480,11 +447,11 @@ fn respond(
             .extra_headers = prepared.extra_headers,
         });
         defer {
-            self.forgetSocket();
+            self.socket.forget(self.io);
             request.deinit();
         }
         try request.sendBodyComplete(body);
-        self.watch(&request);
+        self.socket.watch(self.io, &request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);

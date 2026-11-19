@@ -79,13 +79,7 @@ started: bool = false,
 /// Set at start when OpenAI's own API does not list the model in use.
 is_model_unlisted: bool = false,
 model_listing: ?[]u8 = null,
-/// The socket the turn in flight is reading. Guarded rather than atomic: the
-/// shutdown has to happen while the handle is still owned. See `abort`.
-live_socket: std.posix.fd_t = -1,
-socket_lock: std.Io.Mutex = .init,
-/// Whether a cancel arrived. Kept because one can land before the request has
-/// a socket to shut down, and a no-op then would be a cancel that never took.
-aborted: bool = false,
+socket: @import("socket.zig") = .{},
 /// Set when the model, host, key or label was changed at runtime: the borrowed
 /// field then points here rather than at the config, and this is what has to be
 /// freed.
@@ -200,50 +194,8 @@ pub fn provider(self: *OpenAIProvider) Provider {
     };
 }
 
-/// No request in flight.
-const no_socket: std.posix.fd_t = -1;
-
-/// Break off the request in flight. Safe to call when there is none.
-///
-/// Under the lock the worker holds while the handle is live, so the socket
-/// cannot be closed underneath the shutdown and land on a reused descriptor.
 pub fn abort(self: *OpenAIProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-
-    self.aborted = true;
-    self.shutdownLocked();
-}
-
-fn shutdownLocked(self: *OpenAIProvider) void {
-    if (self.live_socket == no_socket) return;
-    self.io.vtable.netShutdown(self.io.userdata, self.live_socket, .both) catch {};
-    self.live_socket = no_socket;
-}
-
-/// Worker thread. What `abort` shuts down until `forgetSocket` takes it back.
-fn watch(self: *OpenAIProvider, request: *std.http.Client.Request) void {
-    const connection = request.connection orelse return;
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-
-    self.live_socket = connection.stream_reader.stream.socket.handle;
-    if (self.aborted) self.shutdownLocked();
-}
-
-/// Worker thread. A new turn is not the cancelled one.
-fn armSocket(self: *OpenAIProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.aborted = false;
-    self.live_socket = no_socket;
-}
-
-/// Worker thread. Must run before the request is torn down.
-fn forgetSocket(self: *OpenAIProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.live_socket = no_socket;
+    self.socket.abort(self.io);
 }
 
 fn abortErased(ptr: *anyopaque) void {
@@ -549,7 +501,7 @@ fn respond(
     const url = try self.endpoint(arena, self.wire.path());
     const uri = std.Uri.parse(url) catch return error.InvalidHost;
 
-    self.armSocket();
+    self.socket.arm(self.io);
 
     var attempt: usize = 1;
     while (true) {
@@ -573,11 +525,11 @@ fn respond(
             .keep_alive = false,
         });
         defer {
-            self.forgetSocket();
+            self.socket.forget(self.io);
             request.deinit();
         }
         try request.sendBodyComplete(body);
-        self.watch(&request);
+        self.socket.watch(self.io, &request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
@@ -603,7 +555,12 @@ fn respond(
                     attempt += 1;
                     continue;
                 }
-            } else if (self.waitAndRetry(head.status, attempt, asked_for, sink)) {
+            } else if (retry.wait(self.io, self.retries, sink, .{
+                .status = head.status,
+                .attempt = attempt,
+                .retry_after_ms = asked_for,
+                .message = self.rejection orelse "",
+            })) {
                 attempt += 1;
                 continue;
             }
@@ -680,20 +637,6 @@ fn retryWithout(self: *OpenAIProvider, why: []const u8) bool {
     return true;
 }
 
-fn waitAndRetry(
-    self: *OpenAIProvider,
-    status: std.http.Status,
-    attempt: usize,
-    retry_after_ms: ?u64,
-    sink: ?Provider.Sink,
-) bool {
-    return retry.wait(self.io, self.retries, sink, .{
-        .status = status,
-        .attempt = attempt,
-        .retry_after_ms = retry_after_ms,
-        .message = self.rejection orelse "",
-    });
-}
 /// One header off a reply, before a body reader invalidates it.
 pub fn headerValue(head: std.http.Client.Response.Head, name: []const u8) ?[]const u8 {
     var it = head.iterateHeaders();
@@ -1857,103 +1800,4 @@ test "a redirect is reported with where it leads, never followed with the key" {
 
     const said = try backend.describeError(error.Redirected, arena);
     try testing.expect(std.mem.indexOf(u8, said, "301 to https://elsewhere.example/v1/models") != null);
-}
-
-/// A sink that reports the turn as given up on, for the retry tests.
-fn stoppedSink() Provider.Sink {
-    const Always = struct {
-        fn stopped(_: *anyopaque) bool {
-            return true;
-        }
-        fn onThinking(_: *anyopaque, _: []const u8) void {}
-        fn onText(_: *anyopaque, _: []const u8) void {}
-    };
-    const nothing = struct {
-        var slot: u8 = 0;
-    };
-    return .{
-        .userdata = &nothing.slot,
-        .stopped = Always.stopped,
-        .onThinking = Always.onThinking,
-        .onText = Always.onText,
-    };
-}
-
-test "a refusal is not sent again, however many attempts are left" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "http://localhost:1234",
-        .model = "local-model",
-        .retries = .{ .base_ms = 1 },
-    };
-
-    try testing.expect(!backend.waitAndRetry(.bad_request, 1, null, null));
-    try testing.expect(!backend.waitAndRetry(.unauthorized, 1, null, null));
-    try testing.expect(!backend.waitAndRetry(.not_found, 1, null, null));
-}
-
-test "congestion is sent again until the attempts run out" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "http://localhost:1234",
-        .model = "local-model",
-        .retries = .{ .attempts = 3, .base_ms = 1 },
-    };
-
-    try testing.expect(backend.waitAndRetry(.too_many_requests, 1, null, null));
-    try testing.expect(backend.waitAndRetry(.service_unavailable, 2, null, null));
-    try testing.expect(!backend.waitAndRetry(.too_many_requests, 3, null, null));
-}
-
-test "a delay longer than a turn is worth is not waited out" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "http://localhost:1234",
-        .model = "local-model",
-        .retries = .{ .base_ms = 1, .max_retry_after_ms = 1_000 },
-    };
-
-    try testing.expect(backend.waitAndRetry(.too_many_requests, 1, 500, null));
-    try testing.expect(!backend.waitAndRetry(.too_many_requests, 1, 60_000, null));
-}
-
-test "a cancel with no request in flight shuts nothing down" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "https://api.example/v1",
-        .label = "Example",
-        .model = "a-model",
-    };
-    defer backend.deinit();
-
-    // Nothing in flight: a no-op rather than a shutdown of whatever -1 is.
-    backend.abort();
-
-    // What the worker does when its request ends, before the socket is closed.
-    backend.forgetSocket();
-    backend.abort();
-    try testing.expectEqual(no_socket, backend.live_socket);
-
-    // A cancel landing before there is a socket still takes, on the next watch.
-    try testing.expect(backend.aborted);
-
-    // And a new turn is not the cancelled one.
-    backend.armSocket();
-    try testing.expect(!backend.aborted);
-}
-
-test "a turn the user gave up on is not retried" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "http://localhost:1234",
-        .model = "local-model",
-        .retries = .{ .base_ms = 1 },
-    };
-
-    try testing.expect(!backend.waitAndRetry(.too_many_requests, 1, null, stoppedSink()));
 }

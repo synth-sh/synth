@@ -57,13 +57,7 @@ auth_header: [1]std.http.Header = undefined,
 auth_value: []const u8 = "",
 
 client: Ollama = undefined,
-/// The socket the turn in flight is reading. Guarded rather than atomic: the
-/// shutdown has to happen while the handle is still owned. See `abort`.
-live_socket: std.posix.fd_t = -1,
-socket_lock: std.Io.Mutex = .init,
-/// Whether a cancel arrived. Kept because one can land before the request has
-/// a socket to shut down, and a no-op then would be a cancel that never took.
-aborted: bool = false,
+socket: @import("socket.zig") = .{},
 started: bool = false,
 /// Set when the model was switched at runtime: `model` then points here rather
 /// than at the config, and this is what has to be freed.
@@ -296,35 +290,8 @@ pub fn provider(self: *OllamaProvider) Provider {
     };
 }
 
-/// No request in flight.
-const no_socket: std.posix.fd_t = -1;
-
-/// Break off the request in flight. Safe to call when there is none.
-///
-/// Under the lock the worker holds while the handle is live, so the socket
-/// cannot be closed underneath the shutdown and land on a reused descriptor.
 pub fn abort(self: *OllamaProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-
-    self.aborted = true;
-    self.shutdownLocked();
-}
-
-fn shutdownLocked(self: *OllamaProvider) void {
-    if (self.live_socket == no_socket) return;
-    self.io.vtable.netShutdown(self.io.userdata, self.live_socket, .both) catch {};
-    self.live_socket = no_socket;
-}
-
-/// Worker thread. What `abort` shuts down until `forgetSocket` takes it back.
-fn watch(self: *OllamaProvider, request: *std.http.Client.Request) void {
-    const connection = request.connection orelse return;
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-
-    self.live_socket = connection.stream_reader.stream.socket.handle;
-    if (self.aborted) self.shutdownLocked();
+    self.socket.abort(self.io);
 }
 
 /// Subscribes to the request going out, which is the only moment before the
@@ -335,22 +302,7 @@ fn observer(self: *OllamaProvider) Ollama.OnRequest {
 
 fn watchErased(ptr: *anyopaque, request: *std.http.Client.Request) void {
     const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
-    self.watch(request);
-}
-
-/// Worker thread. A new turn is not the cancelled one.
-fn armSocket(self: *OllamaProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.aborted = false;
-    self.live_socket = no_socket;
-}
-
-/// Worker thread. Must run before the request is torn down.
-fn forgetSocket(self: *OllamaProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.live_socket = no_socket;
+    self.socket.watch(self.io, request);
 }
 
 fn abortErased(ptr: *anyopaque) void {
@@ -652,8 +604,8 @@ fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest
     });
     errdefer req.deinit();
     try req.sendBodyComplete(prepared.body);
-    self.watch(req);
-    errdefer self.forgetSocket();
+    self.socket.watch(self.io, req);
+    errdefer self.socket.forget(self.io);
     var redirect: [0]u8 = undefined;
     var response = try req.receiveHead(&redirect);
     const head = try http.response(a, response.head);
@@ -706,7 +658,7 @@ fn respond(
     };
 
     self.clearRejection();
-    self.armSocket();
+    self.socket.arm(self.io);
 
     var hook_attempt: ?Provider.Attempt = null;
     defer if (hook_attempt) |*attempt| attempt.finish();
@@ -750,7 +702,7 @@ fn respond(
         };
     };
     defer {
-        self.forgetSocket();
+        self.socket.forget(self.io);
         stream.deinit();
     }
     self.clearRejection();
