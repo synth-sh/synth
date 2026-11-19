@@ -778,6 +778,7 @@ fn startCompaction(self: *Loop, resume_turn: bool) !void {
     );
     self.requests_started += 1;
     self.compacting = true;
+    if (resume_turn) self.recovered_from_overflow = true;
     self.resume_after_compaction = resume_turn;
     self.state = .compacting;
 }
@@ -1006,11 +1007,10 @@ pub fn loadToolResult(self: *Loop, msg: *Conversation.Message, call_index: usize
 fn ask(self: *Loop) !void {
     try self.applySteering();
     if (self.overBudget()) |reason| return self.stop(reason);
-    if (self.shouldCompact()) return self.startCompaction(true);
+    const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
+    if (may_recover and self.shouldCompact()) return self.startCompaction(true);
     if (!try self.contextFits(self.turn(""))) {
-        const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
         if (!may_recover) return self.stop(context_full_notice);
-        self.recovered_from_overflow = true;
         return self.startCompaction(true);
     }
     self.steps += 1;
@@ -1263,7 +1263,6 @@ fn pollRequest(self: *Loop) !bool {
         const server_refused_the_size = err == error.ContextTooLarge and !self.compacting;
         const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
         if (server_refused_the_size and may_recover) {
-            self.recovered_from_overflow = true;
             try self.startCompaction(true);
             return true;
         }

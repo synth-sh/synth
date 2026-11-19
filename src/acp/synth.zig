@@ -205,6 +205,7 @@ pub const Status = struct {
     provider_missing: bool = false,
     /// A ChatGPT sign-in this session started, waiting on a browser.
     sign_in: ?SignIn = null,
+    signing_out: bool = false,
     /// The agent holds a ChatGPT sign-in, which `/logout` would end.
     chatgpt_signed_in: bool = false,
     context_limit: u32 = 0,
@@ -365,7 +366,9 @@ pub const ConnectProvider = struct {
     provider: []const u8,
     host: ?[]const u8 = null,
     key: ?[]const u8 = null,
+    activate: bool = true,
 };
+pub const SignOutProvider = struct { sessionId: []const u8, provider: ?[]const u8 = null };
 pub const ToggleMcp = struct { sessionId: []const u8, name: []const u8 };
 pub const ListModels = struct { sessionId: []const u8, recent: u32 = 5 };
 pub const LoadToolResult = struct { sessionId: []const u8, seq: u64, call: u32 };

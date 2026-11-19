@@ -41,6 +41,12 @@ pub fn init(io: std.Io, config: *const Config, auth: *Auth, chatgpt: ?*chatgpt_a
     };
 }
 
+pub fn deinit(self: *Providers) void {
+    const allocator = self.backend.options.allocator;
+    self.backend.deinit();
+    allocator.destroy(self.backend);
+}
+
 /// Reach the provider, once, and settle whether it is usable.
 pub fn start(self: *Providers, arena: std.mem.Allocator, db: *Database) !void {
     const unstarted = self.unstarted orelse return;
@@ -104,18 +110,42 @@ pub fn endpoint(self: *const Providers, arena: std.mem.Allocator, db: *Database,
 
 /// Store `key` when one is given and point the session at the provider.
 /// Returns what the session now answers as.
-pub fn connect(self: *Providers, entry: catalog.Entry, host: []const u8, key: ?[]const u8) !Provider {
+pub fn connect(self: *Providers, entry: catalog.Entry, host: []const u8, key: ?[]const u8, model: ?[]const u8) !Provider {
     const same_endpoint = std.mem.eql(u8, entry.id, self.active_id) and std.mem.eql(u8, host, self.backend.currentHost());
     const credential: ?[]const u8 = key orelse self.auth.key(entry.id) orelse if (same_endpoint) self.backend.currentKey() else null;
     if (entry.key == .required and (credential == null or credential.?.len == 0)) return error.ProviderKeyRequired;
+    if (entry.key == .oauth and key == null and !entry.ready(self.auth, self.chatgpt)) return error.NotSignedIn;
+    const allocator = self.backend.options.allocator;
+    const replacement = try allocator.create(Backend);
+    errdefer allocator.destroy(replacement);
+    var options = self.backend.options;
+    options.host = "";
+    options.label = "";
+    options.model = "";
+    options.api_key = null;
+    replacement.* = .init(entry.kind, options);
+    errdefer replacement.deinit();
+    const provider = try replacement.connect(entry, host, credential);
+    if (model) |name| {
+        const set = provider.set_model orelse return error.ModelFixed;
+        _ = try set(provider.userdata, name);
+    }
+    if (key != null) try self.saveCredential(entry, key);
+    self.deinit();
+    self.backend = replacement;
+    self.active_id = entry.id;
+    self.missing = false;
+    self.model_unchecked = false;
+    return replacement.provider();
+}
+
+pub fn saveCredential(self: *Providers, entry: catalog.Entry, key: ?[]const u8) !void {
     if (key) |secret| {
         try self.auth.set(entry.id, secret);
         try self.auth.save(self.io, self.auth.path);
+    } else if (entry.key == .required and !entry.ready(self.auth, self.chatgpt)) {
+        return error.ProviderKeyRequired;
     }
-    const provider = try self.backend.connect(entry, host, credential);
-    self.active_id = entry.id;
-    self.missing = false;
-    return provider;
 }
 
 /// ChatGPT was signed out of: a session on it has nothing to answer it.
