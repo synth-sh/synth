@@ -18,7 +18,7 @@ provider_mutex: std.Io.Mutex = .init,
 owned_backend: ?*@import("../provider/backend.zig").Spawned = null,
 prepared_conversation: ?Conversation = null,
 restricted_tools: bool = false,
-started_ms: i64 = 0,
+completed_ms: i64 = 0,
 conversation: *Conversation,
 /// Owned copy of the turn's strings: the loop is free to rebuild its prompt or
 /// switch agents while this is in flight.
@@ -92,7 +92,6 @@ pub fn start(
         self.content.deinit();
     }
 
-    self.started_ms = tool.monotonicMilliseconds(io);
     self.turn.hook_input = try turn.hook_input.dupe(self.hook_arena.allocator());
     self.turn.hook_input.model = try self.hook_arena.allocator().dupe(u8, provider.model);
     self.turn.hook_input.provider = try self.hook_arena.allocator().dupe(u8, provider.name);
@@ -131,10 +130,6 @@ pub fn requestStop(self: *Request) void {
     self.provider_mutex.lockUncancelable(self.io);
     defer self.provider_mutex.unlock(self.io);
     if (self.provider.abort) |abort| abort(self.provider.userdata);
-}
-
-pub fn expired(self: *Request, limit_ms: u32) bool {
-    return tool.monotonicMilliseconds(self.io) - self.started_ms >= limit_ms;
 }
 
 pub fn stalled(self: *Request, limit_ms: i64) bool {
@@ -184,7 +179,10 @@ fn freeTurn(self: *Request) void {
 }
 
 fn run(self: *Request) void {
-    defer self.done.store(true, .release);
+    defer {
+        self.completed_ms = tool.monotonicMilliseconds(self.io);
+        self.done.store(true, .release);
+    }
     defer self.finishDisplay();
 
     Preparation.prepare(self) catch |err| {

@@ -6,6 +6,7 @@ const Loop = @import("loop.zig");
 const Database = @import("../core/database.zig");
 
 pub const Purpose = std.meta.Tag(Pending);
+pub const Compaction = enum { manual, idle, during_turn };
 pub const Resume = enum { begin_prompt, ask_model, compact, compact_session, after_compact, finish_turn, config_idle, failed_turn };
 pub const Pending = union(enum) {
     prompt,
@@ -48,7 +49,8 @@ evaluate_index: usize = 0,
 context: ?[]u8 = null,
 session_started: bool = false,
 session_source: enum { startup, clear, @"resume", compact } = .startup,
-resume_turn: bool = false,
+compaction: Compaction = .manual,
+compaction_veto_seq: ?u64 = null,
 parent_call_id: []const u8 = "",
 identity: [32]u8 = @splat(0),
 notice: ?[]u8 = null,
@@ -75,6 +77,8 @@ pub fn callIndex(self: *const Flow) usize {
 }
 
 pub fn reset(self: *Flow) void {
+    self.compaction = .manual;
+    self.compaction_veto_seq = null;
     self.pre_seq = null;
     self.pre_index = 0;
     self.permission_index = 0;
@@ -237,7 +241,7 @@ pub fn lifecycle(self: *Loop, event: Hooks.Event, next: Resume) !bool {
     self.hook_flow.dispatch = try dispatchHook(self, .{
         .event = event,
         .source = @tagName(self.hook_flow.session_source),
-        .trigger = if (self.hook_flow.resume_turn) "auto" else "manual",
+        .trigger = if (self.hook_flow.compaction != .manual) "auto" else "manual",
     });
     self.hook_flow.pending = .{ .lifecycle = next };
     self.state = .running_hooks;

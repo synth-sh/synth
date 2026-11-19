@@ -151,8 +151,8 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
             });
             try out.flush();
             switch (answer(allow_mutating, started, loop.approvals)) {
-                .approve => try loop.decide(.once),
-                .refuse => try loop.decide(.deny),
+                .approve => try loop.decideHeadless(true),
+                .refuse => try loop.decideHeadless(false),
                 .stop => {
                     try out.print("{s}stopping: auto mode blocked too many calls{s}\n", .{ red, reset });
                     try out.flush();

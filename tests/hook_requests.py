@@ -1,4 +1,5 @@
 """Offline CLI checks for request hooks. Build synth, then run this with Python 3."""
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import http.server
 import json
@@ -116,9 +117,12 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             listing = run("hooks", "list")
             assert listing.returncode == 0, listing.stderr
             ids = re.findall(r"^([0-9a-f]{64})$", listing.stdout, re.M)
-            for identifier in ids if trust else ():
-                trusted = run("hooks", "trust", identifier)
-                assert trusted.returncode == 0, trusted.stderr
+            if trust and ids:
+                with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+                    for trusted in pool.map(lambda identifier: run("hooks", "trust", identifier), ids):
+                        assert trusted.returncode == 0, trusted.stderr
+                listing = run("hooks", "list")
+                assert listing.returncode == 0 and "NEEDS REVIEW" not in listing.stdout, listing.stdout
             result = run("run", "--allow", "route-me reference human request")
             log = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()] if (root / "events.jsonl").exists() else []
             assert all("forbidden" not in packet["path"] for packet in requests), requests
@@ -152,10 +156,16 @@ def main():
         assert len(requests) == 1
         expect(result, 'HookCommandUnavailable')
     print('PASS unavailable completion policies fail headless runs')
-    with session('ollama-status', lambda *_: (429, {'error': 'model is busy'}, 'application/json'), events=('StopFailure',), protocol='ollama', attempts=1) as (_, result, _, log):
+    def routed_failure(command):
+        return {'StopFailure': [{'when': {'model': 'agent-model', 'request_purpose': 'agent'}, 'hooks': [{'command': command}]}]}
+    with session('ollama-status', lambda *_: (429, {'error': 'model is busy'}, 'application/json'), events=('PreModelRequest',), extra_hooks=routed_failure, protocol='ollama', attempts=1) as (_, result, _, log):
         assert result.returncode != 0
         failure = [event for event in log if event['hook_event_name'] == 'StopFailure']
         assert len(failure) == 1 and failure[0]['error_type'] == 'rate_limit', failure
+        attempt, = [event for event in log if event['hook_event_name'] == 'PreModelRequest']
+        for key in ('model', 'provider', 'route', 'request_purpose', 'request_id', 'attempt'):
+            assert failure[0][key] == attempt[key], (key, failure, attempt)
+        assert attempt['request_id'] == 1 and attempt['route'] == 'agent'
     print('PASS actual Ollama HTTP failures classify StopFailure hooks')
 
     def ollama_reviewer(config, url):
@@ -304,9 +314,10 @@ if e=='ModelRetry':
             return 400, {'error': {'message': 'unsupported stream_options'}}, 'application/json'
         assert 'stream_options' not in packet['body']
         return chat() if any(m['role'] == 'tool' for m in packet['body']['messages']) else chat('', tool('read', {'path': 'seed.txt'}))
-    with session('learned-compatibility', learned_compatibility, route_policy=False) as (_, result, requests, _):
-        assert result.returncode == 0, result.stderr
-        assert len(requests) == 3, requests
+    for named_route in (False, True):
+        with session('learned-compatibility', learned_compatibility, route_policy=named_route) as (_, result, requests, _):
+            assert result.returncode == 0, result.stderr
+            assert len(requests) == 3, requests
     print('PASS compatibility retry metadata/veto, learned transport capabilities, and bounded oversized Ollama error handling')
 
     def proposed(packet, _):
@@ -331,6 +342,35 @@ if e=='ModelRetry':
     with session('forced-ask', proposed, "out={'effect':'ask'}", ('PermissionEvaluate',)) as (root, result, requests, _):
         assert not (root/'allowed.txt').exists()
         assert not any('/review/' in packet['path'] for packet in requests)
+    for mode in ('ask', 'all'):
+        with session('headless-mandatory-ask', readonly, "out={'effect':'ask'}", ('PermissionEvaluate',),
+                     configure=lambda config, _: config.update(approvals=mode)) as (root, result, _, _):
+            assert result.returncode == 0, result.stderr
+            with sqlite3.connect(root / 'session.db') as db:
+                assert db.execute('select status from tool_call').fetchall() == [('rejected',)]
+                assert db.execute("select body from blob where kind='headless_tool_decision'").fetchall() == [('deny',)]
+                assert db.execute('select count(*) from human_authorization').fetchone() == (0,)
+    with session('headless-ordinary-allow', proposed, configure=lambda config, _: config.update(approvals='ask')) as (root, result, _, _):
+        assert result.returncode == 0 and (root / 'allowed.txt').exists(), result.stderr
+        with sqlite3.connect(root / 'session.db') as db:
+            assert db.execute("select body from blob where kind='headless_tool_decision'").fetchall() == [('approve',)]
+            assert db.execute('select count(*) from human_authorization').fetchone() == (0,)
+    def rewrite_with_peer(command):
+        return {'PreToolUse': [{'hooks': [
+            {'command': command},
+            {'command': """echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"path":"effective.txt"}}}'"""},
+        ]}]}
+    check_effective = """
+if p['tool_input']['path'] == 'effective.txt':
+ assert json.loads(p['action'])['arguments']['path'] == 'effective.txt'
+ out={'permissionDecision':'deny','permissionDecisionReason':'effective input blocked'}
+"""
+    with session('rewrite-checked', readonly, check_effective, extra_hooks=rewrite_with_peer) as (root, result, _, log):
+        assert result.returncode == 0, result.stderr
+        assert [entry['tool_input']['path'] for entry in log] == ['seed.txt', 'effective.txt'], log
+        with sqlite3.connect(root / 'session.db') as db:
+            status, reason = db.execute('select status, result from tool_call').fetchone()
+            assert status == 'rejected' and 'effective input blocked' in reason, (status, reason)
     earlier_ask = "if e=='PreToolUse': out={'permissionDecision':'ask'}\nelif e=='PermissionEvaluate': out={'effect':'allow'}\n"
     with session('earlier-ask', proposed, earlier_ask, ('PreToolUse', 'PermissionEvaluate')) as (root, result, requests, _):
         assert not (root/'allowed.txt').exists()

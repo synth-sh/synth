@@ -1691,10 +1691,10 @@ const Session = struct {
         self.settleMcp();
         if (loop.isBusy()) return;
         self.settleSignIn();
-        if (loop.shouldCompact()) {
-            loop.compact() catch |err| self.notice(.warning, "Could not compact: {s}", .{@errorName(err)});
+        if (loop.compactIfNeeded() catch |err| {
+            self.notice(.warning, "Could not compact: {s}", .{@errorName(err)});
             return;
-        }
+        }) return;
         if (loop.takeSteering()) |taken| {
             var next = taken;
             defer next.deinit(loop.allocator);

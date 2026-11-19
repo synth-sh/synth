@@ -37,6 +37,7 @@ Direct file-tool writes under `.git/` and `.synth/`, and edits to control files
 and literal paths named by trusted commands require human approval. Shell commands and MCP tools can have other
 side effects and follow their normal approval policy. Trust does not provide
 filesystem isolation for those processes.
+Headless runs decline calls that require human approval, including runs with `--allow`.
 
 The [path-protection example](../examples/hooks/protect-paths.py) rejects writes
 to secrets, CI files, lockfiles, and migrations, including equivalent paths and
@@ -45,6 +46,9 @@ symlinks. Place it under `.synth/` and match `write|edit`.
 Built-in file hooks expose `file_path`, `old_string`, and `new_string` alongside
 Synth's field names, including batched edits. `updatedInput` accepts either
 spelling; conflicting changes reject the call. MCP arguments are preserved.
+When a handler changes the arguments, the other synchronous `PreToolUse`
+handlers check the effective call. A further change during this check rejects
+the call.
 
 ## Handlers and matching
 

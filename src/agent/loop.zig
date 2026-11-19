@@ -748,18 +748,6 @@ pub fn requestStop(self: *Loop) void {
 }
 
 pub fn deinit(self: *Loop) void {
-    if (self.effective_model) |value| self.allocator.free(value);
-    if (self.effective_provider) |value| self.allocator.free(value);
-    self.clearHumanIntent();
-    self.human_intent.deinit(self.allocator);
-    self.hook_flow.watch.deinit(self.allocator);
-    if (self.hook_flow.model) |model| self.allocator.free(model);
-    if (self.session_title) |t| self.allocator.free(t);
-    if (self.hook_flow.context) |context| self.allocator.free(context);
-    if (self.hook_flow.failure) |failure| self.allocator.free(failure);
-    self.session_title = null;
-    if (self.session_model_owned) |m| self.allocator.free(m);
-    self.session_model_owned = null;
     if (self.canceller) |*canceller| {
         canceller.await(self.io);
         self.canceller = null;
@@ -784,6 +772,17 @@ pub fn deinit(self: *Loop) void {
         dispatch.destroy();
         self.hook_flow.dispatch = null;
     }
+    if (self.effective_model) |value| self.allocator.free(value);
+    if (self.effective_provider) |value| self.allocator.free(value);
+    self.clearHumanIntent();
+    self.hook_flow.watch.deinit(self.allocator);
+    if (self.hook_flow.model) |model| self.allocator.free(model);
+    if (self.session_title) |t| self.allocator.free(t);
+    if (self.hook_flow.context) |context| self.allocator.free(context);
+    if (self.hook_flow.failure) |failure| self.allocator.free(failure);
+    self.session_title = null;
+    if (self.session_model_owned) |m| self.allocator.free(m);
+    self.session_model_owned = null;
     if (self.hooks) |runner| if (runner.runtime) |runtime| runtime.discardAgent(&self.hook_flow.identity);
     self.discardHookSubmission();
 
@@ -955,16 +954,22 @@ pub fn compact(self: *Loop) !void {
     if (self.isBusy()) return;
     if (self.conversation.messages.items.len == 0) return;
 
-    try self.startCompaction(false);
+    try self.startCompaction(.manual);
 }
 
-fn startCompaction(self: *Loop, resume_turn: bool) !void {
-    self.hook_flow.resume_turn = resume_turn;
+pub fn compactIfNeeded(self: *Loop) !bool {
+    if (self.isBusy() or self.conversation.messages.items.len == 0 or !self.shouldCompact()) return false;
+    try self.startCompaction(.idle);
+    return true;
+}
+
+fn startCompaction(self: *Loop, source: HookFlow.Compaction) !void {
+    self.hook_flow.compaction = source;
     if (try self.lifecycle(.pre_compact, .compact)) return;
-    try self.startCompactionRequest(resume_turn);
+    try self.startCompactionRequest();
 }
 
-fn startCompactionRequest(self: *Loop, resume_turn: bool) !void {
+fn startCompactionRequest(self: *Loop) !void {
     const request_turn: Provider.Turn = .{
         .backend = self.backend,
         .model_policy = self.model_policy,
@@ -984,13 +989,13 @@ fn startCompactionRequest(self: *Loop, resume_turn: bool) !void {
     );
     self.requests_started += 1;
     self.compacting = true;
-    self.resume_after_compaction = resume_turn;
+    self.resume_after_compaction = self.hook_flow.compaction == .during_turn;
     self.state = .compacting;
 }
 
 /// Check the same budget the serializers enforce, even for an unknown model.
 pub fn shouldCompact(self: *Loop) bool {
-    if (self.auto_compact_at <= 0) return false;
+    if (self.auto_compact_at <= 0 or self.hook_flow.compaction_veto_seq == self.conversation.next_seq) return false;
     const request_turn = self.turn("");
     const budget = window.requestBudget(self.provider.context_limit, request_turn);
     const estimated = window.contextTokens(self.conversation, self.provider.vision);
@@ -1028,7 +1033,6 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
 
     self.usage.context_tokens = 0;
     self.prompt_cache.invalidate(self.allocator);
-    self.hook_flow.resume_turn = resume_turn;
     if (try self.lifecycle(.post_compact, .compact_session)) return;
     self.hook_flow.session_source = .compact;
     if (try self.lifecycle(.session_start, .after_compact)) return;
@@ -1247,7 +1251,8 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
         self.discardHookSubmission();
         if (dispatch.invocation.event == .session_start) self.hook_flow.session_started = false;
         self.state = .idle;
-        if ((self.hook_flow.resume_turn and self.hook_flow.continuation() != .begin_prompt and self.hook_flow.continuation() != .config_idle) or self.hook_flow.continuation() == .ask_model) self.finish(.halted);
+        if ((self.hook_flow.compaction == .during_turn and self.hook_flow.continuation() != .begin_prompt and self.hook_flow.continuation() != .config_idle) or self.hook_flow.continuation() == .ask_model) self.finish(.halted);
+        if (dispatch.invocation.event == .pre_compact) self.hook_flow.compaction_veto_seq = self.conversation.next_seq;
         return true;
     }
     try self.acceptHookResult(&dispatch.result);
@@ -1261,13 +1266,13 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch) !bool {
         },
         .ask_model => try self.ask(),
         .config_idle => {},
-        .compact => try self.startCompactionRequest(self.hook_flow.resume_turn),
+        .compact => try self.startCompactionRequest(),
         .compact_session => {
             self.hook_flow.session_source = .compact;
             if (try self.lifecycle(.session_start, .after_compact)) return true;
-            if (self.hook_flow.resume_turn) try self.ask();
+            if (self.hook_flow.compaction == .during_turn) try self.ask();
         },
-        .after_compact => if (self.hook_flow.resume_turn) try self.ask(),
+        .after_compact => if (self.hook_flow.compaction == .during_turn) try self.ask(),
         .finish_turn, .failed_turn => unreachable,
     }
     return true;
@@ -1386,22 +1391,27 @@ fn pollOtherHooks(self: *Loop) !bool {
             call.result = blocked;
             call.result_bytes = blocked.len;
         } else {
-            if (dispatch.result.replacement) |replacement| {
-                self.replaceHookInput(call, replacement) catch |err| {
+            const rewritten = if (dispatch.result.replacement) |replacement|
+                self.replaceHookInput(call, replacement, dispatch.runner.rewrite_author == null) catch |err| {
                     if (err == error.OutOfMemory) return err;
                     call.status = .rejected;
-                    call.result = try std.fmt.allocPrint(self.allocator, "hook replacement does not satisfy the tool input schema: {s}", .{@errorName(err)});
+                    call.result = try std.fmt.allocPrint(self.allocator, "hook replacement rejected: {s}", .{@errorName(err)});
                     call.result_bytes = call.result.?.len;
                     try self.persistToolCall(message_index, index);
                     try self.autoApprove();
                     return true;
-                };
-            }
-            try self.acceptHookResult(&dispatch.result);
+                }
+            else
+                false;
+            if (dispatch.runner.rewrite_author == null) try self.acceptHookResult(&dispatch.result);
             if (self.hook_flow.purpose() == .tool_policy and dispatch.result.permission == .ask) try self.hook_flow.asks.append(self.allocator, call.id);
-            if (dispatch.result.replacement != null) {
-                _ = try self.anchorToolPaths(call);
+            if (rewritten) {
                 try self.prepareAction(call);
+                if (call.status == .pending and dispatch.runner.set.pre_tool_use.len > 1) {
+                    try self.persistToolCall(message_index, index);
+                    try self.startPolicyHook(.tool_policy, index, dispatch.result.replacement_author.?);
+                    return true;
+                }
             }
             if (self.hook_flow.purpose() == .evaluation and dispatch.result.permission == .ask) {
                 try self.hook_flow.asks.append(self.allocator, call.id);
@@ -1415,23 +1425,36 @@ fn pollOtherHooks(self: *Loop) !bool {
     return self.pollOwnerHooks(dispatch);
 }
 
-fn replaceHookInput(self: *Loop, call: *Conversation.ToolCall, replacement: []const u8) !void {
-    const effective = try HookToolInput.normalize(self.allocator, call.name, call.arguments, replacement);
-    errdefer self.allocator.free(effective);
-    const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, effective, .{});
-    defer parsed.deinit();
+fn replaceHookInput(self: *Loop, call: *Conversation.ToolCall, replacement: []const u8, allow_change: bool) !bool {
+    var candidate = call.*;
+    candidate.arguments = try HookToolInput.normalize(self.allocator, call.name, call.arguments, replacement);
+    errdefer self.allocator.free(candidate.arguments);
+    _ = try self.anchorToolPaths(&candidate);
+    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, candidate.arguments, .{});
     const definition = self.registry.get(call.name) orelse return error.UnknownTool;
-    const schema = try std.json.parseFromSlice(std.json.Value, self.allocator, definition.schema, .{});
-    defer schema.deinit();
-    try HookSchema.validate(schema.value, parsed.value);
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema, .{});
+    try HookSchema.validate(schema, input);
+    const original = try std.json.parseFromSliceLeaky(std.json.Value, a, call.arguments, .{});
+    if (HookSchema.jsonEqual(original, input)) {
+        self.allocator.free(candidate.arguments);
+        return false;
+    }
+    if (!allow_change) return error.ConflictingHookRewrite;
+    if (!try self.actionMatches(call)) return error.ActionChangedDuringPolicy;
     self.allocator.free(call.arguments);
-    call.arguments = effective;
+    call.arguments = candidate.arguments;
+    return true;
 }
 
-fn startPolicyHook(self: *Loop, purpose: HookPurpose, index: usize) !void {
+fn startPolicyHook(self: *Loop, purpose: HookPurpose, index: usize, rewrite_author: ?usize) !void {
     const message_index = self.pendingIndex() orelse return;
     const call = self.conversation.messages.items[message_index].tool_calls[index];
-    self.hook_flow.dispatch = try self.dispatchHook(.{
+    var runner = self.hooks.?.*;
+    runner.rewrite_author = rewrite_author;
+    self.hook_flow.dispatch = try Hooks.Dispatch.start(self.allocator, runner, try self.exportHookInput(.{
         .event = switch (purpose) {
             .tool_policy => .pre_tool_use,
             .evaluation => .permission_evaluate,
@@ -1444,7 +1467,7 @@ fn startPolicyHook(self: *Loop, purpose: HookPurpose, index: usize) !void {
         .tool_call_id = call.id,
         .model = self.provider.model,
         .permission_mode = @tagName(self.approvals),
-    });
+    }));
     self.hook_flow.pending = HookFlow.Pending.policy(purpose, index);
     self.state = .running_hooks;
 }
@@ -1599,12 +1622,12 @@ fn ask(self: *Loop) !void {
         try self.persistMessage(self.conversation.messages.items.len - 1);
     }
     if (self.overBudget()) |reason| return self.stop(reason);
-    if (self.shouldCompact()) return self.startCompaction(true);
+    if (self.shouldCompact()) return self.startCompaction(.during_turn);
     if (!try self.contextFits(self.turn(""))) {
         const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
         if (!may_recover) return self.stop(context_full_notice);
         self.recovered_from_overflow = true;
-        return self.startCompaction(true);
+        return self.startCompaction(.during_turn);
     }
     self.steps += 1;
     if (self.steps > self.agent.steps and !self.isRunningWithoutLimit()) {
@@ -1907,7 +1930,7 @@ fn pollRequest(self: *Loop) !bool {
         const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
         if (server_refused_the_size and may_recover) {
             self.recovered_from_overflow = true;
-            try self.startCompaction(true);
+            try self.startCompaction(.during_turn);
             return true;
         }
 
@@ -1921,7 +1944,15 @@ fn pollRequest(self: *Loop) !bool {
         try self.persistMessage(self.conversation.messages.items.len - 1);
         if (self.hooks) |runner| {
             if (runner.set.stop_failure.len > 0) {
-                self.hook_flow.dispatch = try self.dispatchHook(.{ .event = .stop_failure, .error_type = Provider.errorType(err, detail), .error_message = detail, .last_assistant_message = text });
+                var input = try self.exportHookInput(.{ .event = .stop_failure, .error_type = Provider.errorType(err, detail), .error_message = detail, .last_assistant_message = text });
+                const failed = request.turn.hook_input;
+                input.request_id = failed.request_id;
+                input.request_purpose = failed.request_purpose;
+                input.route = failed.route;
+                input.model = failed.model;
+                input.provider = failed.provider;
+                input.attempt = request.attempt_number.load(.acquire);
+                self.hook_flow.dispatch = try Hooks.Dispatch.start(self.allocator, runner.*, input);
                 self.hook_flow.pending = .{ .lifecycle = .failed_turn };
                 self.state = .running_hooks;
                 return true;
@@ -2110,19 +2141,29 @@ fn prepareAction(self: *Loop, call: *Conversation.ToolCall) !void {
     call.prepared_action = prepared;
 }
 
-fn approve(self: *Loop, call: *Conversation.ToolCall) !void {
-    if (call.status != .pending) return;
-    const prepared = call.prepared_action orelse return error.UnpreparedAction;
-    const current = try self.action(call);
+fn actionMatches(self: *Loop, call: *const Conversation.ToolCall) !bool {
+    const prepared = call.prepared_action orelse return false;
+    const current = self.action(call) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    };
     defer self.allocator.free(current);
-    if (!std.mem.eql(u8, current, prepared)) {
+    return std.mem.eql(u8, current, prepared);
+}
+
+fn approve(self: *Loop, message_index: usize, call_index: usize) !void {
+    const call = &self.conversation.messages.items[message_index].tool_calls[call_index];
+    if (call.status != .pending) return;
+    if (!try self.actionMatches(call)) {
         call.status = .rejected;
         call.result = try self.allocator.dupe(u8, "action changed while awaiting approval; propose it again");
         call.result_bytes = call.result.?.len;
+        try self.persistToolCall(message_index, call_index);
         return;
     }
+    const approved = try self.allocator.dupe(u8, call.prepared_action.?);
     if (call.approved_action) |old| self.allocator.free(old);
-    call.approved_action = try self.allocator.dupe(u8, prepared);
+    call.approved_action = approved;
     call.begin(tool.monotonicMilliseconds(self.io));
 }
 
@@ -2142,8 +2183,10 @@ fn autoApprove(self: *Loop) !void {
             try self.refuse(message_index, i);
             continue;
         }
-        if (try self.anchorToolPaths(call)) try self.persistToolCall(message_index, i);
-        try self.prepareAction(call);
+        if (call.prepared_action == null) {
+            if (try self.anchorToolPaths(call)) try self.persistToolCall(message_index, i);
+            try self.prepareAction(call);
+        }
         if (call.status != .pending) {
             try self.persistToolCall(message_index, i);
             continue;
@@ -2159,26 +2202,26 @@ fn autoApprove(self: *Loop) !void {
             if (i >= self.hook_flow.pre_index) {
                 self.hook_flow.pre_index = i + 1;
                 if (runner.set.forEvent(.pre_tool_use).len > 0) {
-                    try self.startPolicyHook(.tool_policy, i);
+                    try self.startPolicyHook(.tool_policy, i, null);
                     return;
                 }
             }
             if (i >= self.hook_flow.evaluate_index) {
                 self.hook_flow.evaluate_index = i + 1;
                 if (runner.set.permission_evaluate.len > 0) {
-                    try self.startPolicyHook(.evaluation, i);
+                    try self.startPolicyHook(.evaluation, i, null);
                     return;
                 }
             }
             if (!self.needsNoDecision(call) and i >= self.hook_flow.permission_index) {
                 self.hook_flow.permission_index = i + 1;
                 if (runner.set.forEvent(.permission_request).len > 0) {
-                    try self.startPolicyHook(.permission, i);
+                    try self.startPolicyHook(.permission, i, null);
                     return;
                 }
             }
         }
-        if (self.needsNoDecision(call)) try self.approve(call);
+        if (self.needsNoDecision(call)) try self.approve(message_index, i);
     }
 
     if (self.firstPending() != null) {
@@ -2228,7 +2271,7 @@ fn judgeNext(self: *Loop) !void {
             return;
         }
         if (self.editsInside(call)) {
-            try self.approve(call);
+            try self.approve(message_index, index);
             continue;
         }
         return self.startJudging(index, .quick);
@@ -2242,7 +2285,12 @@ fn editsInside(self: *const Loop, call: *const Conversation.ToolCall) bool {
 }
 
 fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
-    if (stage == .quick) self.review_started_ms = tool.monotonicMilliseconds(self.io);
+    const now = tool.monotonicMilliseconds(self.io);
+    if (stage == .quick) self.review_started_ms = now;
+    if (now - self.review_started_ms >= self.model_policy.reviewer_timeout_ms) {
+        _ = try self.judgeUnavailable(call_index, "reviewer timed out");
+        return;
+    }
     const message_index = self.pendingIndex() orelse return;
     const call = self.conversation.messages.items[message_index].tool_calls[call_index];
     const asker = self.parent orelse self;
@@ -2286,26 +2334,23 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
         .instruction = classifier.instruction(stage),
     });
     self.requests_started += 1;
-    request.started_ms = self.review_started_ms;
     self.judging = .{ .request = request, .convo = convo, .call = call_index, .stage = stage };
     self.state = .classifying;
 }
 
 fn pollJudging(self: *Loop) !bool {
     const judging = self.judging orelse return false;
-    if (!judging.request.isFinished()) {
-        if (!judging.request.expired(self.model_policy.reviewer_timeout_ms)) return false;
-        judging.request.cancel();
-        self.judging = null;
-        defer judging.destroy(self.allocator);
-        return self.judgeUnavailable(judging.call, "reviewer timed out");
-    }
-    judging.request.join();
+    const now = tool.monotonicMilliseconds(self.io);
+    const finished = judging.request.isFinished();
+    const end = if (finished) judging.request.completed_ms else now;
+    const timed_out = end - self.review_started_ms >= self.model_policy.reviewer_timeout_ms;
+    if (!finished and !timed_out) return false;
+    if (finished) judging.request.join() else judging.request.cancel();
     self.judging = null;
     defer judging.destroy(self.allocator);
+    if (timed_out) return self.judgeUnavailable(judging.call, "reviewer timed out");
 
     const message_index = self.pendingIndex() orelse return true;
-    const call = &self.conversation.messages.items[message_index].tool_calls[judging.call];
     const reply = judging.request.reply orelse {
         const why = if (judging.request.failed) |err| @errorName(err) else "no answer";
         return self.judgeUnavailable(judging.call, why);
@@ -2318,7 +2363,7 @@ fn pollJudging(self: *Loop) !bool {
     switch (classifier.verdict(judging.stage, reply.text)) {
         .allow => {
             self.blocks_in_row = 0;
-            try self.approve(call);
+            try self.approve(message_index, judging.call);
             try self.judgeNext();
         },
         .block => |reason| switch (judging.stage) {
@@ -2579,29 +2624,48 @@ pub const Proposal = struct {
 
 /// Record the user's answer for the call currently being asked about.
 pub fn decide(self: *Loop, decision: Decision) !void {
+    return self.applyDecision(decision, .human);
+}
+
+pub fn decideHeadless(self: *Loop, allow_mutating: bool) !void {
     const call = self.pendingCall() orelse return;
+    const allow_call = allow_mutating and !self.hookRequiresApproval(call);
+    return self.applyDecision(if (allow_call) .once else .deny, .headless);
+}
+
+fn applyDecision(self: *Loop, decision: Decision, source: enum { human, headless }) !void {
     const message_index = self.pendingIndex() orelse return;
     const call_index = self.firstPending() orelse return;
-
-    const receipt = try HumanIntent.decisionReceipt(self.allocator, if (decision == .deny) "deny" else "approve", call.name, call.prepared_action orelse call.arguments);
-    defer self.allocator.free(receipt);
+    const message = self.conversation.messages.items[message_index];
+    const call = &message.tool_calls[call_index];
 
     switch (decision) {
-        .once => try self.approve(call),
+        .once => try self.approve(message_index, call_index),
         .always => |breadth| {
-            try self.approve(call);
+            try self.approve(message_index, call_index);
             if (call.status == .running) try self.allow(call, breadth);
         },
         .deny => {
             call.status = .rejected;
-            call.result = try self.allocator.dupe(u8, "denied by the user");
-            call.result_bytes = "denied by the user".len;
-            try self.persistToolCall(message_index, call_index);
+            call.result = try self.allocator.dupe(u8, if (source == .human) "denied by the user" else "denied by headless policy");
+            call.result_bytes = call.result.?.len;
         },
     }
 
-    if (decision == .deny or call.status == .running) try self.recordHuman(receipt, true);
-    if (call.status == .rejected) try self.persistToolCall(message_index, call_index);
+    if (decision == .deny or call.status == .running) {
+        const verdict = if (decision == .deny) "deny" else "approve";
+        switch (source) {
+            .human => {
+                const receipt = try HumanIntent.decisionReceipt(self.allocator, verdict, call.name, call.prepared_action orelse call.arguments);
+                defer self.allocator.free(receipt);
+                try self.recordHuman(receipt, true);
+            },
+            .headless => if (self.db) |db| {
+                if (self.message_ids.get(message.seq)) |id| try db.appendBlob(id, @intCast(call_index), "headless_tool_decision", verdict);
+            },
+        }
+    }
+    if (decision == .deny) try self.persistToolCall(message_index, call_index);
     if (decision == .always and call.status == .running) try self.autoApproveRemaining(message_index);
 
     if (self.firstPending() != null) return;
@@ -2613,9 +2677,9 @@ pub fn decide(self: *Loop, decision: Decision) !void {
 /// decision that may have changed the answer for calls beyond the first.
 fn autoApproveRemaining(self: *Loop, message_index: usize) !void {
     const calls = self.conversation.messages.items[message_index].tool_calls;
-    for (calls) |*call| {
+    for (calls, 0..) |*call, i| {
         if (call.status != .pending) continue;
-        if (self.needsNoDecision(call)) try self.approve(call);
+        if (self.needsNoDecision(call)) try self.approve(message_index, i);
     }
 }
 
@@ -6184,11 +6248,19 @@ test "pre-compaction stop leaves history intact and starts no model attempt" {
     const hook: Hooks.Hook = .{ .legacy = false, .command = "printf '%s' '{\"continue\":false,\"stopReason\":\"keep history\"}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_compact = &.{hook} } };
     loop.hooks = &runner;
+    loop.auto_compact_at = 0.01;
+    loop.usage.context_tokens = 100_000;
+    try testing.expect(try loop.compactIfNeeded());
+    try settle(&loop);
+    try testing.expect(!try loop.compactIfNeeded());
     try loop.compact();
+    try testing.expectEqual(State.running_hooks, loop.state);
     try settle(&loop);
     try testing.expectEqual(@as(usize, 1), fixture.convo.messages.items.len);
     try testing.expectEqualStrings("keep history", fixture.convo.messages.items[0].text);
     try testing.expectEqual(@as(u64, 0), loop.requests_started);
+    try fixture.convo.add(.user, "another message");
+    try testing.expect(loop.shouldCompact());
 }
 
 test "successful manual compaction emits post and a new session context" {
@@ -6214,6 +6286,28 @@ test "successful manual compaction emits post and a new session context" {
         } else try testing.expectEqualStrings("manual", parsed.value.object.get("trigger").?.string);
     }
     try testing.expect(lines.next() == null);
+}
+
+test "teardown waits for the interrupt hook to read the effective route" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .interrupt = &.{.{ .command = "cat > interrupt.json" }} } };
+    {
+        var loop = fixture.loop();
+        defer loop.deinit();
+        loop.hooks = &runner;
+        loop.effective_model = try testing.allocator.dupe(u8, "previous-model");
+        loop.effective_provider = try testing.allocator.dupe(u8, "previous-provider");
+        fixture.fake.latency = .fromSeconds(2);
+        try loop.submit("go", .{});
+        try loop.cancel();
+    }
+    const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "interrupt.json", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(trace);
+    const input = try std.json.parseFromSlice(std.json.Value, testing.allocator, trace, .{});
+    defer input.deinit();
+    try testing.expectEqualStrings("previous-model", input.value.object.get("model").?.string);
+    try testing.expectEqualStrings("previous-provider", input.value.object.get("provider").?.string);
 }
 
 test "an explicit interruption emits one bounded cleanup event" {
@@ -7094,6 +7188,78 @@ test "approval is rejected when arguments or a symlink target changes" {
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "two/file", .{}));
 }
 
+test "policy completion cannot refresh a stale action snapshot" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "fake");
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_evaluate = &.{.{ .command = "true" }} } };
+    loop.hooks = &runner;
+    try loop.submit("list files", .{});
+    while (loop.state == .thinking) {
+        _ = try loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(State.running_hooks, loop.state);
+    const call = loop.pendingCall().?;
+    const changed = try testing.allocator.dupe(u8, "{\"path\":\"different\"}");
+    testing.allocator.free(call.arguments);
+    call.arguments = changed;
+    try settle(&loop);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    try testing.expect(firstCall(&loop).approved_action == null);
+    const saved = (try db.conn.row("SELECT status FROM tool_call", .{})).?;
+    defer saved.deinit();
+    try testing.expectEqualStrings("rejected", saved.text(0));
+}
+
+test "headless allowance leaves protected writes for a person" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .all;
+    loop.control_files = &.{"policy.json"};
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"policy.json\",\"content\":\"sample\"}";
+    try loop.submit("write a sample", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try loop.decideHeadless(true);
+    try settle(&loop);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "policy.json", .{}));
+}
+
+test "a finished review is judged against its completion time" {
+    for ([_]bool{ true, false }) |late| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        var loop = fixture.loop();
+        defer loop.deinit();
+        loop.approvals = .auto;
+        loop.auto_approve_safe = false;
+        loop.model_policy.reviewer_fallback = .deny;
+        loop.model_policy.reviewer_timeout_ms = 100;
+        fixture.fake.tool_name = "bash";
+        fixture.fake.tool_arguments = "{\"command\":\"pwd\"}";
+        try loop.submit("show the current directory", .{});
+        while (loop.judging == null) {
+            _ = try loop.poll();
+            try std.Io.sleep(testing.io, .fromMilliseconds(1), .awake);
+        }
+        const request = loop.judging.?.request;
+        request.join();
+        request.completed_ms -= 1000;
+        loop.review_started_ms = request.completed_ms - @as(i64, if (late) 100 else 99);
+        try settle(&loop);
+        try testing.expectEqual(if (late) Conversation.ToolCall.Status.rejected else .ok, firstCall(&loop).status);
+    }
+}
+
 test "unavailable reviewer uses configured denial and a bounded deadline" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -7111,7 +7277,7 @@ test "unavailable reviewer uses configured denial and a bounded deadline" {
         _ = try loop.poll();
         try std.Io.sleep(testing.io, .fromMilliseconds(1), .awake);
     }
-    loop.judging.?.request.started_ms -= 100;
+    loop.review_started_ms -= 100;
     _ = try loop.pollJudging();
     try settle(&loop);
     try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);

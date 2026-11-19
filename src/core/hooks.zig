@@ -791,6 +791,7 @@ pub const Runner = struct {
     runtime: ?*Runtime = null,
     deadline_ms: ?i64 = null,
     mcp_executor: ?McpExecutor = null,
+    rewrite_author: ?usize = null,
 
     /// Raised when the turn is cancelled. Checked between hooks and on every
     /// slice of the wait for one, so a cancel lands without needing the signal
@@ -857,7 +858,7 @@ pub const Runner = struct {
             const hook = definitions[at];
             if (hook.enabled and hook.async and (invocation.event.requestStage() or invocation.event == .permission_evaluate)) return error.InvalidHookAsync;
             if (self.givenUp()) return error.Cancelled;
-            if (!hook.enabled) {
+            if (!hook.enabled or self.rewrite_author == at or (self.rewrite_author != null and hook.async)) {
                 at += 1;
                 continue;
             }
@@ -925,7 +926,7 @@ pub const Runner = struct {
                 if (self.givenUp()) return error.Cancelled;
                 while (at < end and running < slots.len and pending < 64) : (at += 1) {
                     const grouped = definitions[at];
-                    if (!grouped.enabled) continue;
+                    if (!grouped.enabled or self.rewrite_author == at or (self.rewrite_author != null and grouped.async)) continue;
                     const grouped_match = hookMatches(allocator, grouped, invocation) catch |err| {
                         if (err == error.OutOfMemory) return err;
                         if (at < failure_at) {
@@ -978,7 +979,10 @@ pub const Runner = struct {
                             failure = err;
                             failure_at = merged;
                         }
-                    } else try outcome.merge(allocator, job.result);
+                    } else {
+                        try outcome.merge(allocator, job.result);
+                        if (job.result.replacement != null) outcome.replacement_author = merged;
+                    }
                     if (self.runtime) |runtime| try runtime.bound(allocator, &outcome);
                     job.destroy();
                     jobs[merged - start] = null;

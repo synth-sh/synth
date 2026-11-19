@@ -16,6 +16,7 @@ pub const Result = struct {
     context: ?[]u8 = null,
     message: ?[]u8 = null,
     replacement: ?[]u8 = null,
+    replacement_author: ?usize = null,
     feedback: ?[]u8 = null,
     permission: ?Permission = null,
     stop: bool = false,
