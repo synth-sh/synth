@@ -363,7 +363,7 @@ pub const Rename = struct { sessionId: []const u8, title: []const u8 };
 pub const ConnectProvider = struct {
     sessionId: []const u8,
     provider: []const u8,
-    host: []const u8,
+    host: ?[]const u8 = null,
     key: ?[]const u8 = null,
 };
 pub const ToggleMcp = struct { sessionId: []const u8, name: []const u8 };

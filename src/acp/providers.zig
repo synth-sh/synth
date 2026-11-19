@@ -76,7 +76,7 @@ pub fn states(self: *const Providers, arena: std.mem.Allocator, db: *Database) !
     const out = try arena.alloc(synth.ProviderState, catalog.all.len);
     for (catalog.all, out) |entry, *state| state.* = .{
         .id = entry.id,
-        .host = try hostOf(arena, db, entry),
+        .host = try self.endpoint(arena, db, entry),
         .connected = self.isConnected(entry),
         .active = !missing and std.mem.eql(u8, entry.id, self.active_id),
     };
@@ -97,14 +97,22 @@ pub fn hostOf(arena: std.mem.Allocator, db: *Database, entry: catalog.Entry) ![]
     return if (remembered.len > 0) remembered else entry.host;
 }
 
+pub fn endpoint(self: *const Providers, arena: std.mem.Allocator, db: *Database, entry: catalog.Entry) ![]const u8 {
+    if (std.mem.eql(u8, entry.id, self.active_id)) return self.backend.currentHost();
+    return hostOf(arena, db, entry);
+}
+
 /// Store `key` when one is given and point the session at the provider.
 /// Returns what the session now answers as.
 pub fn connect(self: *Providers, entry: catalog.Entry, host: []const u8, key: ?[]const u8) !Provider {
+    const same_endpoint = std.mem.eql(u8, entry.id, self.active_id) and std.mem.eql(u8, host, self.backend.currentHost());
+    const credential: ?[]const u8 = key orelse self.auth.key(entry.id) orelse if (same_endpoint) self.backend.currentKey() else null;
+    if (entry.key == .required and (credential == null or credential.?.len == 0)) return error.ProviderKeyRequired;
     if (key) |secret| {
         try self.auth.set(entry.id, secret);
         try self.auth.save(self.io, self.auth.path);
     }
-    const provider = try self.backend.connect(entry, host, self.auth.key(entry.id));
+    const provider = try self.backend.connect(entry, host, credential);
     self.active_id = entry.id;
     self.missing = false;
     return provider;
