@@ -5,7 +5,7 @@ const Config = @import("config.zig");
 pub const State = struct { trusted: bool = false, disabled: bool = false };
 pub const Store = struct {
     arena: std.heap.ArenaAllocator,
-    entries: std.StringHashMapUnmanaged(State) = .empty,
+    entries: std.json.ArrayHashMap(State) = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, path: ?[]const u8) !Store {
         var self: Store = .{ .arena = .init(allocator) };
@@ -18,45 +18,26 @@ pub const Store = struct {
         };
         const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{});
         if (parsed != .object) return error.InvalidHookTrustStore;
-        var entries = parsed.object.iterator();
-        while (entries.next()) |entry| {
-            const json = try std.json.Stringify.valueAlloc(a, entry.value_ptr.*, .{});
-            try self.entries.put(a, entry.key_ptr.*, try std.json.parseFromSliceLeaky(State, a, json, .{}));
-        }
+        self.entries = try std.json.parseFromValueLeaky(std.json.ArrayHashMap(State), a, parsed, .{});
         return self;
     }
     pub fn deinit(self: *Store) void {
         self.arena.deinit();
     }
     pub fn get(self: Store, id: []const u8) State {
-        return self.entries.get(id) orelse .{};
+        return self.entries.map.get(id) orelse .{};
     }
     pub fn put(self: *Store, id: []const u8, state: State) !void {
-        try self.entries.put(self.arena.allocator(), try self.arena.allocator().dupe(u8, id), state);
+        try self.entries.map.put(self.arena.allocator(), try self.arena.allocator().dupe(u8, id), state);
     }
     pub fn save(self: *Store, io: std.Io, path: []const u8) !void {
-        try Config.ensureDir(io, path);
-        const a = self.arena.allocator();
-        var writer: std.Io.Writer.Allocating = .init(a);
-        var json: std.json.Stringify = .{ .writer = &writer.writer };
-        try json.beginObject();
-        var entries = self.entries.iterator();
-        while (entries.next()) |entry| {
-            try json.objectField(entry.key_ptr.*);
-            try json.write(entry.value_ptr.*);
-        }
-        try json.endObject();
-        var nonce: [16]u8 = undefined;
-        io.random(&nonce);
-        const temporary = try std.fmt.allocPrint(a, "{s}.{s}.tmp", .{ path, std.fmt.bytesToHex(nonce, .lower) });
-        const file = try std.Io.Dir.cwd().createFile(io, temporary, .{ .exclusive = true, .permissions = .fromMode(0o600) });
-        defer file.close(io);
-        errdefer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
+        var file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true, .make_path = true, .permissions = .fromMode(0o600) });
+        defer file.deinit(io);
         var buffer: [4096]u8 = undefined;
-        var out = file.writer(io, &buffer);
-        try out.interface.writeAll(writer.written());
+        var out = file.file.writer(io, &buffer);
+        try std.json.Stringify.value(self.entries, .{}, &out.interface);
         try out.interface.flush();
-        try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), path, io);
+        try file.replace(io);
     }
 };
 
