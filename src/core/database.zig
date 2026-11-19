@@ -648,16 +648,22 @@ pub fn recordAuthorization(self: *Database, session: i64, seq: u64, text: []cons
 pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) !HumanIntent.Snapshot {
     var rows = try self.conn.rows(
         \\WITH authorizations AS (
-        \\SELECT text, seq, id AS source_order, CASE WHEN json_valid(text) THEN json_extract(text, '$.kind') END AS kind FROM human_authorization WHERE session_id = ?
+        \\    SELECT text, seq, id, CASE WHEN json_valid(text) THEN json_extract(text, '$.kind') END AS kind
+        \\    FROM human_authorization WHERE session_id = ?1
+        \\), recent_reviews AS (
+        \\    SELECT text, seq, id FROM authorizations
+        \\    WHERE kind IS NOT 'human_answer' AND text NOT LIKE '{"kind":"human_answer",%'
+        \\    ORDER BY seq DESC, id DESC LIMIT ?2
         \\)
-        \\SELECT text, decision FROM (
-        \\SELECT text, seq, id AS source_order, 0 AS decision FROM message WHERE session_id = ? AND role = 'user' AND origin = 'human'
+        \\SELECT text, 0 AS is_authorization, seq, id FROM message
+        \\WHERE session_id = ?1 AND role = 'user' AND origin = 'human'
         \\UNION ALL
-        \\SELECT text, seq, source_order, 1 AS decision FROM authorizations WHERE kind = 'human_answer' OR (kind IS NULL AND text LIKE '{"kind":"human_answer",%')
+        \\SELECT text, 1, seq, id FROM authorizations
+        \\WHERE kind = 'human_answer' OR (kind IS NULL AND text LIKE '{"kind":"human_answer",%')
         \\UNION ALL
-        \\SELECT text, seq, source_order, 1 AS decision FROM (SELECT text, seq, source_order FROM authorizations WHERE kind IS NOT 'human_answer' AND text NOT LIKE '{"kind":"human_answer",%' ORDER BY seq DESC, source_order DESC LIMIT ?)
-        \\) ORDER BY seq ASC, source_order ASC
-    , .{ session, session, HumanIntent.max_previous_reviews + 1 });
+        \\SELECT text, 1, seq, id FROM recent_reviews
+        \\ORDER BY seq, id
+    , .{ session, HumanIntent.max_previous_reviews + 1 });
     defer rows.deinit();
     var intent: HumanIntent = .{};
     defer intent.deinit(allocator);
@@ -2670,15 +2676,12 @@ test "persisted human intent uses the same guardian retention and omission polic
         try db.setMessageOrigin(id, .human);
     }
     const snapshot = try db.humanIntent(a, session);
+    defer snapshot.deinit(a);
     const messages = snapshot.messages;
-    defer {
-        for (messages) |*msg| msg.deinit(a);
-        a.free(messages);
-    }
+    try std.testing.expectEqual(HumanIntent.max_family_records + 1, messages.len);
     try std.testing.expectEqualStrings("stop now", messages[messages.len - 2].text);
     try std.testing.expectEqualStrings(HumanIntent.omission_notice, messages[messages.len - 1].text);
     try std.testing.expect(snapshot.has_human);
-    try std.testing.expectEqual(HumanIntent.max_family_records + 1, messages.len);
 }
 
 test "legacy answers without typed provenance are omitted with notice" {
@@ -2687,12 +2690,12 @@ test "legacy answers without typed provenance are omitted with notice" {
     defer db.deinit();
     const project = try db.resolveProject("/repo", "git", "repo");
     const session = try db.createSession(project, "/repo", "model");
-    const message = try db.appendMessage(session, 0, "user", "inspect", null, 0, null);
-    try db.setMessageOrigin(message, .human);
     try db.recordAuthorization(session, 1, "{\"kind\":\"human_answer\",\"answer\":\"partial answer\",\"is_complete\":false}");
     const snapshot = try db.humanIntent(a, session);
     defer snapshot.deinit(a);
-    try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[snapshot.messages.len - 1].text);
+    try std.testing.expect(!snapshot.has_human);
+    try std.testing.expectEqual(1, snapshot.messages.len);
+    try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[0].text);
 }
 
 test "human answers survive ordinary receipt eviction without losing their restrictions" {

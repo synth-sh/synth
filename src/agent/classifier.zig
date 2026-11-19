@@ -104,72 +104,60 @@ pub fn material(
     history: []const Conversation.Message,
     call: Conversation.ToolCall,
 ) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, "Execution context (harness supplied):\n");
-    try writeEscaped(arena, &out, project_root);
-    try out.appendSlice(arena, "\n\n");
-
-    try out.appendSlice(arena, "Human instructions and original untrusted questions, in source order:\n");
-    var writer = std.Io.Writer.Allocating.init(arena);
-    defer writer.deinit();
+    var buffer: std.Io.Writer.Allocating = .init(arena);
+    defer buffer.deinit();
+    const writer = &buffer.writer;
+    try writer.writeAll("Execution context (harness supplied):\n");
+    try HumanIntent.writeEscaped(writer, project_root);
+    try writer.writeAll("\n\nHuman instructions and original untrusted questions, in source order:\n");
     for (intent) |message| {
-        if (message.role == .user and message.origin == .human or message.role == .assistant and message.origin == .agent or message.role == .system and message.origin == .harness) {
-            try HumanIntent.writeMessage(&writer.writer, message);
+        const show = switch (message.origin) {
+            .human => message.role == .user,
+            .agent => message.role == .assistant,
+            .harness => message.role == .system,
+            else => false,
+        };
+        if (show) try HumanIntent.writeMessage(writer, message);
+    }
+    try writer.writeAll("\nPrevious human decisions, scoped only to their reviewed actions:\n");
+    for (intent) |message| {
+        if (message.origin == .human_decision) try HumanIntent.writeMessage(writer, message);
+    }
+
+    try writer.writeAll("\nActions the agent already took, oldest first:\n");
+    var calls: [max_history_calls]*const Conversation.ToolCall = undefined;
+    var start = calls.len;
+    var messages = std.mem.reverseIterator(history);
+    recent: while (messages.next()) |message| {
+        if (message.role != .assistant) continue;
+        var earlier = std.mem.reverseIterator(message.tool_calls);
+        while (earlier.nextPtr()) |action| {
+            if (action.status == .pending) continue;
+            start -= 1;
+            calls[start] = action;
+            if (start == 0) break :recent;
         }
     }
-    try out.appendSlice(arena, writer.written());
-    try out.appendSlice(arena, "\nPrevious human decisions, scoped only to their reviewed actions:\n");
-    writer.clearRetainingCapacity();
-    for (intent) |message| {
-        if (message.origin == .human_decision) try HumanIntent.writeMessage(&writer.writer, message);
-    }
-    try out.appendSlice(arena, writer.written());
+    if (start == calls.len) try writer.writeAll("(none)\n");
+    for (calls[start..]) |action| try writeCall(writer, action.*, true);
 
-    try out.appendSlice(arena, "\nActions the agent already took, oldest first:\n");
-    var calls: std.ArrayList(Conversation.ToolCall) = .empty;
-    for (history) |msg| {
-        if (msg.role != .assistant) continue;
-        for (msg.tool_calls) |earlier| {
-            if (earlier.status == .pending) continue;
-            try calls.append(arena, earlier);
-        }
-    }
-    const shown = calls.items[calls.items.len -| max_history_calls..];
-    if (shown.len == 0) try out.appendSlice(arena, "(none)\n");
-    for (shown) |earlier| try writeCall(arena, &out, earlier, true);
-
-    try out.appendSlice(arena, "\nThe action to judge:\n");
-    try writeCall(arena, &out, call, false);
-    return out.items;
+    try writer.writeAll("\nThe action to judge:\n");
+    try writeCall(writer, call, false);
+    return buffer.toOwnedSlice();
 }
 
-fn writeCall(arena: std.mem.Allocator, out: *std.ArrayList(u8), call: Conversation.ToolCall, truncate: bool) !void {
+fn writeCall(writer: *std.Io.Writer, call: Conversation.ToolCall, truncate: bool) std.Io.Writer.Error!void {
     const arguments = if (truncate) call.arguments[0..@min(call.arguments.len, max_arguments_bytes)] else call.arguments;
     const outcome = switch (call.status) {
         .rejected => " refused=\"true\"",
         else => "",
     };
-    try out.appendSlice(arena, "<call tool=\"");
-    try writeEscaped(arena, out, call.name);
-    try out.print(arena, "\"{s}>\n", .{outcome});
-    try writeEscaped(arena, out, arguments);
-    if (arguments.len < call.arguments.len) try out.appendSlice(arena, " ...(cut)");
-    try out.appendSlice(arena, "\n</call>\n");
-}
-
-/// Escaped as XML text, so arguments cannot close their own `<call>`.
-fn writeEscaped(arena: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
-    for (text) |byte| switch (byte) {
-        '<' => try out.appendSlice(arena, "&lt;"),
-        '>' => try out.appendSlice(arena, "&gt;"),
-        '&' => try out.appendSlice(arena, "&amp;"),
-        '"' => try out.appendSlice(arena, "&quot;"),
-        else => try out.append(arena, byte),
-    };
-}
-
-fn tail(text: []const u8, limit: usize) []const u8 {
-    return if (text.len > limit) text[text.len - limit ..] else text;
+    try writer.writeAll("<call tool=\"");
+    try HumanIntent.writeEscaped(writer, call.name);
+    try writer.print("\"{s}>\n", .{outcome});
+    try HumanIntent.writeEscaped(writer, arguments);
+    if (arguments.len < call.arguments.len) try writer.writeAll(" ...(cut)");
+    try writer.writeAll("\n</call>\n");
 }
 
 /// Read the classifier's answer for `stage`.
@@ -267,7 +255,7 @@ test "human request restrictions survive decision receipts" {
     const a = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(a);
     defer arena.deinit();
-    var intent: @import("../core/human_intent.zig") = .{};
+    var intent: HumanIntent = .{};
     defer intent.deinit(a);
     const restriction = "inspect only; do not upload";
     try intent.record(a, restriction, false);
@@ -275,6 +263,9 @@ test "human request restrictions survive decision receipts" {
     defer a.free(receipt);
     for (0..20) |_| try intent.record(a, receipt, true);
     const text = try material(arena.allocator(), "/repo", try intent.view(arena.allocator()), &.{}, .{ .id = "call", .name = "bash", .arguments = "{}" });
-    try std.testing.expect(std.mem.indexOf(u8, text, restriction) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "<decision>") != null);
+    const instructions = std.mem.indexOf(u8, text, "<person>\n" ++ restriction ++ "\n</person>") orelse return error.TestUnexpectedResult;
+    const decisions = std.mem.indexOf(u8, text, "Previous human decisions") orelse return error.TestUnexpectedResult;
+    const review = std.mem.indexOf(u8, text, "<decision>\nThis decision applies only to this action.") orelse return error.TestUnexpectedResult;
+    try testing.expect(instructions < decisions and decisions < review);
+    try testing.expectEqual(HumanIntent.max_previous_reviews, std.mem.count(u8, text, "rm exactly-one-file"));
 }
