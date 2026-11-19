@@ -760,7 +760,7 @@ test "a request names its cache key as its session, so it is routed to its cache
     try testing.expectEqualStrings(parsed.object.get("prompt_cache_key").?.string, headers[1].value);
 }
 
-test "a recorded turn is replayed verbatim, in order, ahead of its outputs" {
+test "recorded items keep their order and metadata while replaying effective call arguments" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const store = try testStore(&tmp);
@@ -783,7 +783,7 @@ test "a recorded turn is replayed verbatim, in order, ahead of its outputs" {
         \\{"provider":"chatgpt","model":"gpt-test","items":[
         \\{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"opaque"},
         \\{"id":"msg_1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Reading both."}]},
-        \\{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a\"}"},
+        \\{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"proposed\"}"},
         \\{"id":"fc_2","type":"function_call","call_id":"call_2","name":"read","arguments":"{\"path\":\"b\"}"}]}
         ,
     });
@@ -801,6 +801,9 @@ test "a recorded turn is replayed verbatim, in order, ahead of its outputs" {
     for (expected, input) |kind, item| try testing.expectEqualStrings(kind, item.object.get("type").?.string);
     try testing.expectEqualStrings("opaque", input[2].object.get("encrypted_content").?.string);
     try testing.expectEqualStrings("commentary", input[3].object.get("phase").?.string);
+    try testing.expectEqualStrings("fc_1", input[4].object.get("id").?.string);
+    try testing.expectEqualStrings(calls[0].arguments, input[4].object.get("arguments").?.string);
+    try testing.expectEqualStrings(calls[1].arguments, input[5].object.get("arguments").?.string);
     try testing.expectEqualStrings("call_2", input[7].object.get("call_id").?.string);
     try testing.expectEqualStrings("contents of a", input[6].object.get("output").?.string);
     try testing.expectEqualStrings("contents of b", input[7].object.get("output").?.string);
