@@ -29,8 +29,6 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
