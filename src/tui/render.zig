@@ -2459,3 +2459,83 @@ test "a transcript drag follows the wheel and copies what it scrolled over" {
     defer if (copied) |text| testing.allocator.free(text);
     try testing.expectEqualStrings("message 25\n\nmessage 26\n\nmessage 27", copied.?);
 }
+
+fn dragFixture(model: *Model, userdata: *u8, arena: std.mem.Allocator) !vxfw.DrawContext {
+    try chromeFixture(model, userdata, null);
+    for (0..6) |i| {
+        const text = try std.fmt.allocPrint(arena, "message {d}", .{i});
+        if (i % 2 == 0) {
+            _ = try model.conversation.addUser(text, &.{}, &.{});
+        } else {
+            _ = try model.conversation.addAssistant(text, null, null);
+        }
+    }
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = 60, .height = 20 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    _ = try draw(model, ctx);
+    return ctx;
+}
+
+test "a click that wobbles a cell in the transcript passes on as a click" {
+    const testing = std.testing;
+    const keys = @import("keys.zig");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    var userdata: u8 = 0;
+    var model: Model = undefined;
+    const ctx = try dragFixture(&model, &userdata, arena_state.allocator());
+    defer model.deinit();
+
+    var events: vxfw.EventContext = .{ .io = testing.io, .alloc = testing.allocator, .cmds = .empty };
+    defer events.cmds.deinit(testing.allocator);
+    try keys.trackSelection(&model, &events, .{ .col = 4, .row = 12, .button = .left, .mods = .{}, .type = .press });
+    try keys.trackSelection(&model, &events, .{ .col = 5, .row = 12, .button = .left, .mods = .{}, .type = .drag });
+    _ = try draw(&model, ctx);
+    try testing.expect(model.transcript_drag != null);
+
+    events.consume_event = false;
+    try keys.trackSelection(&model, &events, .{ .col = 5, .row = 12, .button = .left, .mods = .{}, .type = .release });
+    try testing.expect(model.transcript_drag == null);
+    try testing.expect(!events.consume_event);
+    try testing.expectEqual(@as(usize, 0), events.cmds.items.len);
+}
+
+test "a transcript drag that crosses the plan is still let go over it" {
+    const testing = std.testing;
+    const keys = @import("keys.zig");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    var userdata: u8 = 0;
+    var model: Model = undefined;
+    const ctx = try dragFixture(&model, &userdata, arena_state.allocator());
+    defer model.deinit();
+
+    var events: vxfw.EventContext = .{ .io = testing.io, .alloc = testing.allocator, .cmds = .empty };
+    defer events.cmds.deinit(testing.allocator);
+    try keys.trackSelection(&model, &events, .{ .col = 4, .row = 8, .button = .left, .mods = .{}, .type = .press });
+    try keys.trackSelection(&model, &events, .{ .col = 4, .row = 12, .button = .left, .mods = .{}, .type = .drag });
+    _ = try draw(&model, ctx);
+    try testing.expect(model.transcript_drag != null);
+
+    model.sidebar_col = 40;
+    model.plan_top = 2;
+    model.plan_bottom = 6;
+    const expanded = model.mirror.todos.expanded;
+    const over_plan: vaxis.Mouse = .{ .col = 45, .row = 3, .button = .left, .mods = .{}, .type = .release };
+    try keys.typeErasedCaptureHandler(&model, &events, .{ .mouse = over_plan });
+    try testing.expect(model.transcript_drag == null);
+    try testing.expectEqual(expanded, model.mirror.todos.expanded);
+
+    for (events.cmds.items) |cmd| switch (cmd) {
+        .copy_to_clipboard => |text| testing.allocator.free(text),
+        else => {},
+    };
+}

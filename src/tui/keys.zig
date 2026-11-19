@@ -16,6 +16,7 @@ const bell = @import("bell.zig");
 const editor = @import("editor.zig");
 const Model = @import("model.zig");
 const Selection = @import("selection.zig");
+const transcript_map = @import("transcript_map.zig");
 const render = @import("render.zig");
 const widget_pool = @import("widget_pool.zig");
 const themes = @import("themes.zig");
@@ -72,6 +73,8 @@ pub fn typeErasedCaptureHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event:
 /// Consuming a press in the capture phase is what stops the two from toggling
 /// twice. Returns whether the event was the plan's.
 fn trackPlan(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) !bool {
+    if (self.transcript_drag != null or self.selection.dragging) return false;
+
     const row: u16 = @intCast(@max(mouse.row, 0));
     const col: u16 = @intCast(@max(mouse.col, 0));
 
@@ -184,16 +187,21 @@ fn dragTranscript(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse, poi
     ctx.consumeAndRedraw();
 }
 
-/// Let go of a transcript drag: copy what it covered, on screen or not.
+/// Let go of a transcript drag: copy what it covered, on screen or not. One
+/// that never got past the cell next to where it started is a click that
+/// wobbled, and is passed on for a card or link under it to take.
 fn endTranscriptDrag(self: *Model, ctx: *vxfw.EventContext) !void {
     const drag = self.transcript_drag orelse return;
     self.transcript_drag = null;
     defer self.selection.clear();
-    defer ctx.consumeAndRedraw();
 
-    const layout = self.transcriptLayout() orelse return;
-    const head = layout.locate(drag.pointer) orelse return;
-    if (drag.anchor.order(head) == .eq) return;
+    const layout = self.transcriptLayout() orelse return ctx.consumeAndRedraw();
+    const head = layout.locate(drag.pointer) orelse return ctx.consumeAndRedraw();
+    if (!drag.left_start_row and isWobble(drag.anchor, head)) {
+        ctx.redraw = true;
+        return;
+    }
+    defer ctx.consumeAndRedraw();
     const from, const to = if (drag.anchor.order(head) == .lt) .{ drag.anchor, head } else .{ head, drag.anchor };
 
     const copied = try render.transcriptText(self, self.allocator, from, to) orelse return;
@@ -201,6 +209,11 @@ fn endTranscriptDrag(self: *Model, ctx: *vxfw.EventContext) !void {
     if (copied.len == 0) return;
     try ctx.copyToClipboard(copied);
     try self.notification.show(ctx, .info, "Copied to clipboard");
+}
+
+fn isWobble(anchor: transcript_map.Position, head: transcript_map.Position) bool {
+    if (anchor.block.order(head.block) != .eq or anchor.row != head.row) return false;
+    return @max(anchor.col, head.col) - @min(anchor.col, head.col) <= 1;
 }
 
 /// How often a drag held at the transcript's edge scrolls it by a row.
