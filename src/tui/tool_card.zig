@@ -91,7 +91,7 @@ fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.
                 .left => {},
                 else => return ctx.consumeEvent(),
             }
-            if (mouse.type != .press) return;
+            if (mouse.type != .release) return;
             if (self.open) |open| {
                 open.call(open.userdata, open.key, open.seq, open.index, self.name);
                 return ctx.consumeAndRedraw();
@@ -206,14 +206,14 @@ fn drawHeader(self: *ToolCard, arena: std.mem.Allocator, surface: vxfw.Surface, 
 /// over, what it is doing while it is not, and the hint under the pointer.
 fn trailingText(self: *const ToolCard, arena: std.mem.Allocator) []const u8 {
     if (self.has_mouse) {
-        if (self.open != null) return "click to open transcript";
+        if (self.open != null) return w.decoration("click to open transcript");
         if (self.result != null or self.capped) {
-            return if (self.expanded) "click to collapse" else "click to expand";
+            return if (self.expanded) w.decoration("click to collapse") else w.decoration("click to expand");
         }
     }
     switch (self.status) {
-        .running => return "running...",
-        .pending => return "waiting...",
+        .running => return w.decoration("running..."),
+        .pending => return w.decoration("waiting..."),
         else => {},
     }
     const ms = self.elapsed_ms orelse return "";
@@ -729,9 +729,6 @@ test "the box has no ground of its own showing between its edge and its contents
     try testing.expect(tinted > (width - text_col) / 2);
 }
 
-
-
-
 test "a call hangs off a rule one level in from the reply that made it" {
     const testing = std.testing;
 
@@ -756,7 +753,6 @@ test "a call hangs off a rule one level in from the reply that made it" {
         try testing.expectEqualStrings(" ", surface.buffer[col].char.grapheme);
     }
 }
-
 
 test "a finished call reports how long it took, in place of what it was doing" {
     const testing = std.testing;
@@ -785,4 +781,19 @@ test "a finished call reports how long it took, in place of what it was doing" {
     card.status = .rejected;
     const refused = try rowText(arena, try card.draw(drawContext(arena, width)), 0);
     try testing.expect(std.mem.endsWith(u8, refused, "read"));
+}
+
+test "a card toggles when the click lets go, so a drag that starts on it changes nothing" {
+    var card: ToolCard = .{ .name = "list", .result = "a\nb\nc" };
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = std.testing.allocator, .cmds = .empty };
+    defer ctx.cmds.deinit(std.testing.allocator);
+
+    const at: vaxis.Mouse = .{ .col = 0, .row = 0, .button = .left, .mods = .{}, .type = .press };
+    try typeErasedEventHandler(&card, &ctx, .{ .mouse = at });
+    try std.testing.expect(!card.expanded);
+
+    var released = at;
+    released.type = .release;
+    try typeErasedEventHandler(&card, &ctx, .{ .mouse = released });
+    try std.testing.expect(card.expanded);
 }

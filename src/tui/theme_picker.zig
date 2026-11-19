@@ -192,7 +192,7 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
         if (chosen) w.fillRow(surface, y, 1, width - 2, base.cell);
 
         const in_use = std.mem.eql(u8, entry.id, self.previous);
-        if (in_use) _ = w.writeText(surface, pad, y, "●", base.withFg(theme.success).cell);
+        if (in_use) _ = w.writeText(surface, pad, y, w.dot, base.withFg(theme.success).cell);
 
         const x = w.writeText(surface, pad + 2, y, entry.label, base.withFg(theme.fg).cell);
         swatch(surface, x + 1, y, entry, base);

@@ -179,7 +179,7 @@ pub fn draw(self: *Popup, ctx: vxfw.DrawContext, widget: vxfw.Widget, width: u16
             while (col < width) : (col += 1) {
                 surface.writeCell(col, @intCast(row), .{ .style = theme.on_card(theme.fg).cell });
             }
-            _ = w.writeText(surface, 0, @intCast(row), "▌", theme.on_card(theme.accent).cell);
+            _ = w.writeText(surface, 0, @intCast(row), w.block_rule, theme.on_card(theme.accent).cell);
         }
 
         _ = w.writeText(surface, 2, @intCast(row), path, style);
