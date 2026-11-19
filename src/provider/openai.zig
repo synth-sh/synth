@@ -150,7 +150,7 @@ fn probe(self: *OpenAIProvider) void {
 
     const listing = self.get(arena, models_path) catch null;
     if (self.model_listing) |old| self.allocator.free(old);
-    self.model_listing = if (isOfficialHost(self.host) and listing != null) self.allocator.dupe(u8, listing.?) catch null else null;
+    self.model_listing = if (listing) |body| self.allocator.dupe(u8, body) catch null else null;
     self.is_model_unlisted = self.isRefused(arena, self.model_listing, self.model);
     self.learnWindow(arena, listing);
 }
@@ -409,18 +409,15 @@ pub fn listModels(self: *OpenAIProvider, allocator: std.mem.Allocator) ![][]cons
     const arena = arena_state.allocator();
 
     const body = try self.get(arena, models_path);
-    if (isOfficialHost(self.host)) {
-        const kept = try self.allocator.dupe(u8, body);
-        if (self.model_listing) |old| self.allocator.free(old);
-        self.model_listing = kept;
-    }
-
     const Listing = struct {
         data: []const struct { id: []const u8 = "" } = &.{},
     };
     const parsed = std.json.parseFromSlice(Listing, arena, body, .{
         .ignore_unknown_fields = true,
     }) catch return error.UnexpectedResponse;
+    const kept = try self.allocator.dupe(u8, body);
+    if (self.model_listing) |old| self.allocator.free(old);
+    self.model_listing = kept;
 
     const names = try allocator.alloc([]const u8, parsed.value.data.len);
     var filled: usize = 0;
