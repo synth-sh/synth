@@ -56,7 +56,6 @@ const Family = struct {
 
 pub const Snapshot = struct {
     messages: []Conversation.Message,
-    is_complete: bool,
     has_human: bool,
 
     pub fn deinit(self: Snapshot, a: std.mem.Allocator) void {
@@ -202,10 +201,7 @@ pub fn snapshot(self: Intent, a: std.mem.Allocator) !Snapshot {
         copy.* = try message.clone(a);
         built += 1;
     }
-    const complete = for (messages) |message| {
-        if (message.role == .system and message.origin == .harness) break false;
-    } else true;
-    return .{ .messages = owned, .is_complete = complete, .has_human = self.has_human };
+    return .{ .messages = owned, .has_human = self.has_human };
 }
 
 pub fn writeMessage(w: *std.Io.Writer, message: Conversation.Message) !void {
@@ -235,7 +231,6 @@ test "guardian bounds omit complete records and keep review evidence available" 
     try std.testing.expect(intent.has_human);
     const saved = try intent.snapshot(a);
     defer saved.deinit(a);
-    try std.testing.expect(!saved.is_complete);
     try std.testing.expectEqualStrings("request 12", saved.messages[0].text);
     try std.testing.expectEqualStrings(omission_notice, saved.messages[saved.messages.len - 1].text);
 }

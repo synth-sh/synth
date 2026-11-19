@@ -2677,7 +2677,6 @@ test "persisted human intent uses the same guardian retention and omission polic
     }
     try std.testing.expectEqualStrings("stop now", messages[messages.len - 2].text);
     try std.testing.expectEqualStrings(HumanIntent.omission_notice, messages[messages.len - 1].text);
-    try std.testing.expect(!snapshot.is_complete);
     try std.testing.expect(snapshot.has_human);
     try std.testing.expectEqual(HumanIntent.max_family_records + 1, messages.len);
 }
@@ -2693,7 +2692,7 @@ test "legacy answers without typed provenance are omitted with notice" {
     try db.recordAuthorization(session, 1, "{\"kind\":\"human_answer\",\"answer\":\"partial answer\",\"is_complete\":false}");
     const snapshot = try db.humanIntent(a, session);
     defer snapshot.deinit(a);
-    try std.testing.expect(!snapshot.is_complete);
+    try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[snapshot.messages.len - 1].text);
 }
 
 test "human answers survive ordinary receipt eviction without losing their restrictions" {
@@ -2713,7 +2712,7 @@ test "human answers survive ordinary receipt eviction without losing their restr
     for (2..100) |seq| try db.recordAuthorization(session, seq, review);
     const snapshot = try db.humanIntent(a, session);
     defer snapshot.deinit(a);
-    try std.testing.expect(!snapshot.is_complete);
+    try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[snapshot.messages.len - 2].text);
     const present = for (snapshot.messages) |message| {
         if (message.origin == .human and std.mem.eql(u8, message.text, answer)) break true;
     } else false;
@@ -2766,5 +2765,5 @@ test "recent human decisions use stable order and describe only their reviewed a
         count += 1;
     }
     try std.testing.expectEqual(HumanIntent.max_previous_reviews, count);
-    try std.testing.expect(!snapshot.is_complete);
+    try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[snapshot.messages.len - 2].text);
 }
