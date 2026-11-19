@@ -57,7 +57,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release/* \
-            --verify-tag --latest \
-            --title "synth v${{ steps.vars.outputs.version }}" \
-            --generate-notes
+          set -euo pipefail
+
+          tags=$(gh api --paginate "repos/{owner}/{repo}/releases" --jq '.[].tag_name')
+          if ! grep -Fxq -- "$GITHUB_REF_NAME" <<< "$tags"; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag --latest \
+              --title "synth v${{ steps.vars.outputs.version }}" \
+              --generate-notes
+          fi
+
+          assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
+          for asset in release/*; do
+            if ! grep -Fxq -- "${asset##*/}" <<< "$assets"; then
+              gh release upload "$GITHUB_REF_NAME" "$asset"
+            fi
+          done
