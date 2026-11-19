@@ -5,7 +5,6 @@ const Flow = @This();
 const Loop = @import("loop.zig");
 const Database = @import("../core/database.zig");
 
-pub const Purpose = std.meta.Tag(Pending);
 pub const Compaction = enum { manual, idle, during_turn };
 pub const Resume = enum { begin_prompt, ask_model, compact, compact_session, after_compact, finish_turn, config_idle, failed_turn };
 pub const Pending = union(enum) {
@@ -13,21 +12,10 @@ pub const Pending = union(enum) {
     steering,
     expansion,
     owner_post: usize,
-    tool_policy: usize,
-    permission: usize,
-    evaluation: usize,
+    policy: usize,
     lifecycle: Resume,
     auto_denied: usize,
     task_policy: usize,
-
-    pub fn policy(kind: Purpose, index: usize) Pending {
-        return switch (kind) {
-            .tool_policy => .{ .tool_policy = index },
-            .permission => .{ .permission = index },
-            .evaluation => .{ .evaluation = index },
-            else => unreachable,
-        };
-    }
 };
 
 pending: Pending = .prompt,
@@ -61,19 +49,6 @@ session_handle: ?[]const u8 = null,
 pub fn setNotice(self: *Flow, allocator: std.mem.Allocator, notice: []u8) void {
     if (self.notice) |old| allocator.free(old);
     self.notice = notice;
-}
-
-pub fn purpose(self: *const Flow) Purpose {
-    return std.meta.activeTag(self.pending);
-}
-pub fn continuation(self: *const Flow) Resume {
-    return self.pending.lifecycle;
-}
-pub fn callIndex(self: *const Flow) usize {
-    return switch (self.pending) {
-        .owner_post, .tool_policy, .permission, .evaluation, .auto_denied, .task_policy => |index| index,
-        else => unreachable,
-    };
 }
 
 pub fn reset(self: *Flow) void {
@@ -197,9 +172,7 @@ pub fn notifyHook(self: *Loop, kind: []const u8, message: []const u8) void {
 
 pub fn acceptHookResult(self: *Loop, result: *const Hooks.Result) !void {
     if (result.message) |message| {
-        const copy = try self.allocator.dupe(u8, message);
-        if (self.hook_flow.notice) |old| self.allocator.free(old);
-        self.hook_flow.notice = copy;
+        self.hook_flow.setNotice(self.allocator, try self.allocator.dupe(u8, message));
     }
     if (result.context) |context| {
         const combined = if (self.hook_flow.context) |old|

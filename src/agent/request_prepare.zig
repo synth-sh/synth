@@ -87,22 +87,24 @@ pub fn prepare(self: *Request) !void {
         const context = try requestHook(self, .model_context);
         if (context.context_edits != null or context.request_context != null) {
             if (purpose == .approval_judge) return error.ReviewerContextImmutable;
-            self.prepared_conversation = .init(self.allocator);
-            for (self.conversation.messages.items) |msg| try self.prepared_conversation.?.adoptMessage(try msg.clone(self.allocator));
-            if (context.context_edits) |encoded| {
-                const edits = try std.json.parseFromSliceLeaky([]const ContextPatch.Edit, a, encoded, .{});
-                try ContextPatch.apply(&self.prepared_conversation.?, edits);
-            }
-            if (context.request_context) |encoded| {
-                const patch = try std.json.parseFromSliceLeaky(ContextPatch.Patch, a, encoded, .{});
-                if (patch.system) |value| try replaceTurnText(self, &self.turn.system, value);
-                if (patch.instruction) |value| try replaceTurnText(self, &self.turn.instruction, value);
-                if (patch.tools) |names| {
-                    const selected = try ContextPatch.selectTools(a, self.turn.tools_json, names);
-                    try replaceTurnText(self, &self.turn.tools_json, selected);
-                    self.restricted_tools = true;
+            const edits = if (context.context_edits) |encoded| try std.json.parseFromSliceLeaky([]const ContextPatch.Edit, a, encoded, .{}) else &.{};
+            const patch = if (context.request_context) |encoded| try std.json.parseFromSliceLeaky(ContextPatch.Patch, a, encoded, .{}) else ContextPatch.Patch{};
+            if (edits.len > 0 or patch.messages.len > 0) {
+                self.prepared_conversation = .init(self.allocator);
+                for (self.conversation.messages.items) |msg| {
+                    var copy = try msg.clone(self.allocator);
+                    errdefer copy.deinit(self.allocator);
+                    try self.prepared_conversation.?.adoptMessage(copy);
                 }
+                try ContextPatch.apply(&self.prepared_conversation.?, edits);
                 try ContextPatch.apply(&self.prepared_conversation.?, patch.messages);
+            }
+            if (patch.system) |value| try replaceTurnText(self, &self.turn.system, value);
+            if (patch.instruction) |value| try replaceTurnText(self, &self.turn.instruction, value);
+            if (patch.tools) |names| {
+                const selected = try ContextPatch.selectTools(a, self.turn.tools_json, names);
+                try replaceTurnText(self, &self.turn.tools_json, selected);
+                self.allowed_tools = names;
             }
             try describeContext(self);
         }
@@ -121,10 +123,20 @@ fn describeContext(self: *Request) !void {
     self.turn.hook_input.request_system = try a.dupe(u8, self.turn.system);
     self.turn.hook_input.request_instruction = try a.dupe(u8, self.turn.instruction);
     self.turn.hook_input.request_tools = try a.dupe(u8, self.turn.tools_json);
-    var routes: std.ArrayList(std.json.Value) = .empty;
+    var routes: std.Io.Writer.Allocating = .init(a);
+    var json: std.json.Stringify = .{ .writer = &routes.writer };
+    try json.beginArray();
     for (self.turn.model_policy.routes) |route| {
-        const encoded = try std.json.Stringify.valueAlloc(a, .{ .id = route.id, .provider = route.provider, .protocol = route.protocol, .endpoint = route.endpoint, .model = route.model, .context_limit = route.context_limit, .purposes = route.purposes }, .{});
-        try routes.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}));
+        try json.write(.{
+            .id = route.id,
+            .provider = route.provider,
+            .protocol = route.protocol,
+            .endpoint = route.endpoint,
+            .model = route.model,
+            .context_limit = route.context_limit,
+            .purposes = route.purposes,
+        });
     }
-    self.turn.hook_input.request_routes = try std.json.Stringify.valueAlloc(a, routes.items, .{});
+    try json.endArray();
+    self.turn.hook_input.request_routes = routes.written();
 }

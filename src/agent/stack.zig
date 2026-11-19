@@ -172,7 +172,7 @@ pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore
         const discovered = try HookStore.discover(self.arena.allocator(), self.hooks.io, self.hook_inline, self.project.root, self.hook_home, store);
         for (try changedHookSources(self.arena.allocator(), self.hooks.set, discovered)) |changed_source| {
             const path = if (std.mem.eql(u8, changed_source, "config")) self.hook_config_path else changed_source;
-            const source = if (std.mem.startsWith(u8, path, self.project.root) and (path.len == self.project.root.len or path[self.project.root.len] == '/')) "project_settings" else "user_settings";
+            const source = if (@import("../core/paths.zig").inside(self.project.root, path)) "project_settings" else "user_settings";
             var result = try self.hooks.evaluate(allocator, try self.loop.exportHookInput(.{ .event = .config_change, .source = source, .file_path = path }));
             defer result.deinit(allocator);
             if (result.blocked != null or result.stop) {

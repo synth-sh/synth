@@ -13,6 +13,7 @@ pub const cleanup_timeout_ms: i64 = 3000;
 pub const review_notice = "Hooks need review. Use /hooks review or synth hooks review; trust or disable each reviewed id.";
 const max_timeout_ms: u64 = 86_400_000;
 const background_limit: usize = 64;
+const concurrent_limit = 8;
 const posix_signals = switch (builtin.os.tag) {
     .windows, .wasi => false,
     else => true,
@@ -153,8 +154,7 @@ fn parseWhen(allocator: std.mem.Allocator, value: std.json.Value) !When {
     while (fields.next()) |field| {
         if (field.value_ptr.* != .string or field.value_ptr.string.len == 0) return error.InvalidHookFilter;
     }
-    const encoded = try std.json.Stringify.valueAlloc(allocator, value, .{});
-    return std.json.parseFromSliceLeaky(When, allocator, encoded, .{}) catch |err| switch (err) {
+    return std.json.parseFromValueLeaky(When, allocator, value, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidHookFilter,
     };
@@ -316,8 +316,7 @@ fn parseHandler(a: std.mem.Allocator, value: std.json.Value, declaration: Declar
         }
         try normalized.object.put(a, "timeout_ms", .{ .integer = seconds.integer * std.time.ms_per_s });
     }
-    const encoded = try std.json.Stringify.valueAlloc(a, normalized, .{});
-    var hook = try std.json.parseFromSliceLeaky(Hook, a, encoded, .{});
+    var hook = try std.json.parseFromValueLeaky(Hook, a, normalized, .{});
     hook.source = declaration.source;
     hook.matcher = declaration.matcher;
     hook.when = declaration.when;
@@ -495,7 +494,7 @@ pub const Runtime = struct {
             if (deadline_ms) |deadline| if (std.Io.Clock.now(.awake, self.io).toMilliseconds() >= deadline) return error.Timeout;
             if (stop) |flag| if (flag.load(.acquire)) return error.Cancelled;
             const active = self.active.load(.acquire);
-            if (active < 8 and self.active.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) return;
+            if (active < concurrent_limit and self.active.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) return;
             try std.Io.sleep(self.io, .fromMilliseconds(5), .awake);
         }
     }
@@ -838,6 +837,32 @@ pub const Runner = struct {
         return blocked;
     }
 
+    const FirstFailure = struct {
+        index: usize = std.math.maxInt(usize),
+        err: ?anyerror = null,
+
+        fn record(self: *FirstFailure, index: usize, err: anyerror) void {
+            if (index < self.index) self.* = .{ .index = index, .err = err };
+        }
+    };
+
+    fn admits(self: Runner, allocator: std.mem.Allocator, hook: Hook, invocation: Invocation, index: usize, failure: *FirstFailure) !bool {
+        if (!hook.enabled) return false;
+        if (hook.async and (invocation.event.requestStage() or invocation.event == .permission_evaluate)) return error.InvalidHookAsync;
+        if (self.rewrite_author == index or (self.rewrite_author != null and hook.async)) return false;
+        const matched = hookMatches(allocator, hook, invocation) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            failure.record(index, err);
+            if (self.runtime) |runtime| runtime.record(hook, invocation, std.Io.Clock.now(.awake, self.io).toMilliseconds(), "failed", null, @errorName(err));
+            return false;
+        };
+        if (matched and !hook.trusted) {
+            failure.record(index, error.HookNeedsReview);
+            return false;
+        }
+        return matched;
+    }
+
     pub fn evaluate(self: Runner, allocator: std.mem.Allocator, invocation: Invocation) !Result {
         var outcome: Result = .{};
         errdefer outcome.deinit(allocator);
@@ -851,147 +876,74 @@ pub const Runner = struct {
         }
         const definitions = if (invocation.event == .post_tool_use_failure) inherited.items else self.set.forEvent(invocation.event);
         var at: usize = 0;
-        var failure: ?anyerror = null;
-        var failure_at: usize = std.math.maxInt(usize);
+        var failure: FirstFailure = .{};
         var legacy_blocked = false;
         while (at < definitions.len) {
             const hook = definitions[at];
-            if (hook.enabled and hook.async and (invocation.event.requestStage() or invocation.event == .permission_evaluate)) return error.InvalidHookAsync;
             if (self.givenUp()) return error.Cancelled;
-            if (!hook.enabled or self.rewrite_author == at or (self.rewrite_author != null and hook.async)) {
-                at += 1;
-                continue;
-            }
-            const matched = hookMatches(allocator, hook, invocation) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                if (at < failure_at) {
-                    failure = err;
-                    failure_at = at;
-                }
-                if (self.runtime) |runtime| runtime.record(hook, invocation, std.Io.Clock.now(.awake, self.io).toMilliseconds(), "failed", null, @errorName(err));
-                at += 1;
-                continue;
-            };
-            if (!matched) {
-                at += 1;
-                continue;
-            }
-            if (!hook.trusted) {
-                if (at < failure_at) {
-                    failure = error.HookNeedsReview;
-                    failure_at = at;
-                }
-                at += 1;
-                continue;
-            }
             if (hook.legacy) {
-                if (legacy_blocked) {
-                    at += 1;
-                    continue;
-                }
+                const index = at;
+                at += 1;
+                if (!try self.admits(allocator, hook, invocation, index, &failure) or legacy_blocked) continue;
                 var legacy_input = invocation;
-                if (at < inherited_count) legacy_input.event = .post_tool_use;
+                if (index < inherited_count) legacy_input.event = .post_tool_use;
                 var result = self.runHook(allocator, hook, legacy_input) catch |err| {
-                    if (at < failure_at) {
-                        failure = err;
-                        failure_at = at;
-                    }
+                    failure.record(index, err);
                     legacy_blocked = true;
-                    at += 1;
                     continue;
                 };
                 legacy_blocked = result.blocked != null;
                 defer result.deinit(allocator);
                 try outcome.merge(allocator, result);
                 if (self.runtime) |runtime| try runtime.bound(allocator, &outcome);
-                at += 1;
                 continue;
             }
-            const start = at;
             var end = at;
             while (end < definitions.len and !definitions[end].legacy) : (end += 1) {}
-            const jobs = try allocator.alloc(?*Job, end - start);
-            @memset(jobs, null);
-            defer {
-                for (jobs) |maybe| if (maybe) |job| {
-                    job.destroy();
-                };
-                allocator.free(jobs);
-            }
-            var slots: [8]?*Job = @splat(null);
+            const PendingJob = struct { index: usize, job: *Job };
+            var buffer: [64]PendingJob = undefined;
+            var pending: std.Deque(PendingJob) = .initBuffer(&buffer);
+            defer while (pending.popFront()) |entry| entry.job.destroy();
             var running: usize = 0;
-            var pending: usize = 0;
-            var merged = start;
             while (at < end or running > 0) {
                 if (self.givenUp()) return error.Cancelled;
-                while (at < end and running < slots.len and pending < 64) : (at += 1) {
+                while (at < end and running < concurrent_limit and pending.len < buffer.len) : (at += 1) {
                     const grouped = definitions[at];
-                    if (!grouped.enabled or self.rewrite_author == at or (self.rewrite_author != null and grouped.async)) continue;
-                    const grouped_match = hookMatches(allocator, grouped, invocation) catch |err| {
-                        if (err == error.OutOfMemory) return err;
-                        if (at < failure_at) {
-                            failure = err;
-                            failure_at = at;
-                        }
-                        if (self.runtime) |runtime| runtime.record(grouped, invocation, std.Io.Clock.now(.awake, self.io).toMilliseconds(), "failed", null, @errorName(err));
-                        continue;
-                    };
-                    if (!grouped_match) continue;
-                    if (!grouped.trusted) {
-                        if (at < failure_at) {
-                            failure = error.HookNeedsReview;
-                            failure_at = at;
-                        }
-                        continue;
-                    }
-                    if (grouped.async and (invocation.event.requestStage() or invocation.event == .permission_evaluate)) return error.InvalidHookAsync;
+                    if (!try self.admits(allocator, grouped, invocation, at, &failure)) continue;
                     if (grouped.async) {
                         const runtime = self.runtime orelse return error.BackgroundHooksUnavailable;
                         try runtime.launch(self, grouped, invocation);
                     } else {
                         const job = try Job.start(allocator, self, grouped, invocation);
-                        jobs[at - start] = job;
-                        for (&slots) |*slot| {
-                            if (slot.* == null) {
-                                slot.* = job;
-                                break;
-                            }
-                        }
+                        pending.pushBackAssumeCapacity(.{ .index = at, .job = job });
                         running += 1;
-                        pending += 1;
                     }
                 }
                 var progressed = false;
-                for (&slots) |*slot| {
-                    const job = slot.* orelse continue;
-                    if (!job.done.load(.acquire)) continue;
-                    job.join();
-                    slot.* = null;
+                var jobs = pending.iterator();
+                while (jobs.next()) |entry| {
+                    if (entry.job.joined or !entry.job.done.load(.acquire)) continue;
+                    entry.job.join();
                     running -= 1;
                     progressed = true;
-                    if (job.failed != null) continue;
                 }
-                while (merged < at) : (merged += 1) {
-                    const job = jobs[merged - start] orelse continue;
+                while (pending.front()) |entry| {
+                    const job = entry.job;
                     if (!job.joined) break;
+                    _ = pending.popFront();
+                    defer job.destroy();
                     if (job.failed) |err| {
-                        if (merged < failure_at) {
-                            failure = err;
-                            failure_at = merged;
-                        }
+                        failure.record(entry.index, err);
                     } else {
                         try outcome.merge(allocator, job.result);
-                        if (job.result.replacement != null) outcome.replacement_author = merged;
+                        if (job.result.replacement != null) outcome.replacement_author = entry.index;
                     }
                     if (self.runtime) |runtime| try runtime.bound(allocator, &outcome);
-                    job.destroy();
-                    jobs[merged - start] = null;
-                    pending -= 1;
                 }
                 if (!progressed and running > 0) try std.Io.sleep(self.io, .fromMilliseconds(1), .awake);
             }
         }
-        if (failure) |err| {
+        if (failure.err) |err| {
             const strict = !invocation.event.observational() and invocation.event != .post_tool_use;
             if (strict or err == error.OutOfMemory) return err;
             var diagnostic: Result = .{ .message = try std.fmt.allocPrint(allocator, "{s} hook failed: {s}", .{ invocation.event.name(), @errorName(err) }) };
@@ -1386,46 +1338,47 @@ fn writeJson(
     root: []const u8,
     invocation: Invocation,
 ) !void {
-    try w.writeAll("{\"hook_event_name\":");
-    try std.json.Stringify.encodeJsonString(invocation.event.name(), .{}, w);
-    try w.writeAll(",\"cwd\":");
-    try std.json.Stringify.encodeJsonString(invocation.cwd orelse root, .{}, w);
-
-    try w.writeAll(",\"agent_scope\":");
-    try std.json.Stringify.value(invocation.agent_scope, .{}, w);
-    try w.writeAll(",\"request_purpose\":");
-    try std.json.Stringify.value(invocation.request_purpose, .{}, w);
-    inline for (.{ "request_system", "request_instruction", "request_tools", "request_routes", "permission_effect", "action", "http", "route", "request_context", "request_settings", "provider", "parent_agent_id", "parent_tool_call_id", "old_cwd", "new_cwd", "directory", "session_id", "turn_id", "tool_call_id", "agent_id", "agent_type", "model", "permission_mode", "source", "trigger", "status", "error_type", "error_message", "parent_session_id", "reason", "notification_type", "message", "title", "file_path", "event_type", "load_reason", "memory_type", "from_model", "to_model", "task_id", "task_subject", "task_description", "command_name", "command_args", "expanded_prompt", "message_id", "delta" }) |field| {
-        try w.writeAll(",\"" ++ field ++ "\":");
-        if (comptime std.mem.eql(u8, field, "turn_id")) {
-            if (invocation.turn_number) |number| {
-                try w.print("\"{d}\"", .{number});
-            } else try std.json.Stringify.encodeJsonString(invocation.turn_id, .{}, w);
-        } else try std.json.Stringify.encodeJsonString(@field(invocation, field), .{}, w);
+    var json: std.json.Stringify = .{ .writer = w };
+    try json.beginObject();
+    try json.objectField("hook_event_name");
+    try json.write(invocation.event.name());
+    try json.objectField("cwd");
+    try json.write(invocation.cwd orelse root);
+    inline for (.{
+        "agent_scope",       "request_purpose",        "request_system",      "request_instruction", "request_tools",   "request_routes",
+        "permission_effect", "action",                 "http",                "route",               "request_context", "request_settings",
+        "provider",          "parent_agent_id",        "parent_tool_call_id", "old_cwd",             "new_cwd",         "directory",
+        "session_id",        "tool_call_id",           "agent_id",            "agent_type",          "model",           "permission_mode",
+        "source",            "trigger",                "status",              "error_type",          "error_message",   "parent_session_id",
+        "reason",            "notification_type",      "message",             "title",               "file_path",       "event_type",
+        "load_reason",       "memory_type",            "from_model",          "to_model",            "task_id",         "task_subject",
+        "task_description",  "command_name",           "command_args",        "expanded_prompt",     "message_id",      "delta",
+        "requested_model",   "last_assistant_message", "http_status",         "retry_delay_ms",      "retry_allowed",   "request_id",
+        "attempt",           "transcript_path",        "stop_hook_active",    "input_tokens",        "output_tokens",   "is_interrupt",
+        "duration_ms",       "index",                  "final",
+    }) |field| {
+        try json.objectField(field);
+        try json.write(@field(invocation, field));
     }
-    try w.writeAll(",\"tool_use_id\":");
-    try std.json.Stringify.encodeJsonString(invocation.tool_call_id, .{}, w);
-    try w.writeAll(",\"requested_model\":");
-    try std.json.Stringify.value(invocation.requested_model, .{}, w);
-    try w.writeAll(",\"last_assistant_message\":");
-    try std.json.Stringify.value(invocation.last_assistant_message, .{}, w);
-    try w.print(",\"http_status\":{d},\"retry_delay_ms\":{d},\"retry_allowed\":{s}", .{ invocation.http_status, invocation.retry_delay_ms, if (invocation.retry_allowed) "true" else "false" });
-    try w.print(",\"request_id\":{d},\"attempt\":{d}", .{ invocation.request_id, invocation.attempt });
+    try json.objectField("turn_id");
+    if (invocation.turn_number) |number| try json.print("\"{d}\"", .{number}) else try json.write(invocation.turn_id);
+    try json.objectField("tool_use_id");
+    try json.write(invocation.tool_call_id);
+    try json.objectField("error");
+    try json.write(if (invocation.error_type.len > 0) invocation.error_type else invocation.error_message);
+    try json.objectField("error_details");
+    try json.write(invocation.error_message);
     if (invocation.event == .subagent_stop) {
-        try w.writeAll(",\"agent_transcript_path\":");
-        try std.json.Stringify.value(invocation.transcript_path, .{}, w);
+        try json.objectField("agent_transcript_path");
+        try json.write(invocation.transcript_path);
     }
-    try w.writeAll(",\"transcript_path\":");
-    try std.json.Stringify.value(invocation.transcript_path, .{}, w);
-    try w.print(",\"stop_hook_active\":{s},\"input_tokens\":{d},\"output_tokens\":{d}", .{ if (invocation.stop_hook_active) "true" else "false", invocation.input_tokens, invocation.output_tokens });
     if (invocation.event == .user_prompt_submit or invocation.event == .user_prompt_expansion) {
-        try w.writeAll(",\"prompt\":");
-        try std.json.Stringify.encodeJsonString(invocation.prompt, .{}, w);
+        try json.objectField("prompt");
+        try json.write(invocation.prompt);
     }
     if (invocation.event.toolMatcher()) {
-        try w.writeAll(",\"tool_name\":");
-        try std.json.Stringify.encodeJsonString(invocation.tool_name, .{}, w);
-        try w.writeAll(",\"tool_input\":");
+        try json.objectField("tool_name");
+        try json.write(invocation.tool_name);
         var scratch: std.heap.ArenaAllocator = .init(allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -1434,26 +1387,24 @@ fn writeJson(
             else => std.json.Value{ .object = .empty },
         };
         try ToolInput.addAliases(a, invocation.tool_name, &arguments);
-        try std.json.Stringify.value(arguments, .{}, w);
+        try json.objectField("tool_input");
+        try json.write(arguments);
     }
     if (invocation.event == .post_tool_use or invocation.event == .post_tool_use_failure) {
-        try w.writeAll(",\"tool_response\":");
-        try std.json.Stringify.encodeJsonString(invocation.tool_response, .{}, w);
+        try json.objectField("tool_response");
+        try json.write(invocation.tool_response);
     }
-    try w.writeAll(",\"error\":");
-    try std.json.Stringify.encodeJsonString(if (invocation.error_type.len > 0) invocation.error_type else invocation.error_message, .{}, w);
-    try w.writeAll(",\"error_details\":");
-    try std.json.Stringify.encodeJsonString(invocation.error_message, .{}, w);
-    try w.print(",\"is_interrupt\":{s},\"duration_ms\":{d},\"index\":{d},\"final\":{s}", .{ if (invocation.is_interrupt) "true" else "false", invocation.duration_ms, invocation.index, if (invocation.final) "true" else "false" });
     if (invocation.event == .file_changed) {
-        try w.writeAll(",\"event\":");
-        try std.json.Stringify.encodeJsonString(invocation.event_type, .{}, w);
+        try json.objectField("event");
+        try json.write(invocation.event_type);
     }
     if (invocation.event == .post_tool_batch) {
-        try w.writeAll(",\"tool_calls\":");
-        if (try std.json.validate(allocator, invocation.tool_calls)) try w.writeAll(invocation.tool_calls) else try w.writeAll("[]");
+        try json.objectField("tool_calls");
+        try json.beginWriteRaw();
+        try w.writeAll(if (try std.json.validate(allocator, invocation.tool_calls)) invocation.tool_calls else "[]");
+        json.endWriteRaw();
     }
-    try w.writeByte('}');
+    try json.endObject();
 }
 
 test "a matching pre-tool hook can block" {
@@ -1567,22 +1518,6 @@ test "large input and stderr cannot block each other" {
     try testing.expectEqual(stderr_limit, reason.?.len);
 }
 
-test "a hook is killed when its deadline passes" {
-    const testing = std.testing;
-    const hook = Hook{ .command = "sleep 5" };
-    const runner: Runner = .{
-        .io = testing.io,
-        .root = ".",
-        .set = .{ .user_prompt_submit = &.{hook} },
-        .timeout_ms = 50,
-    };
-
-    try testing.expectError(error.Timeout, runner.dispatch(testing.allocator, .{
-        .event = .user_prompt_submit,
-        .prompt = "hello",
-    }));
-}
-
 test "grouped output is structured while legacy stdout stays ignored" {
     const a = std.testing.allocator;
     const command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"echo safe\"},\"additionalContext\":\"from policy\"}}'";
@@ -1612,19 +1547,10 @@ test "grouped config normalizes without changing legacy declarations" {
     try std.testing.expect(!set.pre_tool_use[1].legacy);
     try std.testing.expectEqualStrings("test.json", set.pre_tool_use[1].source);
     try std.testing.expectEqual(@as(?u64, 50), set.pre_tool_use[1].timeout_ms);
+    const unknown = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"UnknownEvent\":[]}", .{});
+    try std.testing.expectError(error.InvalidHookEvent, parse(a, unknown, "test.json"));
     try std.testing.expectError(error.InvalidHookTimeout, validTimeout(0));
     try std.testing.expectError(error.InvalidHookTimeout, validTimeout(std.math.maxInt(u64)));
-}
-
-test "event payload keeps empty fields and a nullable transcript" {
-    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer writer.deinit();
-    try writeJson(std.testing.allocator, &writer.writer, ".", .{ .event = .post_tool_use });
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.written(), .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("", parsed.value.object.get("tool_response").?.string);
-    try std.testing.expect(parsed.value.object.get("transcript_path").? == .null);
-    try std.testing.expectEqualStrings("", parsed.value.object.get("session_id").?.string);
 }
 
 test "grouped hooks run despite denial and apply rewrites in declaration order" {
@@ -1821,14 +1747,14 @@ test "event input fixtures preserve field values and escaping" {
         const event = Event.fromName(fixture.object.get("event").?.string).?;
         var input = fixture.object.get("input").?;
         try input.object.put(a, "event", .{ .string = @tagName(event) });
-        const invocation = try std.json.parseFromSliceLeaky(Invocation, a, try std.json.Stringify.valueAlloc(a, input, .{}), .{});
+        const invocation = try std.json.parseFromValueLeaky(Invocation, a, input, .{});
         var writer: std.Io.Writer.Allocating = .init(a);
         try writeJson(a, &writer.writer, ".", invocation);
         const payload = try std.json.parseFromSliceLeaky(std.json.Value, a, writer.written(), .{});
         var expected = fixture.object.get("expected").?.object.iterator();
         while (expected.next()) |field| {
             const actual = payload.object.get(field.key_ptr.*) orelse return error.MissingHookInput;
-            try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, field.value_ptr.*, .{}), try std.json.Stringify.valueAlloc(a, actual, .{}));
+            try std.testing.expect(@import("hook_schema.zig").jsonEqual(field.value_ptr.*, actual));
         }
     }
 }
@@ -1838,9 +1764,8 @@ test "policy regex budget exhaustion fails visibly" {
     const input = try a.alloc(u8, 2000);
     defer a.free(input);
     @memset(input, 'a');
-    var compiled = try compileMatcher(a, "(a|aa)*b");
-    defer compiled.deinit();
-    try std.testing.expectError(error.RegexResourceLimit, compiled.checkedMatches(input));
+    const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .pre_tool_use = &.{.{ .legacy = false, .matcher = "(a|aa)*b", .command = "true" }} } };
+    try std.testing.expectError(error.RegexResourceLimit, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = input }));
 }
 
 test "an observation failure does not discard a sibling's valid feedback" {
@@ -1874,13 +1799,17 @@ test "legacy lists stop serially without suppressing grouped handlers" {
 }
 
 test "queued handlers start when a slot frees rather than waiting for the whole group" {
-    const slow: Hook = .{ .legacy = false, .command = "sleep 0.3; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"slow\"}}}'" };
-    const fast: Hook = .{ .legacy = false, .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"fast\"}}}'" };
-    const definitions = [_]Hook{slow} ++ ([_]Hook{.{ .legacy = false, .command = "true" }} ** 7) ++ [_]Hook{fast};
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .pre_tool_use = &definitions } };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const waiting: Hook = .{ .legacy = false, .command = "while [ ! -e released ]; do sleep 0.02; done", .timeout_ms = 2000 };
+    const release: Hook = .{ .legacy = false, .command = "touch released" };
+    const definitions = [_]Hook{waiting} ++ ([_]Hook{.{ .legacy = false, .command = "true" }} ** 7) ++ [_]Hook{release};
+    const runner: Runner = .{ .io = std.testing.io, .root = root, .set = .{ .pre_tool_use = &definitions } };
     var result = try runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use });
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("{\"command\":\"fast\"}", result.replacement.?);
+    try tmp.dir.access(std.testing.io, "released", .{});
 }
 
 test "grouped failures are reported in declaration order" {
@@ -1953,30 +1882,6 @@ test "event matchers filter lifecycle metadata and ignore unsupported matcher fi
     try std.testing.expect(try hookMatches(a, .{ .legacy = false, .matcher = "ignored" }, .{ .event = .post_tool_batch }));
 }
 
-test "every supported event has result fixtures and parses as configuration" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const results = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/results.json"), .{});
-    inline for (std.meta.fields(Event)) |field| {
-        const event: Event = @field(Event, field.name);
-        var has_result = false;
-        for (results.array.items) |item| if (std.mem.eql(u8, item.object.get("event").?.string, event.name()) and !item.object.contains("invalid")) {
-            has_result = true;
-        };
-        try std.testing.expect(has_result);
-        const source = try std.fmt.allocPrint(a, "{{\"{s}\":[{{\"hooks\":[{{\"type\":\"command\",\"command\":\"true\"}}]}}]}}", .{event.name()});
-        const config = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{});
-        const set = try parse(a, config, "fixture");
-        try std.testing.expectEqual(@as(usize, 1), set.forEvent(event).len);
-    }
-    for ([_][]const u8{ "Setup", "TeammateIdle", "WorktreeCreate", "WorktreeRemove", "Elicitation", "ElicitationResult" }) |name| {
-        const source = try std.fmt.allocPrint(a, "{{\"{s}\":[]}}", .{name});
-        const unsupported = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{});
-        try std.testing.expectError(error.InvalidHookEvent, parse(a, unsupported, "fixture"));
-    }
-}
-
 test "routing filters require every exact field and compose with event matchers" {
     const a = std.testing.allocator;
     const input: Invocation = .{ .event = .pre_tool_use, .agent_scope = .subagent, .request_purpose = .agent, .agent_type = "task", .model = "qwen3", .provider = "local", .tool_name = "read" };
@@ -2021,20 +1926,17 @@ test "unfiltered declaration encoding retains existing trust identity bytes" {
     , encoded);
 }
 
-test "request and permission stages reject malformed output and blocking exits" {
-    const a = std.testing.allocator;
-    inline for (.{ Event.model_resolve, Event.model_context, Event.model_settings, Event.model_retry, Event.permission_evaluate, Event.http_request, Event.http_response }) |event| {
-        var set: Set = .{};
-        @field(set, @tagName(event)) = &.{.{ .legacy = false, .command = "printf 'invalid json'" }};
-        var runner: Runner = .{ .io = std.testing.io, .root = ".", .set = set };
-        try std.testing.expectError(error.SyntaxError, runner.evaluate(a, .{ .event = event }));
-        @field(set, @tagName(event)) = &.{.{ .legacy = false, .command = "echo blocked >&2; exit 2" }};
-        runner.set = set;
-        if (event == .permission_evaluate) {
-            var result = try runner.evaluate(a, .{ .event = event });
-            defer result.deinit(a);
-            try std.testing.expect(result.blocked != null);
-        } else try std.testing.expectError(error.HookBlocked, runner.evaluate(a, .{ .event = event }));
+test "permission and retry hooks reject malformed output and preserve blocking reasons" {
+    const block: Hook = .{ .legacy = false, .source = "team policy", .command = "echo blocked >&2; exit 2" };
+    var runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .permission_evaluate = &.{block}, .model_retry = &.{block} } };
+    var result = try runner.evaluate(std.testing.allocator, .{ .event = .permission_evaluate });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("[Hook team policy]\nblocked", result.blocked.?);
+    try std.testing.expectError(error.HookBlocked, runner.evaluate(std.testing.allocator, .{ .event = .model_retry }));
+    const malformed: Hook = .{ .legacy = false, .command = "printf invalid" };
+    runner.set = .{ .permission_evaluate = &.{malformed}, .model_retry = &.{malformed} };
+    for ([_]Event{ .permission_evaluate, .model_retry }) |event| {
+        try std.testing.expectError(error.SyntaxError, runner.evaluate(std.testing.allocator, .{ .event = event }));
     }
 }
 

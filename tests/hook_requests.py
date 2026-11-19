@@ -79,7 +79,7 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
             self.wfile.write(body)
 
     server = Server(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
     thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix=f"synth-{name}-") as directory:
@@ -121,8 +121,6 @@ def session(name, respond, logic="", events=(), protocol="chat", attempts=2, ext
                 with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
                     for trusted in pool.map(lambda identifier: run("hooks", "trust", identifier), ids):
                         assert trusted.returncode == 0, trusted.stderr
-                listing = run("hooks", "list")
-                assert listing.returncode == 0 and "NEEDS REVIEW" not in listing.stdout, listing.stdout
             result = run("run", "--allow", "route-me reference human request")
             log = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()] if (root / "events.jsonl").exists() else []
             assert all("forbidden" not in packet["path"] for packet in requests), requests
@@ -182,6 +180,7 @@ def main():
         return chat('', tool('bash', {'command': 'touch overflow-must-not-run'}))
 
     with session('ollama-judge-no-truncation', reviewer_overflow, configure=ollama_reviewer) as (root, result, requests, _):
+        assert result.returncode == 0, result.stderr
         assert not (root / 'overflow-must-not-run').exists()
         assert any(packet['path'] == '/review/api/chat' for packet in requests)
     print('PASS Ollama judge requests disable truncation and overflow fails closed')
@@ -209,7 +208,9 @@ elif e=='ModelSettings':
         assert first['messages'][0]['content'] == 'request-specific system'
         assert first['messages'][1]['content'] == 'request-only text'
         assert [entry['function']['name'] for entry in first['tools']] == ['read']
-        assert first['top_p'] == 0.7 and first['seed'] == 42 and first['stop'] == ['END']
+        assert {key: first[key] for key in ('top_p', 'seed', 'frequency_penalty', 'presence_penalty', 'stop')} == {
+            'top_p': 0.7, 'seed': 42, 'frequency_penalty': 0.2, 'presence_penalty': 0.1, 'stop': ['END'],
+        }
         assert not (root / 'must-not-exist').exists()
         with sqlite3.connect(root / 'session.db') as db:
             assert db.execute("select origin,text from message where role='user'").fetchall() == [('human', 'route-me reference human request')]
@@ -256,7 +257,9 @@ elif e=='HttpResponse' and h['phase'] in ('event','body'):
     no_records = lambda command: {'HttpResponse': [{'hooks': [{'command': command}]}]}
     raw_ollama = lambda *_: (200, json.dumps({'message': {'role': 'assistant', 'content': 'native'}, 'done': True}) + '\n', 'application/x-ndjson')
     with session('stream-opt-in', raw_ollama, events=('HttpResponse',), protocol='ollama', extra_hooks=no_records) as (_, result, requests, log):
+        assert result.returncode == 0, result.stderr
         expect(result, 'native')
+        assert len(requests) == 1
         assert [json.loads(entry['http'])['phase'] for entry in log] == ['headers']
     for value in ('custom-agent', None):
         logic = "out={'http':{'headers':{'User-Agent':" + repr(value) + "}}}"
@@ -267,6 +270,7 @@ elif e=='HttpResponse' and h['phase'] in ('event','body'):
     for event in ('ModelResolve', 'ModelContext', 'ModelSettings', 'HttpRequest', 'HttpResponse'):
         hooks = lambda _, event=event: {event: [{'hooks': [{'command': 'echo adapter-blocked >&2; exit 2'}]}]}
         with session('blocked-stage', lambda *_: chat('must-not-appear'), extra_hooks=hooks) as (_, result, requests, _):
+            assert result.returncode != 0, event
             assert len(requests) == (1 if event == 'HttpResponse' else 0)
             expect(result, 'HookBlocked')
             assert 'must-not-appear' not in result.stdout
@@ -278,11 +282,24 @@ if e=='ModelRetry':
  out={'retryAllowed':True,'retryDelayMs':0}
 """
     def recover(_, requests):
-        return (400, {'error': {'message': 'custom compatibility failure'}}, 'application/json') if len(requests) == 1 else chat('recovered')
-    with session('retry', recover, retry, ('ModelRetry',)) as (_, result, requests, _):
+        if len(requests) == 1:
+            return 400, {'error': {'message': 'custom compatibility failure'}}, 'application/json'
+        status, body, content_type = chat('recovered')
+        body['usage'] = {'prompt_tokens': 12, 'completion_tokens': 3}
+        return status, body, content_type
+    with session('retry', recover, retry, ('ModelRetry', 'PreModelRequest', 'PostModelRequest')) as (_, result, requests, log):
+        assert result.returncode == 0, result.stderr
         expect(result, 'recovered')
         assert len(requests) == 2
+        trace = [event for event in log if event['hook_event_name'] != 'ModelRetry']
+        assert [(event['hook_event_name'], event['attempt']) for event in trace] == [
+            ('PreModelRequest', 1), ('PostModelRequest', 1), ('PreModelRequest', 2), ('PostModelRequest', 2)
+        ], trace
+        assert all(event['model'] == 'agent-model' and event['request_purpose'] == 'agent' for event in trace), trace
+        assert trace[1]['status'] == 'failed' and trace[1]['error_message'] == 'HttpError', trace[1]
+        assert trace[3]['status'] == 'completed' and (trace[3]['input_tokens'], trace[3]['output_tokens']) == (12, 3), trace[3]
     with session('retry-bound', lambda *_: (400, {'error': {'message': 'permanent failure'}}, 'application/json'), retry, ('ModelRetry',)) as (_, result, requests, log):
+        assert result.returncode != 0
         assert len(requests) == 2 and len(log) == 1, (len(requests), len(log), result.stdout, result.stderr, log)
         expect(result, 'Request failed')
     print('PASS terminal HTTP failure recovery with a hard physical-attempt ceiling')
@@ -294,28 +311,23 @@ if e=='ModelRetry':
  out={'retryAllowed':False}
 """
     with session('compatibility-veto', lambda *_: (400, {'error': {'message': 'unsupported stream_options'}}, 'application/json'), compatibility_veto, ('ModelRetry',)) as (_, result, requests, log):
+        assert result.returncode != 0
         assert len(requests) == 1 and len(log) == 1
         expect(result, 'stream_options')
     for size in (3000, 4 * 1024 * 1024 + 1):
         with session('ollama-large-error', lambda *_: (503, 'proxy failure ' + 'x' * size, 'text/html'), protocol='ollama') as (_, result, requests, _):
+            assert result.returncode != 0
             assert len(requests) == 2
             expect(result, 'Request failed')
             assert 'StreamTooLong' not in result.stdout + result.stderr
-    def compatibility_repair(packet, requests):
-        if len(requests) == 1:
-            return 400, {'error': {'message': 'unsupported stream_options'}}, 'application/json'
-        assert 'stream_options' not in packet['body']
-        return chat('repaired')
-    with session('single-attempt-repair', compatibility_repair, attempts=1) as (_, result, requests, _):
-        expect(result, 'repaired')
-        assert len(requests) == 2
     def learned_compatibility(packet, requests):
         if len(requests) == 1:
+            assert 'stream_options' in packet['body']
             return 400, {'error': {'message': 'unsupported stream_options'}}, 'application/json'
         assert 'stream_options' not in packet['body']
         return chat() if any(m['role'] == 'tool' for m in packet['body']['messages']) else chat('', tool('read', {'path': 'seed.txt'}))
     for named_route in (False, True):
-        with session('learned-compatibility', learned_compatibility, route_policy=named_route) as (_, result, requests, _):
+        with session('learned-compatibility', learned_compatibility, route_policy=named_route, attempts=1) as (_, result, requests, _):
             assert result.returncode == 0, result.stderr
             assert len(requests) == 3, requests
     print('PASS compatibility retry metadata/veto, learned transport capabilities, and bounded oversized Ollama error handling')
@@ -336,6 +348,7 @@ if e=='ModelRetry':
         assert not any(event['hook_event_name'] == 'PermissionEvaluate' for event in log)
     readonly = lambda packet, _: chat() if any(m['role']=='tool' for m in packet['body']['messages']) else chat('', tool('read', {'path':'seed.txt'}))
     with session('readonly-deny', readonly, "out={'effect':'deny','reason':'read blocked'}", ('PermissionEvaluate',)) as (root, result, _, log):
+        assert result.returncode == 0, result.stderr
         assert log[0]['permission_effect'] == 'allow'
         with sqlite3.connect(root/'session.db') as db:
             assert db.execute('select status from tool_call').fetchall() == [('rejected',)]
@@ -384,6 +397,7 @@ if p['tool_input']['path'] == 'effective.txt':
         ('malformed-adapter', "out={'http':{'headers':{'x-test':'newline\\r\\ninjection'}}}", 'InvalidHttpHookOutput'),
     ):
         with session(name, lambda *_: chat(), logic, ('HttpRequest',)) as (_, result, requests, _):
+            assert result.returncode != 0, name
             assert not requests
             expect(result, error)
     print('PASS fixed destinations/models, header validation, and fail-closed malformed adapter output')

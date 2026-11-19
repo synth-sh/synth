@@ -302,8 +302,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
     if (parsed.model_requests) |value| {
-        const encoded = try std.json.Stringify.valueAlloc(arena, value, .{});
-        self.model_requests = try std.json.parseFromSliceLeaky(ModelPolicy.Policy, arena, encoded, .{});
+        self.model_requests = try std.json.parseFromValueLeaky(ModelPolicy.Policy, arena, value, .{});
         try self.model_requests.validate();
     }
     if (parsed.hooks) |value| self.hooks = try Hooks.parse(arena, value, path);

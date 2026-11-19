@@ -9,7 +9,6 @@ const tool = @import("../tools/tool.zig");
 
 const Request = @This();
 const Preparation = @import("request_prepare.zig");
-const ContextPatch = @import("../core/request_context.zig");
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -17,7 +16,7 @@ provider: Provider,
 provider_mutex: std.Io.Mutex = .init,
 owned_backend: ?*@import("../provider/backend.zig").Spawned = null,
 prepared_conversation: ?Conversation = null,
-restricted_tools: bool = false,
+allowed_tools: ?[]const []const u8 = null,
 completed_ms: i64 = 0,
 conversation: *Conversation,
 /// Owned copy of the turn's strings: the loop is free to rebuild its prompt or
@@ -222,9 +221,9 @@ fn run(self: *Request) void {
         self.failed = err;
         return;
     };
-    if (self.restricted_tools) {
-        for (self.reply.?.tool_calls) |*call| {
-            if (ContextPatch.permits(self.hook_arena.allocator(), self.turn.tools_json, call.name) catch false) continue;
+    if (self.allowed_tools) |names| {
+        calls: for (self.reply.?.tool_calls) |*call| {
+            for (names) |name| if (std.mem.eql(u8, name, call.name)) continue :calls;
             call.status = .rejected;
             call.result = self.allocator.dupe(u8, "tool excluded from this model request") catch {
                 self.failed = error.OutOfMemory;

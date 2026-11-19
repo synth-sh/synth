@@ -166,18 +166,10 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
         if (std.mem.eql(u8, key, "hookEventName")) continue;
         if (std.mem.eql(u8, key, "requestContext")) {
             if (event != .model_context or field != .object) return error.UnsupportedHookEffect;
-            const encoded = try std.json.Stringify.valueAlloc(allocator, field, .{});
-            errdefer allocator.free(encoded);
-            const parsed = try std.json.parseFromSlice(@import("request_context.zig").Patch, allocator, encoded, .{});
-            defer parsed.deinit();
-            result.request_context = encoded;
+            result.request_context = try encodePatch(@import("request_context.zig").Patch, allocator, field);
         } else if (std.mem.eql(u8, key, "http")) {
             if (!event.oneOf(&.{ .http_request, .http_response }) or field != .object) return error.UnsupportedHookEffect;
-            const encoded = try std.json.Stringify.valueAlloc(allocator, field, .{});
-            errdefer allocator.free(encoded);
-            const parsed = try std.json.parseFromSlice(HttpPatch, allocator, encoded, .{});
-            defer parsed.deinit();
-            result.http = encoded;
+            result.http = try encodePatch(HttpPatch, allocator, field);
         } else if (std.mem.eql(u8, key, "effect")) {
             if (event != .permission_evaluate) return error.UnsupportedHookEffect;
             const decision = try text(field);
@@ -194,12 +186,7 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
             result.context_edits = try std.json.Stringify.valueAlloc(allocator, field, .{});
         } else if (std.mem.eql(u8, key, "settings")) {
             if (event != .model_settings or field != .object) return error.UnsupportedHookEffect;
-            const encoded = try std.json.Stringify.valueAlloc(allocator, field, .{});
-            errdefer allocator.free(encoded);
-            const parsed = try std.json.parseFromSlice(@import("model_policy.zig").Settings, allocator, encoded, .{});
-            defer parsed.deinit();
-            try parsed.value.validate();
-            result.settings = encoded;
+            result.settings = try encodePatch(@import("model_policy.zig").Settings, allocator, field);
         } else if (std.mem.eql(u8, key, "retryAllowed")) {
             if (event != .model_retry or field != .bool) return error.UnsupportedHookEffect;
             result.retry_allowed = field.bool;
@@ -261,6 +248,13 @@ fn specific(allocator: std.mem.Allocator, result: *Result, value: std.json.Value
             if (result.permission == .deny) result.blocked = try reason(allocator, field, "message");
         } else return error.UnsupportedHookEffect;
     }
+}
+
+fn encodePatch(comptime T: type, allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    const parsed = try std.json.parseFromValue(T, allocator, value, .{});
+    defer parsed.deinit();
+    if (@hasDecl(T, "validate")) try parsed.value.validate();
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
 fn text(value: std.json.Value) ![]const u8 {

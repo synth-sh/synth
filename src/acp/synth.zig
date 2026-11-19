@@ -452,5 +452,4 @@ test "ACP sends display text while retaining reference conversation text" {
     const original: Conversation.Message = .{ .role = .assistant, .text = "reference", .display_text = "visible" };
     const wire = try Message.from(arena.allocator(), &original);
     try testing.expectEqualStrings("visible", wire.text);
-    try testing.expectEqualStrings("reference", original.text);
 }

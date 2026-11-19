@@ -38,14 +38,6 @@ pub fn selectTools(a: std.mem.Allocator, definitions: []const u8, names: []const
     return std.json.Stringify.valueAlloc(a, selected.items, .{});
 }
 
-pub fn permits(a: std.mem.Allocator, definitions: []const u8, name: []const u8) !bool {
-    _ = selectTools(a, definitions, &.{name}) catch |err| switch (err) {
-        error.UnknownRequestTool => return false,
-        else => return err,
-    };
-    return true;
-}
-
 pub fn apply(conversation: *Conversation, edits: []const Edit) !void {
     const a = conversation.allocator;
     for (edits) |edit| {

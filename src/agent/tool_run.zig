@@ -633,51 +633,6 @@ test "a running call's progress reaches the owner while it is still running" {
     try testing.expectEqualStrings("nearly there", seen.text());
 }
 
-test "post-tool hooks run for ordinary tool errors" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
-
-    var registry = try Registry.init(testing.allocator);
-    defer registry.deinit();
-    var reads = tool.ReadLog.init(testing.allocator);
-    defer reads.deinit();
-
-    const hook = Hooks.Hook{
-        .command = "read payload; printf '%s' \"$payload\" > post.json",
-    };
-    const runner: Hooks.Runner = .{
-        .io = testing.io,
-        .root = root,
-        .set = .{ .post_tool_use = &.{hook} },
-    };
-    const calls = [_]Call{.{
-        .index = 0,
-        .name = "not-a-tool",
-        .arguments = "{}",
-    }};
-
-    const batch = try ToolRun.start(
-        testing.allocator,
-        testing.io,
-        &registry,
-        root,
-        &reads,
-        null,
-        .{},
-        &runner,
-        &calls,
-    );
-    batch.join();
-    defer batch.destroy();
-
-    try testing.expect(batch.results[0].is_error);
-    const payload = try tmp.dir.readFileAlloc(testing.io, "post.json", testing.allocator, .limited(4096));
-    defer testing.allocator.free(payload);
-    try testing.expect(std.mem.indexOf(u8, payload, "unknown tool") != null);
-}
-
 test "grouped post hooks distinguish success and failure while legacy hooks retain both" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -686,13 +641,6 @@ test "grouped post hooks distinguish success and failure while legacy hooks reta
     const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
     var registry = try Registry.init(a);
     defer registry.deinit();
-    const ProbeResult = struct {
-        fn execute(ctx: tool.Context, input: tool.Input) !tool.Output {
-            const fail = input.arguments.object.get("fail").?.bool;
-            return .{ .content = try ctx.allocator.dupe(u8, if (fail) "failed probe" else "successful probe"), .is_error = fail };
-        }
-    };
-    try registry.register(.{ .name = "probe", .description = "probe", .schema = "{}", .handler = ProbeResult.execute, .read_only = true });
     var reads = tool.ReadLog.init(a);
     defer reads.deinit();
     const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{
@@ -703,8 +651,8 @@ test "grouped post hooks distinguish success and failure while legacy hooks reta
         .post_tool_use_failure = &.{.{ .legacy = false, .command = "cat >> failure.jsonl" }},
     } };
     const calls = [_]Call{
-        .{ .index = 0, .name = "probe", .arguments = "{\"fail\":false}", .hook_input = .{ .event = .post_tool_use, .tool_call_id = "ok" } },
-        .{ .index = 1, .name = "probe", .arguments = "{\"fail\":true}", .hook_input = .{ .event = .post_tool_use, .tool_call_id = "bad" } },
+        .{ .index = 0, .name = "list", .arguments = "{}", .hook_input = .{ .event = .post_tool_use, .tool_call_id = "ok" } },
+        .{ .index = 1, .name = "not-a-tool", .arguments = "{}", .hook_input = .{ .event = .post_tool_use, .tool_call_id = "bad" } },
     };
     const batch = try ToolRun.start(a, testing.io, &registry, root, &reads, null, .{}, &runner, &calls);
     defer batch.destroy();
@@ -722,7 +670,8 @@ test "grouped post hooks distinguish success and failure while legacy hooks reta
     try testing.expectEqualStrings("PostToolUse", ok.value.object.get("hook_event_name").?.string);
     try testing.expectEqualStrings("ok", ok.value.object.get("tool_call_id").?.string);
     try testing.expectEqualStrings("PostToolUseFailure", bad.value.object.get("hook_event_name").?.string);
-    try testing.expectEqualStrings("failed probe", bad.value.object.get("error").?.string);
+    try testing.expectEqualStrings("bad", bad.value.object.get("tool_call_id").?.string);
+    try testing.expectEqualStrings("unknown tool 'not-a-tool'", bad.value.object.get("error").?.string);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, old, "hook_event_name"));
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, old, "\"PostToolUse\""));
 }
