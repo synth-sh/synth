@@ -43,6 +43,23 @@ pub const Options = struct {
 
 options: Options,
 client: Client,
+unsupported_stream_options: std.ArrayList([32]u8) = .empty,
+transport_mutex: std.Io.Mutex = .init,
+
+fn streamOptionsKey(client: *const OpenAIProvider) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(std.mem.asBytes(&client.host.len));
+    hash.update(client.host);
+    hash.update(client.model);
+    return hash.finalResult();
+}
+
+fn lacksStreamOptions(self: *const Backend, key: [32]u8) bool {
+    for (self.unsupported_stream_options.items) |known| {
+        if (std.mem.eql(u8, &known, &key)) return true;
+    }
+    return false;
+}
 
 pub const Client = union(catalog.Kind) {
     ollama: OllamaProvider,
@@ -124,6 +141,11 @@ pub fn startWithoutProbe(self: *Backend) !void {
 }
 
 pub fn deinit(self: *Backend) void {
+    self.unsupported_stream_options.deinit(self.options.allocator);
+    self.deinitClient();
+}
+
+fn deinitClient(self: *Backend) void {
     switch (self.client) {
         inline else => |*client| client.deinit(),
     }
@@ -155,8 +177,9 @@ pub const Spawned = struct {
         options.model = try a.dupe(u8, route.model);
         if (route.context_limit > 0) options.num_ctx = route.context_limit;
         options.api_key = if (route.api_key) |key| try a.dupe(u8, key) else null;
-        self.backend.deinit();
-        self.backend = .init(switch (route.provider) {
+        self.backend.deinitClient();
+        self.backend.options = options;
+        self.backend.client = build(switch (route.provider) {
             .openai => .openai,
             .ollama => .ollama,
         }, options);
@@ -167,6 +190,7 @@ pub const Spawned = struct {
                     .responses => .responses,
                     .messages => .messages,
                 };
+                if (client.wire == .chat) client.send_stream_options = !self.backend.lacksStreamOptions(streamOptionsKey(client));
                 try client.startWithoutProbe();
                 if (route.context_limit > 0) client.context_limit = route.context_limit;
             },
@@ -234,6 +258,8 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     errdefer child.arena.deinit();
     const arena = child.arena.allocator();
 
+    self.transport_mutex.lockUncancelable(self.options.io);
+    defer self.transport_mutex.unlock(self.options.io);
     var options = self.options;
     options.copilot_integration_id = try arena.dupe(u8, self.options.copilot_integration_id);
     options.host = try arena.dupe(u8, self.currentHost());
@@ -242,6 +268,9 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     options.api_key = if (self.currentKey()) |value| try arena.dupe(u8, value) else null;
 
     child.backend = .init(std.meta.activeTag(self.client), options);
+    child.backend.unsupported_stream_options = try self.unsupported_stream_options.clone(options.allocator);
+    errdefer child.backend.unsupported_stream_options.deinit(options.allocator);
+    if (self.client == .openai) try child.backend.rememberStreamOptions(&self.client.openai);
     switch (child.backend.client) {
         .ollama => |*client| try client.startLike(&self.client.ollama),
         .openai => |*client| try client.startLike(&self.client.openai),
@@ -251,7 +280,16 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     return child;
 }
 
+fn rememberStreamOptions(self: *Backend, client: *const OpenAIProvider) !void {
+    if (client.wire != .chat or client.send_stream_options) return;
+    const key = streamOptionsKey(client);
+    if (!self.lacksStreamOptions(key)) try self.unsupported_stream_options.append(self.options.allocator, key);
+}
+
 pub fn rememberTransport(self: *Backend, child: *const Spawned, purpose: @import("../core/model_policy.zig").Purpose) void {
+    self.transport_mutex.lockUncancelable(self.options.io);
+    defer self.transport_mutex.unlock(self.options.io);
+    if (child.backend.client == .openai) self.rememberStreamOptions(&child.backend.client.openai) catch {};
     switch (self.client) {
         .openai => |*parent| {
             if (child.backend.client != .openai) return;
@@ -368,14 +406,14 @@ pub fn connect(
         };
         errdefer replacement.deinit();
         try replacement.reconnect(connection);
-        self.deinit();
+        self.deinitClient();
         self.client = .{ .copilot = replacement };
         self.client.copilot.relocate();
         return self.provider();
     }
 
     if (entry.kind != std.meta.activeTag(self.client)) {
-        self.deinit();
+        self.deinitClient();
         // Built empty then reconnected: only `reconnect` copies the strings.
         self.client = build(entry.kind, .{
             .allocator = self.options.allocator,
@@ -577,6 +615,36 @@ test "named routes isolate credentials models and retry settings" {
     try std.testing.expectEqual(@as(usize, 1), review.backend.client.openai.retries.attempts);
     try std.testing.expectEqualStrings("main", base.model());
     try std.testing.expectEqualStrings("primary-secret", base.currentKey().?);
+}
+
+test "a route's stream-options repair is scoped to its endpoint model and wire protocol" {
+    const a = std.testing.allocator;
+    var base: Backend = .init(.ollama, .{ .allocator = a, .io = std.testing.io, .host = "http://localhost:11434", .label = "base" });
+    defer base.deinit();
+    try base.startWithoutProbe();
+    const route: @import("../core/model_policy.zig").Route = .{ .id = "review", .provider = .openai, .endpoint = "http://localhost:8000/v1", .model = "first" };
+    const repaired = try base.spawn(a);
+    defer repaired.deinit();
+    try repaired.configure(route);
+    repaired.backend.client.openai.send_stream_options = false;
+    base.rememberTransport(repaired, .approval_judge);
+
+    const next = try base.spawn(a);
+    defer next.deinit();
+    try next.configure(route);
+    try std.testing.expect(!next.backend.client.openai.send_stream_options);
+    var other = route;
+    other.model = "second";
+    try next.configure(other);
+    try std.testing.expect(next.backend.client.openai.send_stream_options);
+    other = route;
+    other.endpoint = "http://localhost:9000/v1";
+    try next.configure(other);
+    try std.testing.expect(next.backend.client.openai.send_stream_options);
+    other = route;
+    other.protocol = .responses;
+    try next.configure(other);
+    try std.testing.expect(next.backend.client.openai.send_stream_options);
 }
 
 test "completed request children preserve loaded context and conversation cache state" {
