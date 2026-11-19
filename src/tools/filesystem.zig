@@ -248,27 +248,17 @@ fn candidates(ctx: Context, scope: []const u8) ![]const []const u8 {
     return kept.toOwnedSlice(ctx.allocator);
 }
 
-/// `path` as the project sees it: relative to the root, with "." meaning all of
-/// it. Errors the same way every other tool does when it escapes the project.
-fn scopeOf(ctx: Context, path: []const u8) ![]const u8 {
-    if (path.len == 0 or std.mem.eql(u8, path, ".")) return "";
-
-    const resolved = try resolve(ctx, path);
-    defer ctx.allocator.free(resolved);
-
-    if (resolved.len <= ctx.project_root.len) return "";
-    return ctx.allocator.dupe(u8, resolved[ctx.project_root.len + 1 ..]);
+fn scopeOf(root: []const u8, path: []const u8) []const u8 {
+    return std.mem.trimStart(u8, path[root.len..], "/");
 }
 
-fn searchBase(ctx: Context, path: []const u8) ![]const u8 {
-    const resolved = try resolve(ctx, path);
-    defer ctx.allocator.free(resolved);
-    if (path_util.inside(ctx.project_root, resolved)) return ctx.allocator.dupe(u8, ctx.project_root);
+fn searchBase(ctx: Context, resolved: []const u8) ![]const u8 {
+    if (path_util.inside(ctx.project_root, resolved)) return ctx.project_root;
     for (ctx.additional_roots) |root| {
-        if (path_util.inside(root, resolved)) return ctx.allocator.dupe(u8, root);
+        if (path_util.inside(root, resolved)) return root;
     }
     const stat = try std.Io.Dir.cwd().statFile(ctx.io, resolved, .{});
-    return ctx.allocator.dupe(u8, if (stat.kind == .directory) resolved else std.fs.path.dirname(resolved) orelse resolved);
+    return if (stat.kind == .directory) resolved else std.fs.path.dirname(resolved) orelse resolved;
 }
 
 fn globTool(context: Context, input: Input) !Output {
@@ -280,10 +270,8 @@ fn globTool(context: Context, input: Input) !Output {
     const scope_path = resolve(ctx, path) catch |err| return pathError(ctx, path, err);
     defer ctx.allocator.free(scope_path);
     const base = searchBase(ctx, scope_path) catch |err| return pathError(ctx, path, err);
-    defer ctx.allocator.free(base);
     ctx.project_root = base;
-    const scope = scopeOf(ctx, scope_path) catch |err| return pathError(ctx, path, err);
-    defer if (scope.len > 0) ctx.allocator.free(scope);
+    const scope = scopeOf(base, scope_path);
 
     var set: glob.Set = glob.Set.init(ctx.allocator, pattern) catch |err| {
         return Output.err(try std.fmt.allocPrint(
@@ -399,10 +387,8 @@ fn grep(context: Context, input: Input) !Output {
     const scope_path = resolve(ctx, path) catch |err| return pathError(ctx, path, err);
     defer ctx.allocator.free(scope_path);
     const base = searchBase(ctx, scope_path) catch |err| return pathError(ctx, path, err);
-    defer ctx.allocator.free(base);
     ctx.project_root = base;
-    const scope = scopeOf(ctx, scope_path) catch |err| return pathError(ctx, path, err);
-    defer if (scope.len > 0) ctx.allocator.free(scope);
+    const scope = scopeOf(base, scope_path);
 
     var matcher = Matcher.init(ctx.allocator, pattern, literal, ignore_case) catch |err| {
         return Output.err(try std.fmt.allocPrint(
@@ -765,6 +751,7 @@ test "a scope is compared segment by segment" {
     try testing.expect(path_util.inside("src", "src"));
     try testing.expect(!path_util.inside("src", "srcfoo/main.zig"));
     try testing.expect(!path_util.inside("src", "other/src/main.zig"));
+    try testing.expectEqualStrings("src/main.zig", scopeOf("/", "/src/main.zig"));
 }
 
 test "read pages through a file with offset and limit" {
