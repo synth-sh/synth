@@ -2,13 +2,14 @@
 
 ## Files
 
-Three files, split by what they hold.
+Synth stores settings, credentials, and session data separately.
 
 | file | holds | where |
 | --- | --- | --- |
 | `config.json` | what you set by hand | `$XDG_CONFIG_HOME/synth/` |
 | `auth.json` | API keys, one per provider | `$XDG_DATA_HOME/synth/` |
 | `synth.db` | sessions, messages, approvals, the provider and model in use | `$XDG_DATA_HOME/synth/` |
+| `hook-trust.json` | hook trust and enable state | `$XDG_DATA_HOME/synth/` |
 
 Every `config.json` key is optional. An absent one keeps the built-in default.
 
@@ -17,7 +18,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `system_prompt` | string | the built-in brief | Replaces the base instructions entirely. |
 | `think` | bool | `true` | Ask for reasoning output. Turn off for models that do not support it. |
 | `auto_approve_safe_commands` | bool | `true` | Let a preset of read-only shell commands run without a prompt. Off makes every command a question, however harmless. |
-| `approvals` | string | `"ask"` | Who decides a call that would otherwise ask: `ask` puts it to you, `auto` has the configured reviewer judge it (the session model by default; see [Auto approvals](usage.md#auto-approvals)), `all` runs everything, paths outside the project included - for a machine set aside for the agent. `PreToolUse` hooks still run under each. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
+| `approvals` | string | `"ask"` | `ask` prompts, `auto` uses a [model reviewer](usage.md#auto-approvals), and `all` skips ordinary approval prompts, including for paths outside the project. Hook policies and actions requiring human approval still apply. |
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |
@@ -25,8 +26,9 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See [MCP](mcp.md). |
-| `hooks` | object | none | Lifecycle and request events, with legacy command lists or grouped command/MCP handlers. Inline, user, and project sources are additive. Optional `when` filters select agent scope, request purpose, agent_type, model, and provider. Every definition needs explicit trust; see [Hooks](hooks.md#targeted-routing). |
-| `hook_timeout_ms` | integer | `30000` | Default hook timeout, 1–86,400,000 ms. A handler can override `timeout_ms`; shutdown/interruption cleanup is capped separately. |
+| `hooks` | object | none | Commands and MCP tools triggered by [hook events](hooks.md#events). |
+| `model_requests` | object | active session model | Choose [models by request purpose](#models-by-request-purpose). |
+| `hook_timeout_ms` | integer | `30000` | Default hook timeout in milliseconds, from 1 to 86,400,000. |
 | `web` | object | none | Settings for the web tools. See below. |
 | `prune` | object | shed after 30 days | What a prune throws away. See [Pruning](#pruning). |
 | `bell` | string | `unfocused` | When a finished turn says so: `unfocused`, `always` or `never`. See below. |
@@ -41,8 +43,8 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 }
 ```
 
-The provider, its host, the model and the theme are **not** in here. They are
-set by using the app and kept in the database.
+Synth stores the active provider, host, model, and theme in the database.
+Use `model_requests` in this file to configure dedicated routes.
 
 `debug_log` is the first thing to reach for when a model goes quiet: it shows
 whether a request was sent at all, and how large it had grown.
@@ -74,8 +76,10 @@ That works, but DuckDuckGo throttles it after a handful of searches and answers
 with a page that has no results on it, which the tool reports as such. A Brave
 Search key in `BRAVE_API_KEY` switches it to an API that does not throttle.
 
-A debug build keeps all three files in the working directory, so a checkout
-never touches installed state.
+Debug builds keep `config.json`, `auth.json`, and `synth.db` in the working
+directory. Debug hook trust lives under `$XDG_DATA_HOME/synth-dev/`.
+If `XDG_DATA_HOME` is unset, both builds use `~/.local/share/` as the base
+for hook trust.
 
 `"bell"` decides when a finished turn says so: `unfocused` (the default),
 `always`, or `never`. It sends both a desktop notification and BEL, because
@@ -140,75 +144,45 @@ synth db vacuum        hand freed pages back to the filesystem
 A day count given to `db prune` only ever sheds, so losing a transcript stays
 something `config.json` has to ask for.
 
-## Purpose-based models and approval review
+## Models by request purpose
 
-`model_requests` selects models independently for agent turns, automatic approval
-review, and compaction. For a local-only configuration:
+Use `model_requests` to choose a model for `agent`, `approval_judge`, or
+`compaction` requests. This example runs automatic approval review against
+a separate local Ollama model. Replace `qwen3` with a model installed on
+your server.
 
 ```json
 {
   "approvals": "auto",
-  "auto_approve_safe_commands": false,
   "model_requests": {
-    "restrict_routes": true,
-    "agent": "local-agent",
     "approval_judge": "local-review",
-    "compaction": "local-agent",
-    "reviewer_timeout_ms": 30000,
     "reviewer_fallback": "deny",
-    "routes": [
-      {
-        "id": "local-agent",
-        "provider": "ollama",
-        "endpoint": "http://localhost:11434",
-        "model": "qwen3",
-        "context_limit": 32768,
-        "purposes": ["agent", "compaction"],
-        "settings": {"max_output_tokens": 8192}
-      },
-      {
-        "id": "local-review",
-        "provider": "openai",
-        "endpoint": "http://localhost:8080/v1",
-        "model": "reviewer",
-        "context_limit": 8192,
-        "purposes": ["approval_judge"],
-        "settings": {"temperature": 0, "max_output_tokens": 1024, "attempts": 1}
-      }
-    ]
+    "routes": [{
+      "id": "local-review",
+      "provider": "ollama",
+      "endpoint": "http://localhost:11434",
+      "model": "qwen3",
+      "purposes": ["approval_judge"]
+    }]
   }
 }
 ```
 
-Omitting a purpose uses the active provider unless `restrict_routes` is enabled.
-Each request owns an independent backend client. Selecting a reviewer or
-compaction model does not mutate the agent's model. Route credentials are
-optional and explicit (`api_key`); an active provider's credential is never
-forwarded to a configured route.
+| Setting | Behavior |
+| --- | --- |
+| `agent`, `approval_judge`, `compaction` | Select a route ID. Omitted purposes use the active provider by default. |
+| `restrict_routes` | Requires a route for all three purposes and disables provider discovery and switching. Tool network access still follows tool permissions and hook trust. |
+| `reviewer_timeout_ms` | Approval review deadline, including preparation and retries. Defaults to 30,000 ms and accepts 1–300,000. |
+| `reviewer_fallback` | On timeout, error, or missing verified human intent, `ask` (default) requests human approval and `deny` refuses the call. If a resumed session lacks a verified human prompt, send a fresh one. |
 
-The review deadline defaults to 30 seconds, including preparation and retries;
-it can be set from 1 to 300000 ms. Failure, timeout, malformed verdicts, invalid
-routing, or missing verified human intent use `reviewer_fallback`: `ask` by
-default, or `deny`. Neither fallback permits an action automatically. Legacy
-sessions with unknown message provenance need a fresh human request for automatic
-review. Ordinary read-only and configured standing allowances still follow the
-existing approval rules.
+Each route needs an `id`, `provider` (`openai` or `ollama`), HTTP(S)
+`endpoint`, and `model`. For `openai`, set `protocol` to `chat` (default),
+`responses`, or `messages`. Supply an explicit `api_key` if required.
+Only the route's configured key is sent to its endpoint.
 
-The judge retains up to eight human prompts and eight typed question/answer
-records independently, with 16 KiB per stored record and 64 KiB per family.
-Rendering uses Codex guardian's 900 estimated-token limit per instruction or
-question/answer record. Records that do not fit are omitted whole; notices warn
-that remaining grants are incomplete, and review continues. Questions remain
-untrusted context; selected option text and harness-written replies never become
-human instructions. The eight most recent approve/deny decisions include bounded
-action descriptions and apply only to those actions. Ollama judge requests set
-`truncate: false`, so an actual overflow uses the configured fallback.
-
-See [model customization hooks](hooks.md#model-requests) for request
-context, generation settings, and bounded retry controls.
-
-A route may set `context_limit` (0–1048576 tokens). Zero uses the backend
-default or known model table. For local models, set their usable context window;
-Ollama also receives this value as `num_ctx`. With restricted routes, provider
-auto-discovery and model/provider switching are disabled. Explicit tool and hook
-network access remains governed by tool permissions and hook trust.
+Use `purposes` to restrict which requests can use a route and `settings`
+to set supported generation controls such as `max_output_tokens`. Set
+`context_limit` to the usable window in tokens, up to 1,048,576. Zero uses
+the backend default or known model limit. Ollama also receives it as
+`num_ctx`. See [Model request hooks](hooks.md#model-requests) for per-request
+changes and the [configuration schema](../config.schema.json) for all keys.

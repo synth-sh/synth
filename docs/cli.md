@@ -5,10 +5,9 @@ synth [project]                start the TUI (default)
 synth run [--allow] <message>  one headless turn, no TUI
 synth session list|show|rm     sessions for this project
 synth session search <text>    find text in this project's transcripts
-synth hooks list|review        inspect lifecycle hooks and pending trust
-synth hooks trust <id>         trust one exact reviewed hook definition
-synth hooks revoke <id>        remove trust without deleting the declaration
-synth hooks enable|disable <id> control a declaration separately from trust
+synth hooks list|review       inspect hooks and trust status
+synth hooks trust|revoke <id>  change trust for a reviewed definition
+synth hooks enable|disable <id> control whether a hook runs
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
 synth db status|prune|vacuum   what the database holds, and shrinking it
@@ -23,12 +22,12 @@ synth remote new <host> [dir]  start one there, in your home by default
   -c, --continue               resume the most recent session here
   -s, --session <id>           resume a session by handle (ses_7k3f9a2b)
   -m, --model <name>           override the model, this run only
-      --allow                  run only: approve calls that would prompt
+      --allow                  run only: allow ordinary approval prompts
 ```
 
-`synth run` is the fastest way to answer "does this model actually emit tool
-calls" - it drives the real loop and provider and prints each step, denying
-anything that would change the project unless `--allow` is given.
+`synth run` drives one turn and prints each step. By default it declines
+operations that prompt for approval. `--allow` authorizes ordinary approval
+prompts. Calls that specifically require a human are refused in headless runs.
 
 ## ACP
 
@@ -39,7 +38,8 @@ elsewhere attaches to it there. An editor that offers its own view of files
 gets reads and edits through it, unsaved changes included, and one that keeps
 terminals runs commands in them, shown in the call as they run. MCP servers
 the editor brings connect beside those in `config.json`, which wins a clash of
-names; skills, `/compact`, `/hooks`, `/cd`, and `/add-dir` are offered as its slash commands.
+names. ACP offers skills, `/compact`, `/hooks`, `/cd`, and `/add-dir` as
+slash commands.
 
 Quitting stops the session, a turn in progress included, unless another
 terminal is attached to it. `/detach` leaves it running instead, and so does
@@ -48,6 +48,19 @@ losing the terminal without quitting, a closed window or a crash:
 any terminal, and quitting from there stops it. Each session listens on a
 socket in `$SYNTH_SOCKET_DIR`, else `/tmp/synth-<uid>`. An editor's sessions
 stop when the editor goes.
+
+### Synth ACP extensions
+
+Clients opt in with `"_meta": {"synth": {"protocol": 2}}` in `initialize`.
+
+| Method | Params | Effect |
+| --- | --- | --- |
+| `_synth/change_directory` | `{"sessionId":"…","path":"…"}` | Change the working directory of an idle session. |
+| `_synth/add_directory` | `{"sessionId":"…","path":"…"}` | Add a permitted file root to an idle session. A new root emits `DirectoryAdded` with `source: "register_repo_root"` by default. |
+| `_synth/hooks` | `{"sessionId":"…","action":"review"}` | Return a hook report. Use `id` for `trust`, `revoke`, `enable`, and `disable`, which require an idle session. The default action is `list`. |
+
+`_synth/status` includes `cwd` and `additional_roots`. The `root` and
+`project` fields identify the original project.
 
 ## Remote
 
@@ -61,20 +74,6 @@ id offers the sessions there to pick from.
 
 ## Hook review
 
-Hook listing/review includes configured `when` filters; recent execution records
-include agent scope and request purpose. See [Targeted routing](hooks.md#targeted-routing).
-
-`synth hooks review` shows the definitions that an explicit `trust <id>`
-authorizes. Existing hooks require this one-time review after upgrade; changed
-definitions need review again. Trust state stays in private user storage, even
-for debug builds. Listing and review never execute hooks or connect providers.
-See [Hooks](hooks.md) for sources, events, grouped handlers, and migration.
-
-
-ACP clients can change session directories through `_synth/change_directory`
-or register a permitted root through `_synth/add_directory`. Both requests take
-`{"sessionId":"…","path":"…"}` and require an idle session. Root registration
-emits `DirectoryAdded` with `source: "register_repo_root"`.
-The TUI sends `source: "slash_command"`. Status updates expose
-`cwd` and `additional_roots`; `root` and `project` retain their session identity
-and original project meaning. See [Hooks and workspace](usage.md#hooks-and-workspace).
+Run `synth hooks review` from the project to inspect hook definitions and
+trust status without executing hooks or connecting to a model provider.
+See [Hooks](hooks.md#configuration-and-trust) for trust and enable controls.
