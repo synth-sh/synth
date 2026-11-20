@@ -1115,7 +1115,7 @@ fn recordHuman(self: *Loop, text: []const u8, authorization: bool) !void {
 }
 
 fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
-    try self.recordUserPrompt(prompt, extras);
+    try self.recordUserPrompt(prompt, extras, .record_intent);
     self.steps = 0;
     self.recovered_from_overflow = false;
     self.repeats = 0;
@@ -1132,7 +1132,9 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.ask();
 }
 
-fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
+const IntentRecording = enum { record_intent, already_recorded };
+
+fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras, intent: IntentRecording) !void {
     var mentioned: mention.Resolved =
         mention.resolve(self.allocator, self.io, self.workingDirectory(), prompt) catch .{};
     defer mentioned.deinit(self.allocator);
@@ -1143,7 +1145,11 @@ fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
     defer self.allocator.free(images);
 
     const submitted = try self.conversation.addUser(prompt, attachments, images);
-    if (self.parent != null) submitted.origin = .agent else try self.recordHuman(prompt, false);
+    if (self.parent != null) {
+        submitted.origin = .agent;
+    } else if (intent == .record_intent) {
+        try self.recordHuman(prompt, false);
+    }
     try self.persistMessage(self.conversation.messages.items.len - 1);
 }
 
@@ -1327,7 +1333,7 @@ fn pollHooks(self: *Loop) !bool {
                 self.hook_flow.setNotice(self.allocator, reason);
             } else {
                 try self.acceptHookResult(&dispatch.result);
-                try self.recordUserPrompt(pending.prompt, pending.extras);
+                try self.recordUserPrompt(pending.prompt, pending.extras, .already_recorded);
             }
             try self.ask();
         },
@@ -1587,7 +1593,7 @@ fn applySteering(self: *Loop) !void {
     while (self.steering.items.len > 0) {
         var pending = self.steering.orderedRemove(0);
         defer pending.deinit(self.allocator);
-        try self.recordUserPrompt(pending.prompt, pending.extras);
+        try self.recordUserPrompt(pending.prompt, pending.extras, .already_recorded);
     }
 }
 
@@ -1601,6 +1607,7 @@ pub fn steer(self: *Loop, text: []const u8, extras: Extras) !bool {
     try self.checkHookTrust();
     var pending: Submission = try .init(self.allocator, text, extras);
     errdefer pending.deinit(self.allocator);
+    if (self.parent == null) try self.recordHuman(text, false);
     try self.steering.append(self.allocator, pending);
     return true;
 }
@@ -7373,4 +7380,31 @@ test "picked and harness answers never become person instructions" {
             try testing.expectEqual(Conversation.Role.assistant, snapshot.messages[1].role);
         }
     }
+}
+
+test "steering typed mid-turn is human evidence before the next step" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("deploy it", .{});
+    try testing.expect(try loop.steer("wait, plan only", .{}));
+    const snapshot = try loop.human_intent.snapshot(testing.allocator);
+    defer snapshot.deinit(testing.allocator);
+    var found_steering = false;
+    for (snapshot.messages) |message| {
+        if (std.mem.eql(u8, message.text, "wait, plan only")) found_steering = true;
+    }
+    try testing.expect(found_steering);
+    try settle(&loop);
+
+    const after = try loop.human_intent.snapshot(testing.allocator);
+    defer after.deinit(testing.allocator);
+    var occurrences: usize = 0;
+    for (after.messages) |message| {
+        if (std.mem.eql(u8, message.text, "wait, plan only")) occurrences += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), occurrences);
 }
