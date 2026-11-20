@@ -175,7 +175,7 @@ pub const Spawned = struct {
         options.host = try a.dupe(u8, route.endpoint);
         options.label = try a.dupe(u8, route.id);
         options.model = try a.dupe(u8, route.model);
-        if (route.context_limit > 0) options.num_ctx = route.context_limit;
+        options.num_ctx = route.context_limit;
         options.api_key = if (route.api_key) |key| try a.dupe(u8, key) else null;
         self.backend.deinitClient();
         self.backend.options = options;
@@ -608,6 +608,22 @@ test "named routes isolate credentials models and retry settings" {
     try std.testing.expectEqual(@as(usize, 1), review.backend.client.openai.retries.attempts);
     try std.testing.expectEqualStrings("main", base.model());
     try std.testing.expectEqualStrings("primary-secret", base.currentKey().?);
+}
+
+test "an Ollama route uses its own context setting" {
+    const a = std.testing.allocator;
+    var base: Backend = .init(.ollama, .{ .allocator = a, .io = std.testing.io, .host = "http://127.0.0.1:9", .label = "primary", .model = "main", .num_ctx = 32_768 });
+    defer base.deinit();
+    const child = try base.spawn(a);
+    defer child.deinit();
+    var route: @import("../core/model_policy.zig").Route = .{ .id = "small", .provider = .ollama, .endpoint = "http://127.0.0.1:9", .model = "small" };
+    try child.configure(route);
+    child.backend.client.ollama.context_limit = 8192;
+    try std.testing.expectEqual(@as(?u32, null), child.backend.client.ollama.requestedContext());
+    route.context_limit = 4096;
+    try child.configure(route);
+    try std.testing.expectEqual(@as(?u32, 4096), child.backend.client.ollama.requestedContext());
+    try std.testing.expectEqual(@as(?u32, 32_768), base.client.ollama.requestedContext());
 }
 
 test "a route's stream-options repair is scoped to its endpoint model and wire protocol" {

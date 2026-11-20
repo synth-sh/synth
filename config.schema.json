@@ -393,7 +393,7 @@
                 "matcher": {
                     "type": "string",
                     "default": "",
-                    "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal filenames."
+                    "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal project-relative paths."
                 },
                 "hooks": {
                     "type": "array",
@@ -666,7 +666,7 @@
                     "minimum": 0,
                     "maximum": 1048576,
                     "default": 0,
-                    "description": "Known route context window; zero uses the backend default or model table. Ollama also receives num_ctx."
+                    "description": "Known route context window; zero uses the backend default or model table. Ollama receives positive limits as num_ctx."
                 },
                 "protocol": {
                     "enum": [

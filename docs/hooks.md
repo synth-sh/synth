@@ -46,8 +46,9 @@ file arguments can share trust across checkouts.
 Each event takes an array of groups. Put the handlers in each group's
 `hooks` array, with optional `matcher` and `when` fields alongside it.
 Matchers use regular expressions and recognize tool names and aliases such
-as `Bash` and `Edit`. For `FileChanged`, use project-root filenames separated
-by `|`. An omitted matcher runs for every occurrence of the event.
+as `Bash` and `Edit`. For `FileChanged`, use project-relative paths such as
+`subdir/.env`, separated by `|`. An omitted matcher runs for every occurrence
+of the event.
 
 Use `timeout_ms` (milliseconds) or `timeout` (seconds) to override
 [`hook_timeout_ms`](configuration.md). Command handlers accept `async: true`

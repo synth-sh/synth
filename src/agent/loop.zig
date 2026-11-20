@@ -976,9 +976,18 @@ pub fn shouldCompact(self: *Loop) bool {
 
 const context_full_notice = "Stopped: context is full. History was preserved. Use /compact or switch to a model with a larger context window before continuing.";
 
+fn hasModelRoute(self: *const Loop, invocation: Hooks.Invocation) bool {
+    if (self.model_policy.selected(invocation.request_purpose) != null) return true;
+    const runner = self.hooks orelse return false;
+    var input = invocation;
+    input.event = .model_resolve;
+    input.model = self.provider.model;
+    input.provider = self.provider.name;
+    return runner.hasMatching(self.allocator, input, false);
+}
+
 fn contextFits(self: *Loop, request_turn: Provider.Turn) !bool {
-    if (self.model_policy.selected(request_turn.hook_input.request_purpose) != null) return true;
-    if (self.hooks) |runner| if (runner.set.model_resolve.len > 0) return true;
+    if (self.hasModelRoute(request_turn.hook_input)) return true;
     const budget = window.requestBudget(self.provider.context_limit, request_turn);
     const kept = window.completeMessages(self.conversation, self.allocator, budget, self.provider.vision) catch |err| switch (err) {
         error.ContextTooLarge => return false,
@@ -4751,6 +4760,28 @@ test "a tool turn compacts with its task intact and continues without another us
     }
 }
 
+test "inactive model resolution hooks do not bypass the context limit" {
+    const cases = [_]Hooks.Hook{
+        .{ .command = "true", .enabled = false },
+        .{ .command = "true", .when = .{ .request_purpose = .approval_judge } },
+    };
+    for (cases) |hook| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        var loop = fixture.loop();
+        defer loop.deinit();
+        const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .model_resolve = &.{hook} } };
+        loop.hooks = &runner;
+        loop.system_prompt = "";
+        loop.provider.context_limit = 100;
+        loop.auto_compact_at = 0;
+        try loop.submit("preserve this task " ** 40, .{});
+        try testing.expectEqual(Outcome.halted, loop.outcome.?);
+        try testing.expectEqual(@as(u64, 0), loop.requests_started);
+        try testing.expectEqualStrings(context_full_notice, lastAssistant(&fixture.convo).?.text);
+    }
+}
+
 test "a full context stops without sending a truncated request when auto-compaction is disabled" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -6506,17 +6537,25 @@ test "external file and configuration changes fire while idle without starting i
     defer fixture.deinit();
     var runtime: Hooks.Runtime = .{ .allocator = testing.allocator, .io = testing.io };
     defer runtime.deinit();
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = .{
-        .file_changed = &.{.{ .matcher = ".env", .command = "cat > file-change.json" }},
-        .config_change = &.{.{ .matcher = "project_settings", .command = "cat > config-change.json" }},
-    } };
+    const arena = fixture.scratch.allocator();
+    const declarations = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{
+        \\  "FileChanged":[
+        \\    {"matcher":".env","hooks":[{"command":"cat > root-change.json"}]},
+        \\    {"matcher":"subdir/.env|subdir/.envrc","hooks":[{"command":"cat > file-change.json"}]}
+        \\  ],
+        \\  "ConfigChange":[{"matcher":"project_settings","hooks":[{"command":"cat > config-change.json"}]}]
+        \\}
+    , .{});
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .runtime = &runtime, .set = try Hooks.parse(arena, declarations, "fixture") };
     var loop = fixture.loop();
     defer loop.deinit();
     loop.hooks = &runner;
     try loop.hook_flow.watch.configure(testing.allocator, testing.io, fixture.root, "", null, runner.set, &.{}, &.{});
     try fixture.tmp.dir.createDir(testing.io, ".synth", .default_dir);
     try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = ".synth/hooks.json", .data = "{}" });
-    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = ".env", .data = "outside write" });
+    try fixture.tmp.dir.createDir(testing.io, "subdir", .default_dir);
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "subdir/.env", .data = "outside write" });
     _ = try loop.poll();
     try settle(&loop);
     try settleHookObservers(&runtime);
@@ -6524,6 +6563,8 @@ test "external file and configuration changes fire while idle without starting i
     try testing.expect(loop.outcome == null);
     const parsed = try fixture.readEvent("file-change.json");
     try testing.expectEqualStrings("add", parsed.get("event").?.string);
+    try testing.expectEqualStrings(try std.fs.path.join(arena, &.{ fixture.root, "subdir/.env" }), parsed.get("file_path").?.string);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "root-change.json", .{}));
     const config = try fixture.readFile("config-change.json");
     try testing.expect(std.mem.indexOf(u8, config, "project_settings") != null);
 }

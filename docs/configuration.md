@@ -183,6 +183,7 @@ Only the route's configured key is sent to its endpoint.
 Use `purposes` to restrict which requests can use a route and `settings`
 to set supported generation controls such as `max_output_tokens`. Set
 `context_limit` to the usable window in tokens, up to 1,048,576. Zero uses
-the backend default or known model limit. Ollama also receives it as
-`num_ctx`. See [Model request hooks](hooks.md#model-requests) for per-request
-changes and the [configuration schema](../config.schema.json) for all keys.
+the backend default or known model limit. Ollama receives a positive limit as
+`num_ctx` and uses its server default when the limit is zero. See [Model request
+hooks](hooks.md#model-requests) for per-request changes and the
+[configuration schema](../config.schema.json) for all keys.

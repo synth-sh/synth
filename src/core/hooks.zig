@@ -85,7 +85,7 @@ pub const Event = enum {
             .instructions_loaded => input.load_reason,
             .pre_model_switch, .post_model_switch => input.to_model,
             .stop_failure => input.error_type,
-            .file_changed => std.fs.path.basename(input.file_path),
+            .file_changed => input.file_path,
             else => null,
         };
     }
@@ -280,7 +280,16 @@ fn parseDeclaration(a: std.mem.Allocator, value: std.json.Value, event: Event, s
     } else "";
     const filter = if (value.object.get("when")) |field| try parseWhen(a, field) else null;
     const declaration: Declaration = .{ .event = event, .source = source, .matcher = matcher, .when = filter };
-    if (event == .file_changed and std.mem.indexOfAny(u8, matcher, "/\\") != null) return error.InvalidHookMatcher;
+    if (event == .file_changed) {
+        var names = std.mem.tokenizeScalar(u8, matcher, '|');
+        while (names.next()) |name| {
+            if (std.mem.indexOfScalar(u8, name, '\\') != null) return error.InvalidHookMatcher;
+            var components = std.mem.splitScalar(u8, name, '/');
+            while (components.next()) |component| {
+                if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidHookMatcher;
+            }
+        }
+    }
     const group = value.object.get("hooks") orelse return error.InvalidHooks;
     if (group != .array) return error.InvalidHooks;
     var fields = value.object.iterator();
@@ -708,7 +717,7 @@ pub const Runner = struct {
     pub fn hasMatching(self: Runner, allocator: std.mem.Allocator, invocation: Invocation, require_trust: bool) bool {
         for (self.set.forEvent(invocation.event)) |hook| {
             if (!hook.enabled or (require_trust and !hook.trusted)) continue;
-            if (hookMatches(allocator, hook, invocation) catch false) return true;
+            if (hookMatches(allocator, self.root, hook, invocation) catch false) return true;
         }
         return false;
     }
@@ -718,7 +727,7 @@ pub const Runner = struct {
         const runtime = self.runtime orelse return;
         for (self.set.forEvent(invocation.event)) |hook| {
             if (!hook.enabled) continue;
-            if (!try hookMatches(runtime.allocator, hook, invocation)) continue;
+            if (!try hookMatches(runtime.allocator, self.root, hook, invocation)) continue;
             if (!hook.trusted) {
                 try runtime.notice("Hooks need review; an observation handler was not executed");
                 continue;
@@ -740,7 +749,7 @@ pub const Runner = struct {
         if (!hook.enabled) return false;
         if (hook.async and (invocation.event.requestStage() or invocation.event == .permission_evaluate)) return error.InvalidHookAsync;
         if (self.rewrite_author == index or (self.rewrite_author != null and hook.async)) return false;
-        const matched = hookMatches(allocator, hook, invocation) catch |err| {
+        const matched = hookMatches(allocator, self.root, hook, invocation) catch |err| {
             if (err == error.OutOfMemory) return err;
             failure.record(index, err);
             if (self.runtime) |runtime| runtime.record(hook, invocation, std.Io.Clock.now(.awake, self.io).toMilliseconds(), "failed", null, @errorName(err));
@@ -1162,13 +1171,16 @@ fn compileMatcher(allocator: std.mem.Allocator, pattern: []const u8) !regex.Rege
     return regex.compile(allocator, pattern, .{});
 }
 
-fn hookMatches(allocator: std.mem.Allocator, hook: Hook, invocation: Invocation) !bool {
+fn hookMatches(allocator: std.mem.Allocator, root: []const u8, hook: Hook, invocation: Invocation) !bool {
     if (hook.when) |filter| if (!filter.accepts(invocation)) return false;
     const value = invocation.event.matcherValue(invocation) orelse return true;
     if (hook.matcher.len == 0 or std.mem.eql(u8, hook.matcher, "*")) return true;
     if (invocation.event == .file_changed) {
+        const directory = std.mem.trimEnd(u8, root, "/");
+        if (value.len <= directory.len or !std.mem.startsWith(u8, value, directory) or value[directory.len] != '/') return false;
+        const relative = value[directory.len + 1 ..];
         var names = std.mem.tokenizeScalar(u8, hook.matcher, '|');
-        while (names.next()) |name| if (std.mem.eql(u8, value, name)) return true;
+        while (names.next()) |name| if (std.mem.eql(u8, relative, name)) return true;
         return false;
     }
     var compiled = try compileMatcher(allocator, hook.matcher);
@@ -1416,9 +1428,9 @@ test "grouped hooks run despite denial and apply rewrites in declaration order" 
 test "grouped matcher accepts aliases and alternation" {
     const a = std.testing.allocator;
     const hook: Hook = .{ .matcher = "^(Bash|bash|Edit)$", .command = "true" };
-    try std.testing.expect(try hookMatches(a, hook, .{ .event = .pre_tool_use, .tool_name = "bash" }));
-    try std.testing.expect(try hookMatches(a, hook, .{ .event = .pre_tool_use, .tool_name = "edit" }));
-    try std.testing.expect(!try hookMatches(a, hook, .{ .event = .pre_tool_use, .tool_name = "read" }));
+    try std.testing.expect(try hookMatches(a, "/p", hook, .{ .event = .pre_tool_use, .tool_name = "bash" }));
+    try std.testing.expect(try hookMatches(a, "/p", hook, .{ .event = .pre_tool_use, .tool_name = "edit" }));
+    try std.testing.expect(!try hookMatches(a, "/p", hook, .{ .event = .pre_tool_use, .tool_name = "read" }));
     try std.testing.expectError(error.UnsupportedHookRegex, compileMatcher(a, "(?=bash)"));
     try std.testing.expectError(error.UnsupportedHookRegex, compileMatcher(a, "(bash)\\1"));
 }
@@ -1702,27 +1714,28 @@ test "event matchers filter lifecycle metadata and ignore unsupported matcher fi
         .{ .input = .{ .event = .config_change, .source = "project_settings" }, .matcher = "project_settings" },
         .{ .input = .{ .event = .instructions_loaded, .load_reason = "compact" }, .matcher = "compact" },
         .{ .input = .{ .event = .file_changed, .file_path = "/p/.env" }, .matcher = ".env|.envrc" },
+        .{ .input = .{ .event = .file_changed, .file_path = "/p/subdir/.env" }, .matcher = ".envrc|subdir/.env" },
         .{ .input = .{ .event = .post_tool_use_failure, .tool_name = "bash" }, .matcher = "Bash" },
         .{ .input = .{ .event = .permission_denied, .tool_name = "write" }, .matcher = "Write" },
     };
     for (cases) |case| {
-        try std.testing.expect(try hookMatches(a, .{ .matcher = case.matcher }, case.input));
-        try std.testing.expect(!try hookMatches(a, .{ .matcher = "unrelated" }, case.input));
+        try std.testing.expect(try hookMatches(a, "/p", .{ .matcher = case.matcher }, case.input));
+        try std.testing.expect(!try hookMatches(a, "/p", .{ .matcher = "unrelated" }, case.input));
     }
-    try std.testing.expect(try hookMatches(a, .{ .matcher = "ignored" }, .{ .event = .post_tool_batch }));
+    try std.testing.expect(try hookMatches(a, "/p", .{ .matcher = "ignored" }, .{ .event = .post_tool_batch }));
 }
 
 test "routing filters require every exact field and compose with event matchers" {
     const a = std.testing.allocator;
     const input: Invocation = .{ .event = .pre_tool_use, .agent_scope = .subagent, .request_purpose = .agent, .agent_type = "task", .model = "qwen3", .provider = "local", .tool_name = "read" };
     const filter: When = .{ .agent_scope = .subagent, .request_purpose = .agent, .agent_type = "task", .model = "qwen3", .provider = "local" };
-    try std.testing.expect(try hookMatches(a, .{ .matcher = "^Read$", .when = filter }, input));
+    try std.testing.expect(try hookMatches(a, "/p", .{ .matcher = "^Read$", .when = filter }, input));
     const mismatches = [_]When{
         .{ .agent_scope = .main }, .{ .request_purpose = .approval_judge }, .{ .agent_type = "build" }, .{ .model = "qwen" }, .{ .provider = "remote" },
     };
-    for (mismatches) |wrong| try std.testing.expect(!try hookMatches(a, .{ .when = wrong }, input));
-    try std.testing.expect(!try hookMatches(a, .{ .matcher = "write", .when = filter }, input));
-    try std.testing.expect(!try hookMatches(a, .{ .when = .{ .agent_scope = .subagent } }, .{ .event = .stop }));
+    for (mismatches) |wrong| try std.testing.expect(!try hookMatches(a, "/p", .{ .when = wrong }, input));
+    try std.testing.expect(!try hookMatches(a, "/p", .{ .matcher = "write", .when = filter }, input));
+    try std.testing.expect(!try hookMatches(a, "/p", .{ .when = .{ .agent_scope = .subagent } }, .{ .event = .stop }));
 }
 
 test "routing configuration rejects typos null selectors and handler-level ambiguity" {
