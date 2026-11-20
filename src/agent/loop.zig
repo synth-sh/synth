@@ -2622,9 +2622,27 @@ fn hookRequiresApproval(self: *const Loop, call: *const Conversation.ToolCall) b
                 const path = std.fs.path.resolve(arena, &.{ self.workingDirectory(), target.string }) catch return true;
                 if (permission.protectedPath(arena, self.io, self.project_root, path, self.control_files, if (self.hooks) |runner| runner.set else .{}) catch true) return true;
             }
+            if (self.commandTouchesControlFiles(arena, call.name, input)) return true;
         }
     };
     for (self.hook_flow.asks.items) |id| if (std.mem.eql(u8, call.id, id)) return true;
+    return false;
+}
+
+fn commandTouchesControlFiles(self: *const Loop, arena: std.mem.Allocator, tool_name: []const u8, input: std.json.Value) bool {
+    const hooks = if (self.hooks) |runner| runner.set else Hooks.Set{};
+    const is_mcp = std.mem.startsWith(u8, tool_name, "mcp__");
+    var fields = input.object.iterator();
+    while (fields.next()) |field| {
+        if (field.value_ptr.* != .string) continue;
+        const text = field.value_ptr.string;
+        const is_command = std.mem.eql(u8, field.key_ptr.*, "command");
+        if (!is_command and !is_mcp) continue;
+        const changes_trust = permission.commandChangesHookTrust(arena, text) catch return true;
+        if (is_command and changes_trust) return true;
+        const reaches = permission.commandReachesProtectedPath(arena, self.io, self.project_root, self.workingDirectory(), text, self.control_files, hooks) catch return true;
+        if (reaches) return true;
+    }
     return false;
 }
 
@@ -7379,6 +7397,27 @@ test "picked and harness answers never become person instructions" {
             try testing.expectEqualStrings(response.typed.?, snapshot.messages[2].text);
             try testing.expectEqual(Conversation.Role.assistant, snapshot.messages[1].role);
         }
+    }
+}
+
+test "shell commands that write control files or change hook trust need a human" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .all;
+
+    var call: Conversation.ToolCall = .{ .id = "call_0", .name = "bash", .arguments = "{\"command\":\"zig build test\"}" };
+    try testing.expect(loop.needsNoDecision(&call));
+
+    const guarded_commands = [_][]const u8{
+        "{\"command\":\"cat > .synth/hooks.json\"}",
+        "{\"command\":\"synth hooks trust 0123456789abcdef0123456789abcdef\"}",
+    };
+    for (guarded_commands) |arguments| {
+        call.arguments = arguments;
+        try testing.expect(!loop.needsNoDecision(&call));
     }
 }
 

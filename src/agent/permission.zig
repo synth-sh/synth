@@ -288,6 +288,36 @@ fn expandProjectDir(arena: std.mem.Allocator, word: []const u8, root: []const u8
     return expanded;
 }
 
+pub fn commandReachesProtectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, working_directory: []const u8, command: []const u8, control_files: []const []const u8, hooks: Hooks.Set) !bool {
+    var words = safety.shellWords(command);
+    while (words.next()) |word| {
+        const literal = try safety.literalWord(arena, word) orelse continue;
+        if (literal.len == 0 or literal[0] == '-') continue;
+        const target = try std.fs.path.resolve(arena, &.{ working_directory, literal });
+        const protected = protectedPath(arena, io, root, target, control_files, hooks) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        if (protected) return true;
+    }
+    return false;
+}
+
+const hook_trust_actions = [_][]const u8{ "trust", "revoke", "enable", "disable" };
+
+pub fn commandChangesHookTrust(arena: std.mem.Allocator, command: []const u8) !bool {
+    var words = safety.shellWords(command);
+    var previous_was_hooks = false;
+    while (words.next()) |word| {
+        const literal = try safety.literalWord(arena, word) orelse "";
+        if (previous_was_hooks) {
+            for (hook_trust_actions) |action| if (std.mem.eql(u8, literal, action)) return true;
+        }
+        previous_was_hooks = std.mem.eql(u8, literal, "hooks");
+    }
+    return false;
+}
+
 fn samePath(arena: std.mem.Allocator, io: std.Io, root: []const u8, file: []const u8, lexical: []const u8, resolved: []const u8) !bool {
     if (file.len == 0) return false;
     const named = std.fs.path.resolve(arena, &.{ root, file }) catch return false;
@@ -377,5 +407,37 @@ test "hook scripts named through project directory variables stay protected" {
         var arena: std.heap.ArenaAllocator = .init(a);
         defer arena.deinit();
         try testing.expect(try protectedPath(arena.allocator(), std.testing.io, root, case.path, &.{}, .{ .pre_tool_use = &.{.{ .command = case.command }} }));
+    }
+}
+
+test "commands that name control files are caught" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    for ([_][]const u8{ "cat > .synth/hooks.json", "echo '{}'>.synth/hooks.json", "mv new.json .synth/hooks.json", "cp x \"./.GIT/hooks/pre-commit\"" }) |command| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        try testing.expect(try commandReachesProtectedPath(arena.allocator(), std.testing.io, root, root, command, &.{}, .{}));
+    }
+    for ([_][]const u8{ "ls src", "git status", "zig build test" }) |command| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        try testing.expect(!try commandReachesProtectedPath(arena.allocator(), std.testing.io, root, root, command, &.{}, .{}));
+    }
+}
+
+test "commands that change hook trust are caught" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "synth hooks trust abc", "./zig-out/bin/synth hooks enable abc && true", "synth \"hooks\" 'revoke' abc" }) |command| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        try testing.expect(try commandChangesHookTrust(arena.allocator(), command));
+    }
+    for ([_][]const u8{ "synth hooks review", "synth hooks list", "echo trust" }) |command| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        try testing.expect(!try commandChangesHookTrust(arena.allocator(), command));
     }
 }
