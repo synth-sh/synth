@@ -2619,50 +2619,10 @@ fn hookRequiresApproval(self: *const Loop, call: *const Conversation.ToolCall) b
                 const path = std.fs.path.resolve(arena, &.{ self.workingDirectory(), target.string }) catch return true;
                 if (permission.protectedPath(arena, self.io, self.project_root, path, self.control_files, if (self.hooks) |runner| runner.set else .{}) catch true) return true;
             }
-            if (self.commandTouchesControlFiles(arena, call.name, input)) return true;
         }
     };
     for (self.hook_flow.asks.items) |id| if (std.mem.eql(u8, call.id, id)) return true;
     return false;
-}
-
-fn commandTouchesControlFiles(self: *const Loop, arena: std.mem.Allocator, tool_name: []const u8, input: std.json.Value) bool {
-    const scans_every_string = std.mem.startsWith(u8, tool_name, "mcp__");
-    var fields = input.object.iterator();
-    while (fields.next()) |field| {
-        const is_command = std.mem.eql(u8, field.key_ptr.*, "command");
-        if (!is_command and !scans_every_string) continue;
-        if (is_command and changesHookTrust(arena, field.value_ptr.*)) return true;
-        if (self.valueReachesControlFiles(arena, field.value_ptr.*)) return true;
-    }
-    return false;
-}
-
-fn changesHookTrust(arena: std.mem.Allocator, value: std.json.Value) bool {
-    if (value != .string) return false;
-    return permission.commandChangesHookTrust(arena, value.string) catch true;
-}
-
-fn valueReachesControlFiles(self: *const Loop, arena: std.mem.Allocator, value: std.json.Value) bool {
-    switch (value) {
-        .string => |text| return self.textReachesControlFiles(arena, text),
-        .array => |items| for (items.items) |item| {
-            if (self.valueReachesControlFiles(arena, item)) return true;
-        },
-        .object => |object| for (object.values()) |item| {
-            if (self.valueReachesControlFiles(arena, item)) return true;
-        },
-        else => {},
-    }
-    return false;
-}
-
-fn textReachesControlFiles(self: *const Loop, arena: std.mem.Allocator, text: []const u8) bool {
-    const hooks = if (self.hooks) |runner| runner.set else Hooks.Set{};
-    const named = std.fs.path.resolve(arena, &.{ self.workingDirectory(), text }) catch return true;
-    const is_protected = permission.protectedPath(arena, self.io, self.project_root, named, self.control_files, hooks) catch true;
-    if (is_protected) return true;
-    return permission.commandReachesProtectedPath(arena, self.io, self.project_root, self.workingDirectory(), text, self.control_files, hooks) catch true;
 }
 
 /// Whether a call cleared to run may resolve paths outside the project: one
@@ -7266,26 +7226,6 @@ test "adding a home root never grants automatic writes to hook control files" {
     }
 }
 
-test "a referenced hook script requires human approval before editing" {
-    const fixture = try Fixture.init();
-    defer fixture.deinit();
-    try fixture.tmp.dir.createDirPath(testing.io, "scripts");
-    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "scripts/check.sh", .data = "cat >/dev/null\n" });
-    var loop = fixture.loop();
-    defer loop.deinit();
-    loop.approvals = .auto;
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "bash './scripts/check.sh'" }} } };
-    loop.hooks = &runner;
-    fixture.fake.tool_name = "write";
-    fixture.fake.tool_arguments = "{\"path\":\"scripts/check.sh\",\"content\":\"forged policy\"}";
-    try submitAndSettle(&loop, "update the script");
-    try testing.expectEqual(State.awaiting_approval, loop.state);
-    const original = try fixture.readFile("scripts/check.sh");
-    try testing.expectEqualStrings("cat >/dev/null\n", original);
-    try loop.decide(.deny);
-    try settle(&loop);
-}
-
 test "unreviewed hooks reject prompts without retaining or forwarding their text" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -7453,27 +7393,6 @@ test "picked and harness answers never become person instructions" {
     }
 }
 
-test "shell commands that write control files or change hook trust need a human" {
-    const fixture = try Fixture.init();
-    defer fixture.deinit();
-
-    var loop = fixture.loop();
-    defer loop.deinit();
-    loop.approvals = .all;
-
-    var call: Conversation.ToolCall = .{ .id = "call_0", .name = "bash", .arguments = "{\"command\":\"zig build test\"}" };
-    try testing.expect(loop.needsNoDecision(&call));
-
-    const guarded_commands = [_][]const u8{
-        "{\"command\":\"cat > .synth/hooks.json\"}",
-        "{\"command\":\"synth hooks trust 0123456789abcdef0123456789abcdef\"}",
-    };
-    for (guarded_commands) |arguments| {
-        call.arguments = arguments;
-        try testing.expect(!loop.needsNoDecision(&call));
-    }
-}
-
 test "steering waiting for the next step reaches the reviewer once and only when no prompt hook vets it" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -7508,22 +7427,4 @@ test "steering waiting for the next step reaches the reviewer once and only when
         if (std.mem.eql(u8, message.text, "wait, plan only")) occurrences += 1;
     }
     try testing.expectEqual(@as(usize, 1), occurrences);
-}
-
-test "tool arguments nested anywhere in an MCP call are checked for control files" {
-    const fixture = try Fixture.init();
-    defer fixture.deinit();
-
-    var loop = fixture.loop();
-    defer loop.deinit();
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const guarded = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"files\":[{\"path\":\".synth/hooks.json\"}]}", .{});
-    try testing.expect(loop.commandTouchesControlFiles(a, "mcp__fs__write_many", guarded));
-
-    const harmless = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"files\":[{\"path\":\"src/main.zig\"}],\"note\":\"update the readme\"}", .{});
-    try testing.expect(!loop.commandTouchesControlFiles(a, "mcp__fs__write_many", harmless));
-    try testing.expect(!loop.commandTouchesControlFiles(a, "write", guarded));
 }

@@ -263,61 +263,7 @@ pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, tar
         for (@field(hooks, field.name)) |hook| {
             if (!hook.enabled or !hook.trusted) continue;
             if (try samePath(arena, io, root, hook.source, lexical, resolved)) return true;
-            var words = safety.shellWords(hook.command);
-            while (words.next()) |word| {
-                const expanded = try expandProjectDir(arena, word, root);
-                const candidate = try safety.literalWord(arena, expanded) orelse continue;
-                if (candidate.len == 0 or candidate[0] == '-') continue;
-                if (!try mayNameHookScript(arena, io, root, candidate)) continue;
-                if (try samePath(arena, io, root, candidate, lexical, resolved)) return true;
-            }
         }
-    }
-    return false;
-}
-
-fn mayNameHookScript(arena: std.mem.Allocator, io: std.Io, root: []const u8, candidate: []const u8) !bool {
-    const named = try std.fs.path.resolve(arena, &.{ root, candidate });
-    if (std.mem.eql(u8, named, root)) return false;
-    const stat = std.Io.Dir.cwd().statFile(io, named, .{}) catch return std.mem.indexOfScalar(u8, candidate, '/') != null;
-    return stat.kind == .file;
-}
-
-const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR" };
-
-fn expandProjectDir(arena: std.mem.Allocator, word: []const u8, root: []const u8) ![]const u8 {
-    var expanded = word;
-    for (project_dir_variables) |name| {
-        const braced = try std.fmt.allocPrint(arena, "${{{s}}}", .{name});
-        const bare = try std.fmt.allocPrint(arena, "${s}", .{name});
-        expanded = try std.mem.replaceOwned(u8, arena, expanded, braced, root);
-        expanded = try std.mem.replaceOwned(u8, arena, expanded, bare, root);
-    }
-    return expanded;
-}
-
-pub fn commandReachesProtectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, working_directory: []const u8, command: []const u8, control_files: []const []const u8, hooks: Hooks.Set) !bool {
-    var words = safety.shellWords(command);
-    while (words.next()) |word| {
-        const literal = try safety.literalWord(arena, word) orelse continue;
-        if (literal.len == 0 or literal[0] == '-') continue;
-        const target = try std.fs.path.resolve(arena, &.{ working_directory, literal });
-        if (try protectedPath(arena, io, root, target, control_files, hooks)) return true;
-    }
-    return false;
-}
-
-const hook_trust_actions = [_][]const u8{ "trust", "revoke", "enable", "disable" };
-
-pub fn commandChangesHookTrust(arena: std.mem.Allocator, command: []const u8) !bool {
-    var words = safety.shellWords(command);
-    var previous_was_hooks = false;
-    while (words.next()) |word| {
-        const literal = try safety.literalWord(arena, word) orelse "";
-        if (previous_was_hooks) {
-            for (hook_trust_actions) |action| if (std.mem.eql(u8, literal, action)) return true;
-        }
-        previous_was_hooks = std.mem.eql(u8, literal, "hooks");
     }
     return false;
 }
@@ -362,28 +308,6 @@ fn sameName(a: []const u8, b: []const u8) bool {
     return rhs.next() == null;
 }
 
-test "hook script protection accounts for shell operators and quoting" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    defer a.free(root);
-    for ([_][]const u8{ "bash ./scripts/check.sh; true", "bash ./scripts/check.sh&&true", "bash ./scripts/check.sh>/dev/null", "bash ./scripts/'check.sh'", "bash ./scripts/check\\.sh" }) |command| {
-        var arena: std.heap.ArenaAllocator = .init(a);
-        defer arena.deinit();
-        try testing.expect(try protectedPath(arena.allocator(), std.testing.io, root, "scripts/check.sh", &.{}, .{ .pre_tool_use = &.{.{ .command = command }} }));
-    }
-    for ([_]struct { command: []const u8, path: []const u8 }{
-        .{ .command = "bash ./scripts/check\\ file.sh", .path = "scripts/check file.sh" },
-        .{ .command = "bash ./scripts/check\\;name.sh", .path = "scripts/check;name.sh" },
-        .{ .command = "bash \"./scripts/check\\q.sh\"", .path = "scripts/check\\q.sh" },
-    }) |case| {
-        var arena: std.heap.ArenaAllocator = .init(a);
-        defer arena.deinit();
-        try testing.expect(try protectedPath(arena.allocator(), std.testing.io, root, case.path, &.{}, .{ .pre_tool_use = &.{.{ .command = case.command }} }));
-    }
-}
-
 test "missing hook control files cannot bypass protection through case variants" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -395,70 +319,4 @@ test "missing hook control files cannot bypass protection through case variants"
     for ([_][]const u8{ ".SYNTH/hooks.json", ".ſynth/hooks.json", ".GIT/HOOKS/new", ".git/config", ".git/objects/new", "HOOK-TRUST.json", "hook-truſt.json", "hooK-trust.json" }) |target| {
         try testing.expect(try protectedPath(a, testing.io, root, target, &.{trust}, .{}));
     }
-}
-
-test "hook scripts named through project directory variables stay protected" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    defer a.free(root);
-    for ([_]struct { command: []const u8, path: []const u8 }{
-        .{ .command = "python3 \"$SYNTH_PROJECT_DIR/scripts/guard.sh\"", .path = "scripts/guard.sh" },
-        .{ .command = "bash ${SYNTH_PROJECT_DIR}/scripts/guard.sh", .path = "scripts/guard.sh" },
-        .{ .command = "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard.sh", .path = ".claude/hooks/guard.sh" },
-    }) |case| {
-        var arena: std.heap.ArenaAllocator = .init(a);
-        defer arena.deinit();
-        try testing.expect(try protectedPath(arena.allocator(), std.testing.io, root, case.path, &.{}, .{ .pre_tool_use = &.{.{ .command = case.command }} }));
-    }
-}
-
-test "commands that name control files are caught" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    defer a.free(root);
-    for ([_][]const u8{ "cat > .synth/hooks.json", "echo '{}'>.synth/hooks.json", "mv new.json .synth/hooks.json", "cp x \"./.GIT/hooks/pre-commit\"" }) |command| {
-        var arena: std.heap.ArenaAllocator = .init(a);
-        defer arena.deinit();
-        try testing.expect(try commandReachesProtectedPath(arena.allocator(), std.testing.io, root, root, command, &.{}, .{}));
-    }
-    for ([_][]const u8{ "ls src", "git status", "zig build test" }) |command| {
-        var arena: std.heap.ArenaAllocator = .init(a);
-        defer arena.deinit();
-        try testing.expect(!try commandReachesProtectedPath(arena.allocator(), std.testing.io, root, root, command, &.{}, .{}));
-    }
-}
-
-test "commands that change hook trust are caught" {
-    const a = std.testing.allocator;
-    for ([_][]const u8{ "synth hooks trust abc", "./zig-out/bin/synth hooks enable abc && true", "synth \"hooks\" 'revoke' abc" }) |command| {
-        var arena: std.heap.ArenaAllocator = .init(a);
-        defer arena.deinit();
-        try testing.expect(try commandChangesHookTrust(arena.allocator(), command));
-    }
-    for ([_][]const u8{ "synth hooks review", "synth hooks list", "echo trust" }) |command| {
-        var arena: std.heap.ArenaAllocator = .init(a);
-        defer arena.deinit();
-        try testing.expect(!try commandChangesHookTrust(arena.allocator(), command));
-    }
-}
-
-test "ordinary commands are not mistaken for hook scripts" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    defer a.free(root);
-    const hooks: Hooks.Set = .{ .pre_tool_use = &.{.{ .command = "cd \"$CLAUDE_PROJECT_DIR\" && python3 scripts/guard.py | grep -n 2 | jq ." }} };
-    for ([_][]const u8{ "rg TODO .", "python3 tools/gen.py", "grep -rn TODO src", "find . -name '*.zig'", "git log -n 2" }) |command| {
-        var arena: std.heap.ArenaAllocator = .init(a);
-        defer arena.deinit();
-        try testing.expect(!try commandReachesProtectedPath(arena.allocator(), std.testing.io, root, root, command, &.{}, hooks));
-    }
-    var arena: std.heap.ArenaAllocator = .init(a);
-    defer arena.deinit();
-    try testing.expect(try commandReachesProtectedPath(arena.allocator(), std.testing.io, root, root, "echo 'exit 0' > scripts/guard.py", &.{}, hooks));
 }

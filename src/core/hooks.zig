@@ -10,6 +10,19 @@ const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
 pub const default_timeout_ms: u64 = 30_000;
 pub const cleanup_timeout_ms: i64 = 3000;
+const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR" };
+
+pub fn expandProjectDir(arena: std.mem.Allocator, word: []const u8, root: []const u8) ![]const u8 {
+    var expanded = word;
+    for (project_dir_variables) |name| {
+        const braced = try std.fmt.allocPrint(arena, "${{{s}}}", .{name});
+        const bare = try std.fmt.allocPrint(arena, "${s}", .{name});
+        expanded = try std.mem.replaceOwned(u8, arena, expanded, braced, root);
+        expanded = try std.mem.replaceOwned(u8, arena, expanded, bare, root);
+    }
+    return expanded;
+}
+
 pub const review_notice = "Hooks need review. Use /hooks review or synth hooks review; trust or disable each reviewed id.";
 const max_timeout_ms: u64 = 86_400_000;
 const background_limit: usize = 64;
