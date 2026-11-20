@@ -13,6 +13,7 @@ const max_review_action_bytes = 350 * 4;
 const max_review_fragment_bytes = 1000 * 4;
 pub const omission_notice = "Some human instructions or answers are omitted. Do not treat remaining grants as complete authorization.";
 const review_omission_notice = "Some previous approve/deny decisions are omitted. Retained decisions apply only to their described actions.";
+const question_omitted_text = "The question the person answered was too long to keep.";
 
 has_human: bool = false,
 next_order: u64 = 0,
@@ -79,8 +80,9 @@ pub fn deinit(self: *Intent, a: std.mem.Allocator) void {
 }
 
 pub fn answerReceipt(a: std.mem.Allocator, question: []const u8, answer: []const u8) ![]u8 {
-    if (question.len +| answer.len <= max_record_bytes) {
-        const encoded = try std.json.Stringify.valueAlloc(a, .{ .kind = "human_answer", .source = "typed", .question = question, .answer = answer }, .{});
+    for ([_][]const u8{ question, question_omitted_text }) |shown| {
+        if (shown.len +| answer.len > max_record_bytes) continue;
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .kind = "human_answer", .source = "typed", .question = shown, .answer = answer }, .{});
         if (encoded.len <= max_record_bytes) return encoded;
         a.free(encoded);
     }
@@ -174,7 +176,7 @@ pub fn view(self: Intent, a: std.mem.Allocator) ![]Conversation.Message {
     for (families) |item| {
         for (item.family.records.items) |entry| {
             const evidence = entry.evidence orelse continue;
-            const first: Conversation.Message = .{
+            var first: Conversation.Message = .{
                 .seq = evidence.order,
                 .role = if (evidence.answer == null) .user else .assistant,
                 .origin = evidence.origin,
@@ -184,12 +186,11 @@ pub fn view(self: Intent, a: std.mem.Allocator) ![]Conversation.Message {
                 .{ .seq = evidence.order, .role = .user, .origin = .human, .text = answer }
             else
                 null;
-            var rendered: std.Io.Writer.Discarding = .init(&.{});
-            writeMessage(&rendered.writer, first) catch unreachable;
-            if (second) |message| writeMessage(&rendered.writer, message) catch unreachable;
-            if (rendered.fullCount() > item.limit) {
+            if (renderedBytes(first, second) > item.limit) {
                 omitted = true;
-                continue;
+                if (second == null) continue;
+                first.text = question_omitted_text;
+                if (renderedBytes(first, second) > item.limit) continue;
             }
             try out.append(a, first);
             if (second) |message| try out.append(a, message);
@@ -203,6 +204,13 @@ pub fn view(self: Intent, a: std.mem.Allocator) ![]Conversation.Message {
     if (omitted) try out.append(a, .{ .role = .system, .origin = .harness, .text = omission_notice });
     if (self.decisions.omitted) try out.append(a, .{ .role = .system, .origin = .harness, .text = review_omission_notice });
     return out.toOwnedSlice(a);
+}
+
+fn renderedBytes(first: Conversation.Message, second: ?Conversation.Message) usize {
+    var rendered: std.Io.Writer.Discarding = .init(&.{});
+    writeMessage(&rendered.writer, first) catch unreachable;
+    if (second) |message| writeMessage(&rendered.writer, message) catch unreachable;
+    return @intCast(rendered.fullCount());
 }
 
 pub fn snapshot(self: Intent, a: std.mem.Allocator) !Snapshot {
@@ -315,4 +323,27 @@ test "guardian storage uses the upstream family and serialized-record byte limit
     defer evidence.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), evidence.messages.len);
     try std.testing.expectEqualStrings(omission_notice, evidence.messages[0].text);
+}
+
+test "a long model question never hides the typed answer" {
+    const a = std.testing.allocator;
+    var intent: Intent = .{};
+    defer intent.deinit(a);
+    try intent.record(a, "you may push when done", false);
+    for ([_]usize{ 3_663, 20_000 }) |question_length| {
+        const question = try a.alloc(u8, question_length);
+        defer a.free(question);
+        @memset(question, '"');
+        const receipt = try answerReceipt(a, question, "no, do not push");
+        defer a.free(receipt);
+        try intent.record(a, receipt, true);
+    }
+    const saved = try intent.snapshot(a);
+    defer saved.deinit(a);
+    var typed_answers: usize = 0;
+    for (saved.messages) |message| {
+        if (message.origin == .human and std.mem.eql(u8, message.text, "no, do not push")) typed_answers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), typed_answers);
+    try std.testing.expectEqualStrings(omission_notice, saved.messages[saved.messages.len - 1].text);
 }
