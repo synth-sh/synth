@@ -176,8 +176,15 @@ pub const Hook = struct {
     tool: []const u8 = "",
     arguments: std.json.Value = .null,
     when: ?When = null,
+    on_failure: ?OnFailure = null,
 
     const Kind = enum { command, mcp_tool };
+    pub const OnFailure = enum { block, @"continue" };
+
+    fn blocksOnFailure(self: Hook, event: Event) bool {
+        const default: OnFailure = if (event.requestStage()) .block else .@"continue";
+        return (self.on_failure orelse default) == .block;
+    }
 };
 
 pub const Set = struct {
@@ -305,8 +312,12 @@ fn parseHandler(a: std.mem.Allocator, value: std.json.Value, declaration: Declar
         if (seconds != .integer or seconds.integer <= 0 or seconds.integer > max_timeout_ms / std.time.ms_per_s or value.object.contains("timeout_ms")) return error.InvalidHookTimeout;
         break :blk @intCast(seconds.integer * std.time.ms_per_s);
     } else null;
-    var hook = try std.json.parseFromValueLeaky(Hook, a, value, .{ .ignore_unknown_fields = timeout_ms != null });
+    var hook = try std.json.parseFromValueLeaky(Hook, a, value, .{ .ignore_unknown_fields = true });
     if (timeout_ms) |ms| hook.timeout_ms = ms;
+    if (value.object.get("onFailure")) |setting| {
+        if (setting != .string) return error.InvalidHookDefinition;
+        hook.on_failure = std.meta.stringToEnum(Hook.OnFailure, setting.string) orelse return error.InvalidHookDefinition;
+    }
     hook.source = declaration.source;
     hook.matcher = declaration.matcher;
     hook.when = declaration.when;
@@ -334,11 +345,11 @@ fn validateDefinition(value: std.json.Value) !void {
         if (field != .string) return error.InvalidHookDefinition;
         break :blk std.meta.stringToEnum(Hook.Kind, field.string) orelse return error.UnsupportedHookHandlerType;
     } else .command;
-    const Field = enum { type, command, timeout_ms, timeout, async, stream, server, tool, arguments, transcript };
+    const Field = enum { type, command, timeout_ms, timeout, async, stream, server, tool, arguments, transcript, onFailure };
     for (value.object.keys()) |key| {
         const field = std.meta.stringToEnum(Field, key) orelse return error.InvalidHookDefinition;
         const allowed = switch (field) {
-            .type, .timeout_ms, .timeout, .async, .stream, .transcript => true,
+            .type, .timeout_ms, .timeout, .async, .stream, .transcript, .onFailure => true,
             .command => kind == .command,
             .server, .tool, .arguments => kind == .mcp_tool,
         };
@@ -872,6 +883,8 @@ pub const Runner = struct {
         var result: Result = .{};
         errdefer result.deinit(allocator);
         if (command.code == 126 or command.code == 127) return error.HookCommandUnavailable;
+        const exited_abnormally = command.code != 0 and command.code != 2;
+        if (exited_abnormally and hook.blocksOnFailure(invocation.event)) return error.HookCommandFailed;
         const advisory = invocation.event.observational();
         if (command.code == 2 and advisory) {
             result.message = try allocator.dupe(u8, "Observation hook exited 2; control effect ignored");
@@ -1837,4 +1850,27 @@ test "command hooks normalize timeout seconds and provide project environment" {
     var result = try runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use });
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.blocked == null);
+}
+
+test "a failing hook blocks request events and lets other events continue unless told otherwise" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const failing: Hook = .{ .command = "exit 1" };
+    const failing_but_continuing: Hook = .{ .command = "exit 1", .on_failure = .@"continue" };
+    const failing_and_blocking: Hook = .{ .command = "exit 1", .on_failure = .block };
+    var runner: Runner = .{ .io = std.testing.io, .root = root, .set = .{
+        .model_context = &.{failing},
+        .http_request = &.{failing_but_continuing},
+        .pre_tool_use = &.{failing},
+    } };
+    try std.testing.expectError(error.HookCommandFailed, runner.evaluate(a, .{ .event = .model_context }));
+    var tolerated_request = try runner.evaluate(a, .{ .event = .http_request });
+    tolerated_request.deinit(a);
+    var tolerated_tool = try runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "write", .tool_input = "{}" });
+    tolerated_tool.deinit(a);
+    runner.set.pre_tool_use = &.{failing_and_blocking};
+    try std.testing.expectError(error.HookCommandFailed, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "write", .tool_input = "{}" }));
 }

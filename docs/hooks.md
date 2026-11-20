@@ -56,6 +56,10 @@ for background context or diagnostics. Permission and request preparation
 require synchronous handlers. Use `transcript: true` to request a private
 snapshot at `transcript_path`.
 
+A handler that exits with a code other than 0 or 2 blocks the action on request
+events and lets it go ahead on every other event. Set `onFailure` to `block` or
+`continue` to change that for one handler.
+
 For synchronous MCP handlers use `type: "mcp_tool"`, `server`, `tool`, and
 `arguments`. Interpolate with `${input.field.path}`. Whole-value references
 preserve the JSON type. Session shutdown supports command handlers only.

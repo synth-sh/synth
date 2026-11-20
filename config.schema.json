@@ -406,6 +406,13 @@
                 }
             }
         },
+        "hookOnFailure": {
+            "enum": [
+                "block",
+                "continue"
+            ],
+            "description": "Whether the action goes ahead when the hook exits with a code other than 0 or 2. Request events block by default; every other event continues."
+        },
         "commandHookHandler": {
             "type": "object",
             "additionalProperties": false,
@@ -427,6 +434,9 @@
                 "async": {
                     "type": "boolean",
                     "default": false
+                },
+                "onFailure": {
+                    "$ref": "#/$defs/hookOnFailure"
                 },
                 "transcript": {
                     "$ref": "#/$defs/hookTranscript"
@@ -463,6 +473,9 @@
                 },
                 "async": {
                     "const": false
+                },
+                "onFailure": {
+                    "$ref": "#/$defs/hookOnFailure"
                 },
                 "transcript": {
                     "$ref": "#/$defs/hookTranscript"
