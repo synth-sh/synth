@@ -314,6 +314,9 @@ if e=='ModelRetry':
         assert result.returncode != 0
         assert len(requests) == 1 and len(log) == 1
         expect(result, 'stream_options')
+    with session('compatibility-bound', lambda *_: (400, {'error': {'message': 'unsupported stream_options'}}, 'application/json'), compatibility_veto, ('ModelRetry',), attempts=1) as (_, result, requests, log):
+        assert result.returncode != 0 and len(requests) == 1 and not log
+        expect(result, 'stream_options')
     for size in (3000, 4 * 1024 * 1024 + 1):
         with session('ollama-large-error', lambda *_: (503, 'proxy failure ' + 'x' * size, 'text/html'), protocol='ollama') as (_, result, requests, _):
             assert result.returncode != 0
@@ -327,7 +330,7 @@ if e=='ModelRetry':
         assert 'stream_options' not in packet['body']
         return chat() if any(m['role'] == 'tool' for m in packet['body']['messages']) else chat('', tool('read', {'path': 'seed.txt'}))
     for named_route in (False, True):
-        with session('learned-compatibility', learned_compatibility, route_policy=named_route, attempts=1) as (_, result, requests, _):
+        with session('learned-compatibility', learned_compatibility, route_policy=named_route) as (_, result, requests, _):
             assert result.returncode == 0, result.stderr
             assert len(requests) == 3, requests
     print('PASS compatibility retry metadata/veto, learned transport capabilities, and bounded oversized Ollama error handling')
@@ -355,6 +358,19 @@ if e=='ModelRetry':
     with session('forced-ask', proposed, "out={'effect':'ask'}", ('PermissionEvaluate',)) as (root, result, requests, _):
         assert not (root/'allowed.txt').exists()
         assert not any('/review/' in packet['path'] for packet in requests)
+    request_veto = """
+if e=='PermissionEvaluate': out={'effect':'ask'}
+if e=='PermissionRequest':
+ assert p['permission_effect']=='ask'
+ out={'decision':{'behavior':'deny','message':'request vetoed'}}
+"""
+    with session('permission-request-veto', readonly, request_veto, ('PermissionEvaluate', 'PermissionRequest')) as (root, result, _, log):
+        assert result.returncode == 0, result.stderr
+        assert [event['hook_event_name'] for event in log] == ['PermissionEvaluate', 'PermissionRequest']
+        with sqlite3.connect(root / 'session.db') as db:
+            status, reason = db.execute('select status, result from tool_call').fetchone()
+            assert status == 'rejected' and 'request vetoed' in reason, (status, reason)
+            assert db.execute("select count(*) from blob where kind='headless_tool_decision'").fetchone() == (0,)
     for mode in ('ask', 'all'):
         with session('headless-mandatory-ask', readonly, "out={'effect':'ask'}", ('PermissionEvaluate',),
                      configure=lambda config, _: config.update(approvals=mode)) as (root, result, _, _):

@@ -22,7 +22,8 @@ pub fn errorType(status: std.http.Status) []const u8 {
     };
 }
 
-pub fn pause(io: std.Io, sink: ?@import("provider.zig").Sink, info: @import("provider.zig").RetryInfo) bool {
+pub fn pause(io: std.Io, policy: Policy, sink: ?@import("provider.zig").Sink, info: @import("provider.zig").RetryInfo) bool {
+    if (info.attempt >= policy.attempts) return false;
     if (sink) |stream| if (stream.stopped(stream.userdata)) return false;
     const delay = if (sink) |stream| stream.retryDecision(info) orelse return false else delay: {
         if (!info.allowed) return false;
@@ -55,8 +56,7 @@ pub const Failure = struct {
 };
 
 pub fn wait(io: std.Io, policy: Policy, sink: ?@import("provider.zig").Sink, failure: Failure) bool {
-    if (failure.attempt >= policy.attempts) return false;
-    return pause(io, sink, .{
+    return pause(io, policy, sink, .{
         .attempt = failure.attempt,
         .allowed = (failure.retryable orelse transient(failure.status)) and !tooLong(policy, failure.retry_after_ms),
         .delay_ms = waitMs(policy, failure.attempt, failure.retry_after_ms),

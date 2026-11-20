@@ -926,7 +926,9 @@ pub fn compact(self: *Loop) !void {
 }
 
 pub fn compactIfNeeded(self: *Loop) !bool {
-    if (self.isBusy() or self.conversation.messages.items.len == 0 or !self.shouldCompact()) return false;
+    if (self.isBusy() or self.conversation.messages.items.len == 0) return false;
+    if (self.outcome == .failed and self.turn_start_seq == null) return false;
+    if (!self.shouldCompact()) return false;
     try self.startCompaction(.idle);
     return true;
 }
@@ -965,6 +967,7 @@ fn startCompactionRequest(self: *Loop) !void {
 pub fn shouldCompact(self: *Loop) bool {
     if (self.auto_compact_at <= 0 or self.hook_flow.compaction_veto_seq == self.conversation.next_seq) return false;
     const request_turn = self.turn("");
+    if (self.hasContextHook(request_turn)) return false;
     const budget = window.requestBudget(self.provider.context_limit, request_turn);
     const estimated = window.contextTokens(self.conversation, self.provider.vision);
     const prompt_overhead = (request_turn.system.len + request_turn.tools_json.len) / 4;
@@ -988,6 +991,7 @@ fn hasModelRoute(self: *const Loop, invocation: Hooks.Invocation) bool {
 
 fn contextFits(self: *Loop, request_turn: Provider.Turn) !bool {
     if (self.hasModelRoute(request_turn.hook_input)) return true;
+    if (self.hasContextHook(request_turn)) return true;
     const budget = window.requestBudget(self.provider.context_limit, request_turn);
     const kept = window.completeMessages(self.conversation, self.allocator, budget, self.provider.vision) catch |err| switch (err) {
         error.ContextTooLarge => return false,
@@ -995,6 +999,24 @@ fn contextFits(self: *Loop, request_turn: Provider.Turn) !bool {
     };
     self.allocator.free(kept);
     return true;
+}
+
+fn hasContextHook(self: *const Loop, request_turn: Provider.Turn) bool {
+    const runner = self.hooks orelse return false;
+    var input = request_turn.hook_input;
+    input.model = self.provider.model;
+    input.provider = self.provider.name;
+    const may_route = self.hasModelRoute(input);
+    for (runner.set.model_context) |hook| {
+        if (!hook.enabled) continue;
+        var filter = hook.when orelse return true;
+        if (may_route) {
+            filter.model = null;
+            filter.provider = null;
+        }
+        if (filter.accepts(input)) return true;
+    }
+    return false;
 }
 
 /// Turn a finished summarisation into the system message that replaces the
@@ -1029,6 +1051,7 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.hook_flow.notice) |notice| self.allocator.free(notice);
     self.hook_flow.notice = null;
 
+    if (self.hook_flow.reload) |reload| try reload.call(reload.userdata);
     try self.checkHookTrust();
     if (!self.hook_flow.session_started) {
         self.hook_flow.session_started = true;
@@ -1064,6 +1087,12 @@ fn gatePrompt(self: *Loop, input: Hooks.Invocation, pending: HookFlow.Pending, p
 fn discardHookSubmission(self: *Loop) void {
     if (self.hook_submission) |*pending| pending.deinit(self.allocator);
     self.hook_submission = null;
+}
+
+fn rejectPrompt(self: *Loop, err: anyerror) void {
+    self.turn_start_seq = null;
+    self.last_error = err;
+    self.finish(.failed);
 }
 
 fn expandPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
@@ -1204,7 +1233,9 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch, next: HookFlow.Resume) 
         self.discardHookSubmission();
         if (dispatch.invocation.event == .session_start) self.hook_flow.session_started = false;
         self.state = .idle;
-        if ((self.hook_flow.compaction == .during_turn and next != .begin_prompt and next != .config_idle) or next == .ask_model) self.finish(.halted);
+        if (next == .begin_prompt) {
+            self.rejectPrompt(dispatch.failed orelse error.HookBlocked);
+        } else if ((self.hook_flow.compaction == .during_turn and next != .config_idle) or next == .ask_model) self.finish(.halted);
         if (dispatch.invocation.event == .pre_compact) self.hook_flow.compaction_veto_seq = self.conversation.next_seq;
         return true;
     }
@@ -1248,10 +1279,12 @@ fn pollHooks(self: *Loop) !bool {
             self.state = .idle;
             if (dispatch.failed) |err| {
                 self.say("{s} hook failed: {s}", .{ dispatch.invocation.event.name(), @errorName(err) });
+                self.rejectPrompt(err);
                 return true;
             }
             if (dispatch.result.takeBlocked()) |reason| {
                 self.hook_flow.setNotice(self.allocator, reason);
+                self.rejectPrompt(error.HookBlocked);
                 return true;
             }
             try self.acceptHookResult(&dispatch.result);
@@ -1344,7 +1377,6 @@ fn finishPolicyHook(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool 
         }
         if (dispatch.invocation.event == .permission_evaluate and dispatch.result.permission == .ask) {
             try self.hook_flow.asks.append(self.allocator, call.id);
-            self.hook_flow.policy.permission_request = @max(self.hook_flow.policy.permission_request, index + 1);
         }
     }
     try self.persistToolCall(message_index, index);
@@ -4804,6 +4836,32 @@ test "a full context stops without sending a truncated request when auto-compact
     try testing.expect(std.mem.indexOf(u8, notice, "too large to compact") != null);
     try testing.expect(std.mem.indexOf(u8, notice, "/clear") != null);
     try testing.expect(std.mem.indexOf(u8, notice, "Use /compact") == null);
+}
+
+test "model context hooks can shrink oversized prompts before compaction" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const Inspect = struct {
+        fn respond(_: *anyopaque, convo: *Conversation, turn_config: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
+            try testing.expect(!turn_config.compacting);
+            try testing.expectEqualStrings("short", convo.messages.items[0].text);
+            return .{ .text = try allocator.dupe(u8, "done") };
+        }
+    };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{
+        .model_context = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelContext\",\"requestContext\":{\"messages\":[{\"seq\":0,\"text\":\"short\"}]}}}'" }},
+    } };
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.provider.respond = Inspect.respond;
+    loop.provider.context_limit = 100;
+    loop.hooks = &runner;
+    const original = "preserve this task " ** 40;
+    try submitAndSettle(&loop, original);
+    try testing.expectEqual(Outcome.done, loop.outcome.?);
+    try testing.expectEqual(@as(u32, 1), loop.usage.calls);
+    try testing.expectEqualStrings(original, fixture.convo.messages.items[0].text);
+    try testing.expect(!try loop.compactIfNeeded());
 }
 
 test "resuming loads the task beyond the display page, or its latest checkpoint" {

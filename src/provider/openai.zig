@@ -550,7 +550,7 @@ fn respond(
             hook_attempt.error_message = if (Provider.mentionsOverflow(why)) "ContextTooLarge" else "HttpError";
             hook_attempt.finish();
             if (self.retryWithout(why)) {
-                if (retry.pause(self.io, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = retry.errorType(head.status), .error_message = why })) {
+                if (retry.pause(self.io, self.retries, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = retry.errorType(head.status), .error_message = why })) {
                     self.clearRejection();
                     attempt += 1;
                     continue;

@@ -20,6 +20,10 @@ pub const Pending = union(enum) {
 
 pending: Pending = .prompt,
 dispatch: ?*Hooks.Dispatch = null,
+reload: ?struct {
+    userdata: *anyopaque,
+    call: *const fn (*anyopaque) anyerror!void,
+} = null,
 task_seq: ?u64 = null,
 task_call: usize = 0,
 task_cursor: usize = 0,
