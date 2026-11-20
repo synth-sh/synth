@@ -268,11 +268,19 @@ pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, tar
                 const expanded = try expandProjectDir(arena, word, root);
                 const candidate = try safety.literalWord(arena, expanded) orelse continue;
                 if (candidate.len == 0 or candidate[0] == '-') continue;
+                if (!try mayNameHookScript(arena, io, root, candidate)) continue;
                 if (try samePath(arena, io, root, candidate, lexical, resolved)) return true;
             }
         }
     }
     return false;
+}
+
+fn mayNameHookScript(arena: std.mem.Allocator, io: std.Io, root: []const u8, candidate: []const u8) !bool {
+    const named = try std.fs.path.resolve(arena, &.{ root, candidate });
+    if (std.mem.eql(u8, named, root)) return false;
+    const stat = std.Io.Dir.cwd().statFile(io, named, .{}) catch return std.mem.indexOfScalar(u8, candidate, '/') != null;
+    return stat.kind == .file;
 }
 
 const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR" };
@@ -294,11 +302,7 @@ pub fn commandReachesProtectedPath(arena: std.mem.Allocator, io: std.Io, root: [
         const literal = try safety.literalWord(arena, word) orelse continue;
         if (literal.len == 0 or literal[0] == '-') continue;
         const target = try std.fs.path.resolve(arena, &.{ working_directory, literal });
-        const protected = protectedPath(arena, io, root, target, control_files, hooks) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => continue,
-        };
-        if (protected) return true;
+        if (try protectedPath(arena, io, root, target, control_files, hooks)) return true;
     }
     return false;
 }
@@ -440,4 +444,21 @@ test "commands that change hook trust are caught" {
         defer arena.deinit();
         try testing.expect(!try commandChangesHookTrust(arena.allocator(), command));
     }
+}
+
+test "ordinary commands are not mistaken for hook scripts" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const hooks: Hooks.Set = .{ .pre_tool_use = &.{.{ .command = "cd \"$CLAUDE_PROJECT_DIR\" && python3 scripts/guard.py | grep -n 2 | jq ." }} };
+    for ([_][]const u8{ "rg TODO .", "python3 tools/gen.py", "grep -rn TODO src", "find . -name '*.zig'", "git log -n 2" }) |command| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        try testing.expect(!try commandReachesProtectedPath(arena.allocator(), std.testing.io, root, root, command, &.{}, hooks));
+    }
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    try testing.expect(try commandReachesProtectedPath(arena.allocator(), std.testing.io, root, root, "echo 'exit 0' > scripts/guard.py", &.{}, hooks));
 }

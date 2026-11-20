@@ -2627,20 +2627,42 @@ fn hookRequiresApproval(self: *const Loop, call: *const Conversation.ToolCall) b
 }
 
 fn commandTouchesControlFiles(self: *const Loop, arena: std.mem.Allocator, tool_name: []const u8, input: std.json.Value) bool {
-    const hooks = if (self.hooks) |runner| runner.set else Hooks.Set{};
-    const is_mcp = std.mem.startsWith(u8, tool_name, "mcp__");
+    const scans_every_string = std.mem.startsWith(u8, tool_name, "mcp__");
     var fields = input.object.iterator();
     while (fields.next()) |field| {
-        if (field.value_ptr.* != .string) continue;
-        const text = field.value_ptr.string;
         const is_command = std.mem.eql(u8, field.key_ptr.*, "command");
-        if (!is_command and !is_mcp) continue;
-        const changes_trust = permission.commandChangesHookTrust(arena, text) catch return true;
-        if (is_command and changes_trust) return true;
-        const reaches = permission.commandReachesProtectedPath(arena, self.io, self.project_root, self.workingDirectory(), text, self.control_files, hooks) catch return true;
-        if (reaches) return true;
+        if (!is_command and !scans_every_string) continue;
+        if (is_command and changesHookTrust(arena, field.value_ptr.*)) return true;
+        if (self.valueReachesControlFiles(arena, field.value_ptr.*)) return true;
     }
     return false;
+}
+
+fn changesHookTrust(arena: std.mem.Allocator, value: std.json.Value) bool {
+    if (value != .string) return false;
+    return permission.commandChangesHookTrust(arena, value.string) catch true;
+}
+
+fn valueReachesControlFiles(self: *const Loop, arena: std.mem.Allocator, value: std.json.Value) bool {
+    switch (value) {
+        .string => |text| return self.textReachesControlFiles(arena, text),
+        .array => |items| for (items.items) |item| {
+            if (self.valueReachesControlFiles(arena, item)) return true;
+        },
+        .object => |object| for (object.values()) |item| {
+            if (self.valueReachesControlFiles(arena, item)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn textReachesControlFiles(self: *const Loop, arena: std.mem.Allocator, text: []const u8) bool {
+    const hooks = if (self.hooks) |runner| runner.set else Hooks.Set{};
+    const named = std.fs.path.resolve(arena, &.{ self.workingDirectory(), text }) catch return true;
+    const is_protected = permission.protectedPath(arena, self.io, self.project_root, named, self.control_files, hooks) catch true;
+    if (is_protected) return true;
+    return permission.commandReachesProtectedPath(arena, self.io, self.project_root, self.workingDirectory(), text, self.control_files, hooks) catch true;
 }
 
 /// Whether a call cleared to run may resolve paths outside the project: one
@@ -7486,4 +7508,22 @@ test "steering waiting for the next step reaches the reviewer once and only when
         if (std.mem.eql(u8, message.text, "wait, plan only")) occurrences += 1;
     }
     try testing.expectEqual(@as(usize, 1), occurrences);
+}
+
+test "tool arguments nested anywhere in an MCP call are checked for control files" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const guarded = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"files\":[{\"path\":\".synth/hooks.json\"}]}", .{});
+    try testing.expect(loop.commandTouchesControlFiles(a, "mcp__fs__write_many", guarded));
+
+    const harmless = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"files\":[{\"path\":\"src/main.zig\"}],\"note\":\"update the readme\"}", .{});
+    try testing.expect(!loop.commandTouchesControlFiles(a, "mcp__fs__write_many", harmless));
+    try testing.expect(!loop.commandTouchesControlFiles(a, "write", guarded));
 }
