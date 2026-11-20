@@ -1107,7 +1107,7 @@ fn recordHuman(self: *Loop, text: []const u8, authorization: bool) !void {
 }
 
 fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
-    try self.recordUserPrompt(prompt, extras, .record_intent);
+    try self.recordUserPrompt(prompt, extras);
     self.steps = 0;
     self.compacted_since_reply = false;
     self.repeats = 0;
@@ -1124,9 +1124,7 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.ask();
 }
 
-const IntentRecording = enum { record_intent, already_recorded };
-
-fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras, intent: IntentRecording) !void {
+fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
     var mentioned: mention.Resolved =
         mention.resolve(self.allocator, self.io, self.workingDirectory(), prompt) catch .{};
     defer mentioned.deinit(self.allocator);
@@ -1137,11 +1135,7 @@ fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras, intent: Int
     defer self.allocator.free(images);
 
     const submitted = try self.conversation.addUser(prompt, attachments, images);
-    if (self.parent != null) {
-        submitted.origin = .agent;
-    } else if (intent == .record_intent) {
-        try self.recordHuman(prompt, false);
-    }
+    if (self.parent != null) submitted.origin = .agent else try self.recordHuman(prompt, false);
     try self.persistMessage(self.conversation.messages.items.len - 1);
 }
 
@@ -1325,7 +1319,7 @@ fn pollHooks(self: *Loop) !bool {
                 self.hook_flow.setNotice(self.allocator, reason);
             } else {
                 try self.acceptHookResult(&dispatch.result);
-                try self.recordUserPrompt(pending.prompt, pending.extras, .already_recorded);
+                try self.recordUserPrompt(pending.prompt, pending.extras);
             }
             try self.ask();
         },
@@ -1584,7 +1578,7 @@ fn applySteering(self: *Loop) !void {
     while (self.steering.items.len > 0) {
         var pending = self.steering.orderedRemove(0);
         defer pending.deinit(self.allocator);
-        try self.recordUserPrompt(pending.prompt, pending.extras, .already_recorded);
+        try self.recordUserPrompt(pending.prompt, pending.extras);
     }
 }
 
@@ -1598,9 +1592,19 @@ pub fn steer(self: *Loop, text: []const u8, extras: Extras) !bool {
     try self.checkHookTrust();
     var pending: Submission = try .init(self.allocator, text, extras);
     errdefer pending.deinit(self.allocator);
-    if (self.parent == null) try self.recordHuman(text, false);
     try self.steering.append(self.allocator, pending);
     return true;
+}
+
+fn pendingSteeringEvidence(self: *const Loop, arena: std.mem.Allocator) ![]Conversation.Message {
+    if (self.hooks) |runner| {
+        for (runner.set.user_prompt_submit) |hook| if (hook.enabled) return &.{};
+    }
+    const messages = try arena.alloc(Conversation.Message, self.steering.items.len);
+    for (self.steering.items, messages) |pending, *message| {
+        message.* = .{ .seq = self.conversation.next_seq, .role = .user, .origin = .human, .text = pending.prompt };
+    }
+    return messages;
 }
 
 /// What has been typed mid-turn and not yet handed over, for the UI to show as
@@ -2200,8 +2204,10 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
     } else null else null;
     defer if (stored_intent) |snapshot| snapshot.deinit(self.allocator);
     const remembered = if (stored_intent == null) try asker.human_intent.view(arena_state.allocator()) else &.{};
-    const intent = if (stored_intent) |snapshot| snapshot.messages else if (remembered.len > 0) remembered else asker.conversation.messages.items;
-    const has_human = if (stored_intent) |snapshot| snapshot.has_human else asker.human_intent.has_human or for (intent) |message| {
+    const recorded_intent = if (stored_intent) |snapshot| snapshot.messages else if (remembered.len > 0) remembered else asker.conversation.messages.items;
+    const steering = try asker.pendingSteeringEvidence(arena_state.allocator());
+    const intent = try std.mem.concat(arena_state.allocator(), Conversation.Message, &.{ recorded_intent, steering });
+    const has_human = steering.len > 0 or if (stored_intent) |snapshot| snapshot.has_human else asker.human_intent.has_human or for (intent) |message| {
         if (message.role == .user and message.origin == .human and std.mem.trim(u8, message.text, " \t\r\n").len > 0) break true;
     } else false;
     if (!has_human) {
@@ -7446,7 +7452,7 @@ test "shell commands that write control files or change hook trust need a human"
     }
 }
 
-test "steering typed mid-turn is human evidence before the next step" {
+test "steering waiting for the next step reaches the reviewer once and only when no prompt hook vets it" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
 
@@ -7455,15 +7461,24 @@ test "steering typed mid-turn is human evidence before the next step" {
 
     try loop.submit("deploy it", .{});
     try testing.expect(try loop.steer("wait, plan only", .{}));
-    const snapshot = try loop.human_intent.snapshot(testing.allocator);
-    defer snapshot.deinit(testing.allocator);
-    var found_steering = false;
-    for (snapshot.messages) |message| {
-        if (std.mem.eql(u8, message.text, "wait, plan only")) found_steering = true;
-    }
-    try testing.expect(found_steering);
-    try settle(&loop);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
 
+    const waiting = try loop.pendingSteeringEvidence(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), waiting.len);
+    try testing.expectEqualStrings("wait, plan only", waiting[0].text);
+    try testing.expectEqual(Conversation.Origin.human, waiting[0].origin);
+
+    const before = try loop.human_intent.snapshot(testing.allocator);
+    defer before.deinit(testing.allocator);
+    for (before.messages) |message| try testing.expect(!std.mem.eql(u8, message.text, "wait, plan only"));
+
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_submit = &.{.{ .command = "true" }} } };
+    loop.hooks = &runner;
+    try testing.expectEqual(@as(usize, 0), (try loop.pendingSteeringEvidence(arena.allocator())).len);
+    loop.hooks = null;
+
+    try settle(&loop);
     const after = try loop.human_intent.snapshot(testing.allocator);
     defer after.deinit(testing.allocator);
     var occurrences: usize = 0;
