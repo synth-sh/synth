@@ -265,13 +265,27 @@ pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, tar
             if (try samePath(arena, io, root, hook.source, lexical, resolved)) return true;
             var words = safety.shellWords(hook.command);
             while (words.next()) |word| {
-                const candidate = try safety.literalWord(arena, word) orelse continue;
+                const expanded = try expandProjectDir(arena, word, root);
+                const candidate = try safety.literalWord(arena, expanded) orelse continue;
                 if (candidate.len == 0 or candidate[0] == '-') continue;
                 if (try samePath(arena, io, root, candidate, lexical, resolved)) return true;
             }
         }
     }
     return false;
+}
+
+const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR" };
+
+fn expandProjectDir(arena: std.mem.Allocator, word: []const u8, root: []const u8) ![]const u8 {
+    var expanded = word;
+    for (project_dir_variables) |name| {
+        const braced = try std.fmt.allocPrint(arena, "${{{s}}}", .{name});
+        const bare = try std.fmt.allocPrint(arena, "${s}", .{name});
+        expanded = try std.mem.replaceOwned(u8, arena, expanded, braced, root);
+        expanded = try std.mem.replaceOwned(u8, arena, expanded, bare, root);
+    }
+    return expanded;
 }
 
 fn samePath(arena: std.mem.Allocator, io: std.Io, root: []const u8, file: []const u8, lexical: []const u8, resolved: []const u8) !bool {
@@ -346,5 +360,22 @@ test "missing hook control files cannot bypass protection through case variants"
     const trust = try std.fs.path.join(a, &.{ root, "hook-trust.json" });
     for ([_][]const u8{ ".SYNTH/hooks.json", ".ſynth/hooks.json", ".GIT/HOOKS/new", ".git/config", ".git/objects/new", "HOOK-TRUST.json", "hook-truſt.json", "hooK-trust.json" }) |target| {
         try testing.expect(try protectedPath(a, testing.io, root, target, &.{trust}, .{}));
+    }
+}
+
+test "hook scripts named through project directory variables stay protected" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    for ([_]struct { command: []const u8, path: []const u8 }{
+        .{ .command = "python3 \"$SYNTH_PROJECT_DIR/scripts/guard.sh\"", .path = "scripts/guard.sh" },
+        .{ .command = "bash ${SYNTH_PROJECT_DIR}/scripts/guard.sh", .path = "scripts/guard.sh" },
+        .{ .command = "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard.sh", .path = ".claude/hooks/guard.sh" },
+    }) |case| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        try testing.expect(try protectedPath(arena.allocator(), std.testing.io, root, case.path, &.{}, .{ .pre_tool_use = &.{.{ .command = case.command }} }));
     }
 }
