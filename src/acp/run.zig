@@ -31,7 +31,8 @@ pub fn run(init: std.process.Init, editor: bool) !void {
     defer db.deinit();
     const active = try catalog.resolve(init.arena.allocator(), &db, &config, &auth);
 
-    var backend: Backend = .init(active.entry.kind, .{
+    const backend = try allocator.create(Backend);
+    backend.* = .init(active.entry.kind, .{
         .allocator = allocator,
         .io = io,
         .host = active.host,
@@ -44,8 +45,8 @@ pub fn run(init: std.process.Init, editor: bool) !void {
         .chatgpt = chatgpt,
         .copilot_integration_id = config.copilot_integration_id,
     });
-    defer backend.deinit();
-    var providers: Providers = .init(io, &config, &auth, chatgpt, &backend, active);
+    var providers: Providers = .init(io, &config, &auth, chatgpt, backend, active);
+    defer providers.deinit();
 
     const mcp_auth_path = try Config.defaultMcpAuthPath(allocator, init.environ_map);
     defer allocator.free(mcp_auth_path);

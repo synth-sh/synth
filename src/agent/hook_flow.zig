@@ -5,7 +5,7 @@ const Flow = @This();
 const Loop = @import("loop.zig");
 const Database = @import("../core/database.zig");
 
-pub const Compaction = enum { manual, idle, during_turn };
+pub const Compaction = enum { manual, during_turn };
 pub const Resume = enum { begin_prompt, ask_model, compact, compact_session, after_compact, finish_turn, config_idle, failed_turn };
 pub const Pending = union(enum) {
     prompt,

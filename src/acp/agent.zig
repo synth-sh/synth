@@ -374,12 +374,11 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     } else if (eql(u8, method, m.providers)) {
         return connection.reply(id, try (try session.providerSource()).states(arena, self.options.db));
     } else if (eql(u8, method, m.connect_provider)) {
-        const asked = try rpc.parse(synth.ConnectProvider, arena, params);
-        try session.connectProvider(asked.provider, asked.host, asked.key);
+        try session.connectProvider(try rpc.parse(synth.ConnectProvider, arena, params));
     } else if (eql(u8, method, m.cancel_sign_in)) {
         if (session.sign_in) |task| task.cancel();
     } else if (eql(u8, method, m.sign_out)) {
-        try session.signOut();
+        try session.signOut((try rpc.parse(synth.SignOutProvider, arena, params)).provider);
     } else if (eql(u8, method, m.toggle_mcp)) {
         try session.toggleMcp((try rpc.parse(synth.ToggleMcp, arena, params)).name);
     } else if (eql(u8, method, m.models)) {
@@ -972,8 +971,11 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownConfigOption => "no such setting",
         error.ProviderFixed => "this agent's provider is fixed",
         error.UnknownProvider => "no such provider",
+        error.ProviderKeyRequired => "connect this provider with an API key first",
+        error.NotSignedIn => "sign in to this provider first",
         error.NoCredentialStore => "no ChatGPT credential file could be opened",
         error.UnknownServer => "no such MCP server",
+        error.McpServerDisabled => "this MCP server is disabled by its definition",
         error.NoProject => "the session has no project to keep allowances for",
         error.UnknownTool => "no such tool",
         error.EmptyAllowance => "an allowance needs a pattern",
@@ -1410,6 +1412,7 @@ const Session = struct {
     cwd: []const u8,
     mcp_auth: ?mcp.Auth = null,
     sign_in: ?*SignInTask = null,
+    activate_after_sign_in: bool = true,
     sign_out: ?*SignOutTask = null,
     stack: *Stack,
     /// Every message sent, by seq, with a signature of the parts of it that
@@ -1649,9 +1652,8 @@ const Session = struct {
     }
 
     /// Advance the session, and do what a TUI's tick does for a local one:
-    /// check the model once the session is open, compact when the context is
-    /// filling, and start the next turn from whatever was typed while the
-    /// last one ran.
+    /// check the model once the session is open and submit input queued during
+    /// the last turn.
     fn step(self: *Session) void {
         self.finishListings();
         const loop = &self.stack.loop;
@@ -1683,10 +1685,6 @@ const Session = struct {
         self.settleMcp();
         if (loop.isBusy()) return;
         self.settleSignIn();
-        if (loop.compactIfNeeded() catch |err| {
-            self.notice(.warning, "Could not compact: {s}", .{@errorName(err)});
-            return;
-        }) return;
         if (loop.takeSteering()) |taken| {
             var next = taken;
             defer next.deinit(loop.allocator);
@@ -1885,9 +1883,12 @@ const Session = struct {
         const switching = if (chosen.provider) |wanted| !std.mem.eql(u8, wanted, provider_id) else false;
         const change = try loop.beginModelSwitch(chosen.model, if (by_editor) "sdk" else "picker");
         if (switching) {
-            try self.useProvider(catalog.find(chosen.provider.?) orelse return error.UnknownProvider, null, null);
+            const entry = catalog.find(chosen.provider.?) orelse return error.UnknownProvider;
+            try self.useProvider(entry, null, null, .{ .select = chosen.model });
+            try loop.trackModel(change.source);
+        } else {
+            try loop.commitModelSwitch(change);
         }
-        try loop.commitModelSwitch(change);
         self.rememberModel();
         if (extra.effort) |level| try self.chooseEffort(level) else self.restoreEffort();
         if (switching) self.announceProvider();
@@ -2206,6 +2207,7 @@ const Session = struct {
                 break :blk .{ .url = status.url, .port = status.port, .user_code = status.user_code };
             } else null,
             .chatgpt_signed_in = self.chatgptSignedIn(),
+            .signing_out = self.sign_out != null,
             .context_limit = loop.provider.context_limit,
             .vision = loop.provider.vision,
             .switchable = loop.provider.switchable(),
@@ -2304,28 +2306,65 @@ const Session = struct {
         return out;
     }
 
-    fn connectProvider(self: *Session, id: []const u8, at: []const u8, key: ?[]const u8) !void {
+    fn connectProvider(self: *Session, request: synth.ConnectProvider) !void {
         const providers = try self.providerSource();
+        if (providers.model_policy.restrict_routes) return error.ModelRouteDenied;
         if (self.stack.loop.isBusy()) return error.Busy;
-        const entry = catalog.find(id) orelse return error.UnknownProvider;
-        if (entry.key == .oauth and !entry.ready(providers.auth, providers.chatgpt)) return self.beginSignIn(providers, entry.id);
-        try self.useProvider(entry, at, key);
-        self.announceProvider();
+        const entry = catalog.find(request.provider) orelse return error.UnknownProvider;
+        const active = std.mem.eql(u8, entry.id, providers.active_id) and !providers.isMissing();
+        const activate = request.activate or active or providers.isMissing();
+        if (entry.key == .oauth and !entry.ready(providers.auth, providers.chatgpt)) {
+            if (self.sign_in != null) return;
+            self.activate_after_sign_in = activate;
+            return self.beginSignIn(providers, entry.id);
+        }
+        const model = self.stack.loop.provider.model;
+        const keep_model = active and !request.activate and model.len != 0;
+        try self.configureProvider(entry, request.host, request.key, activate, if (keep_model) .{ .keep = model } else .automatic);
+    }
+
+    fn configureProvider(
+        self: *Session,
+        entry: catalog.Entry,
+        host: ?[]const u8,
+        key: ?[]const u8,
+        activate: bool,
+        model: Providers.ModelSelection,
+    ) !void {
+        if (activate) {
+            try self.useProvider(entry, host, key, model);
+            self.announceProvider();
+        } else {
+            const providers = try self.providerSource();
+            try providers.saveCredential(entry, key);
+            if (entry.host_editable) if (host) |endpoint| try self.agent.options.db.setProviderHost(entry.id, endpoint);
+        }
+        self.refreshListings();
     }
 
     /// Point the session at a provider, at `host` or the one it was last
     /// reached at, and remember it as the choice for sessions to come.
-    fn useProvider(self: *Session, entry: catalog.Entry, at: ?[]const u8, key: ?[]const u8) !void {
+    fn useProvider(
+        self: *Session,
+        entry: catalog.Entry,
+        at: ?[]const u8,
+        key: ?[]const u8,
+        model: Providers.ModelSelection,
+    ) !void {
         const providers = try self.providerSource();
         const db = self.agent.options.db;
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena_state.deinit();
-        const where = at orelse try Providers.hostOf(arena_state.allocator(), db, entry);
+        const where = at orelse try providers.endpoint(arena_state.allocator(), db, entry);
 
         const loop = &self.stack.loop;
-        loop.provider = try providers.connect(entry, where, key);
+        loop.provider = try providers.connect(entry, where, key, model);
+        loop.backend = providers.backend;
+        self.stack.runner.backend = providers.backend;
         try loop.setModel(loop.provider.model);
-        db.setProviderHost(entry.id, where) catch |err| self.notice(.warning, "Could not remember the host: {s}", .{@errorName(err)});
+        if (entry.host_editable) if (at) |host| {
+            db.setProviderHost(entry.id, host) catch |err| self.notice(.warning, "Could not remember the host: {s}", .{@errorName(err)});
+        };
         db.setActiveProvider(entry.id) catch |err| self.notice(.warning, "Could not remember the provider: {s}", .{@errorName(err)});
         self.restoreEffort();
     }
@@ -2353,10 +2392,9 @@ const Session = struct {
         const entry = catalog.find(task.id).?;
         const token = task.finish(self.allocator) catch |err| return self.notice(.warning, "{s}", .{SignInTask.explain(err)});
         defer if (token) |value| self.allocator.free(value);
-        self.useProvider(entry, entry.host, token) catch |err| {
+        self.configureProvider(entry, null, token, self.activate_after_sign_in, .automatic) catch |err| {
             return self.notice(.warning, "Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
         };
-        self.announceProvider();
         self.stack.loop.notifyHook("auth_success", entry.label);
         if (std.mem.eql(u8, entry.id, catalog.chatgpt_id)) self.welcomeToPlanUsage();
     }
@@ -2373,18 +2411,23 @@ const Session = struct {
         db.setSetting(welcomed_key, "1") catch {};
     }
 
-    fn signOut(self: *Session) !void {
+    fn signOut(self: *Session, id: ?[]const u8) !void {
         const providers = try self.providerSource();
-        if (std.mem.eql(u8, providers.active_id, catalog.copilot_id)) {
+        const target = id orelse if (std.mem.eql(u8, providers.active_id, catalog.copilot_id)) catalog.copilot_id else catalog.chatgpt_id;
+        if (std.mem.eql(u8, target, catalog.copilot_id)) {
             if (self.busy()) return error.Busy;
             try providers.auth.set(catalog.copilot_id, "");
             try providers.auth.save(self.io, providers.auth.path);
-            providers.backend.client.copilot.signOut();
-            self.stack.loop.provider = providers.backend.provider();
-            providers.missing = true;
-            try self.agent.options.db.setActiveProvider("");
+            if (std.mem.eql(u8, providers.active_id, target)) {
+                providers.backend.client.copilot.signOut();
+                self.stack.loop.provider = providers.backend.provider();
+                providers.missing = true;
+                try self.agent.options.db.setActiveProvider("");
+            }
+            self.refreshListings();
             return self.notice(.info, "Signed out of GitHub Copilot here. Revoke the OAuth application's access in GitHub settings if needed.", .{});
         }
+        if (!std.mem.eql(u8, target, catalog.chatgpt_id)) return error.UnknownProvider;
         const store = providers.chatgpt orelse return error.NoCredentialStore;
         if (self.sign_out != null) return;
         if (!store.isSignedIn()) return self.notice(.info, "Not signed in to ChatGPT.", .{});
@@ -2406,6 +2449,7 @@ const Session = struct {
         if (std.mem.eql(u8, providers.active_id, catalog.chatgpt_id)) {
             self.agent.options.db.setActiveProvider("") catch |err| self.notice(.warning, "Could not clear the provider: {s}", .{@errorName(err)});
         }
+        self.refreshListings();
     }
 
     fn toggleMcp(self: *Session, name: []const u8) !void {
@@ -2414,6 +2458,7 @@ const Session = struct {
         const server = for (mcp_host.servers) |server| {
             if (std.mem.eql(u8, server.name, name)) break server;
         } else return error.UnknownServer;
+        if (!server.enabled) return error.McpServerDisabled;
         if (mcp_host.connecting()) return error.StillConnecting;
         const store = mcp_host.auth orelse return error.NoMcpState;
 
@@ -2505,7 +2550,7 @@ const Session = struct {
             if (self.model_jobs[i] != null) pending += 1;
             const reach = (try self.modelListingReach(arena, providers, entry)) orelse continue;
             const cached = self.model_cached[i] orelse continue;
-            if (!std.mem.eql(u8, cached.reach.host, reach.host)) continue;
+            if (!cached.reach.matches(reach)) continue;
             for (cached.models orelse &.{}) |model| {
                 const remembered = db.rememberedEffort(arena, entry.id, model.name) catch "";
                 try offered.append(arena, .{
@@ -2521,25 +2566,51 @@ const Session = struct {
         return .{ .offered = offered.items, .recent = try db.recentModels(arena, project_id, self.model_recent), .pending = pending };
     }
 
+    fn refreshListings(self: *Session) void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        self.startListings(arena) catch |err| self.notice(.warning, "Could not refresh the model list: {s}", .{@errorName(err)});
+        self.publishModels(arena);
+    }
+
+    fn publishModels(self: *Session, arena: std.mem.Allocator) void {
+        const listed = self.cachedModels(arena) catch return;
+        self.agent.notifyAll(.synth, synth.method.models_updated, synth.ModelsUpdate{ .sessionId = self.handle, .models = listed });
+    }
+
     fn finishListings(self: *Session) void {
         if (self.agent.options.source != .providers) return;
+        const providers = self.agent.options.source.providers;
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         var changed = false;
         for (&self.model_jobs, 0..) |*slot, i| {
             const job = slot.* orelse continue;
             if (!job.isFinished()) continue;
             job.join();
             slot.* = null;
-            if (job.models) |_| {
-                if (self.model_cached[i]) |old| old.destroy();
-                self.model_cached[i] = job;
-            } else job.destroy();
             changed = true;
+            self.finishListing(arena, providers, i, job) catch |err| {
+                self.notice(.warning, "Could not refresh the model list: {s}", .{@errorName(err)});
+            };
         }
-        if (!changed) return;
-        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
-        defer arena_state.deinit();
-        const listed = self.cachedModels(arena_state.allocator()) catch return;
-        self.agent.notifyAll(.synth, synth.method.models_updated, synth.ModelsUpdate{ .sessionId = self.handle, .models = listed });
+        if (changed) self.publishModels(arena);
+    }
+
+    fn finishListing(self: *Session, arena: std.mem.Allocator, providers: *Providers, index: usize, job: *ModelListing) !void {
+        errdefer job.destroy();
+        if (try self.modelListingReach(arena, providers, job.entry)) |reach| {
+            if (!job.reach.matches(reach)) {
+                self.model_jobs[index] = try ModelListing.start(self.allocator, self.agent.io, job.entry, reach);
+            } else if (job.models != null) {
+                if (self.model_cached[index]) |old| old.destroy();
+                self.model_cached[index] = job;
+                return;
+            }
+        }
+        job.destroy();
     }
 
     /// Every connected provider's models, each provider asked in turn.

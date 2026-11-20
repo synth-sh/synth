@@ -22,6 +22,11 @@ pub const Reach = struct {
     api_key: ?[]const u8,
     chatgpt: ?*chatgpt_auth.Store,
     copilot_integration_id: []const u8 = "",
+
+    pub fn matches(self: Reach, other: Reach) bool {
+        return std.mem.eql(u8, self.host, other.host) and
+            std.mem.eql(u8, self.api_key orelse "", other.api_key orelse "");
+    }
 };
 
 allocator: std.mem.Allocator,
