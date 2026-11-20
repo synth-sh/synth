@@ -19,6 +19,7 @@ io: std.Io,
 /// When a refused request is worth sending again.
 retries: retry.Policy = .{},
 last_status: std.http.Status = .ok,
+last_retry_after_ms: ?u64 = null,
 
 /// Base URL of the server, e.g. `http://localhost:11434`. Borrowed.
 host: []const u8,
@@ -619,6 +620,7 @@ fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest
     };
     const reader = response.readerDecompressing(transfer, decompress, compressed);
     self.last_status = head.status;
+    self.last_retry_after_ms = retry.retryAfterMs(head.get("retry-after"));
     if (head.status.class() != .success) {
         const raw = reader.allocRemaining(a, .limited(4 * 1024 * 1024)) catch "";
         const why = (try http.payload(a, raw, false)).?;
@@ -691,6 +693,7 @@ fn respond(
             if (err == error.HttpError and retry.wait(self.io, self.retries, sink, .{
                 .status = self.last_status,
                 .attempt = sends,
+                .retry_after_ms = self.last_retry_after_ms,
                 .message = why,
                 .retryable = retry.transient(self.last_status) or retry.transientText(why),
             })) {
