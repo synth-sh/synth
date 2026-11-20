@@ -165,7 +165,7 @@ fn updateHeaders(a: std.mem.Allocator, headers: *std.ArrayList(std.http.Header),
         const name = entry.key_ptr.*;
         if (name.len == 0) return error.InvalidHttpHookOutput;
         for (name) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) == null) return error.InvalidHttpHookOutput;
-        for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "upgrade", "proxy-authorization" }) |reserved| if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ProtectedHttpHeader;
+        for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "upgrade", "proxy-authorization", "accept-encoding" }) |reserved| if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ProtectedHttpHeader;
         const value = entry.value_ptr.*;
         if (value != .string and value != .null) return error.InvalidHttpHookOutput;
         if (value == .string) {
@@ -196,6 +196,7 @@ test "HTTP overrides reject destination headers injection and invalid payload fi
     const a = arena.allocator();
     var headers: std.ArrayList(std.http.Header) = .empty;
     try std.testing.expectError(error.ProtectedHttpHeader, updateHeaders(a, &headers, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"Host\":\"evil\"}", .{})));
+    try std.testing.expectError(error.ProtectedHttpHeader, updateHeaders(a, &headers, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"Accept-Encoding\":\"gzip\"}", .{})));
     try std.testing.expectError(error.InvalidHttpHookOutput, updateHeaders(a, &headers, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"x-test\":\"a\\r\\nb\"}", .{})));
     const before = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"model\":\"local\"}", .{});
     const after = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"model\":\"remote\"}", .{});
