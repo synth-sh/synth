@@ -54,11 +54,22 @@ const Pending = struct {
     session_id: i64,
 };
 
-pub fn deinit(self: *Titler) void {
+/// Name the session from an answer that already came; give up on one that has
+/// not.
+pub fn deinit(self: *Titler, loop: *Loop) void {
     const pending = self.pending orelse return;
+    if (pending.request.isFinished()) {
+        _ = self.collect(loop, pending) catch false;
+        return;
+    }
     pending.request.cancel();
     self.release(pending);
     self.pending = null;
+}
+
+/// Whether a question is out, which the session has to keep polling for.
+pub fn busy(self: *const Titler) bool {
+    return self.pending != null;
 }
 
 /// Ask for a title once an untitled session finishes a turn, and name it when
@@ -240,7 +251,7 @@ const Fixture = struct {
     }
 
     fn destroy(self: *Fixture) void {
-        self.titler.deinit();
+        self.titler.deinit(&self.loop);
         self.loop.deinit();
         self.reads.deinit();
         self.registry.deinit();
@@ -262,7 +273,7 @@ const Fixture = struct {
         while (true) {
             _ = try self.loop.poll();
             _ = try self.titler.poll(&self.loop);
-            if (!self.loop.isBusy() and self.titler.pending == null) return;
+            if (!self.loop.isBusy() and !self.titler.busy()) return;
             try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
             waited_ms += 1;
             if (waited_ms > 5_000) return error.DidNotSettle;
@@ -312,4 +323,22 @@ test "a failed title leaves the session untitled until the next turn" {
     try fixture.turn("the login page loops");
     try testing.expectEqualStrings("Fix the login redirect", fixture.loop.title());
     try testing.expectEqual(@as(usize, 2), fixture.fake.titles_asked);
+}
+
+test "an answer that came before teardown still names the session" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+
+    try fixture.loop.submit("the login page loops", .{});
+    while (fixture.loop.isBusy()) {
+        _ = try fixture.loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+    _ = try fixture.titler.poll(&fixture.loop);
+    try testing.expect(fixture.titler.busy());
+    while (!fixture.titler.pending.?.request.isFinished()) try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+
+    fixture.titler.deinit(&fixture.loop);
+    try testing.expect(!fixture.titler.busy());
+    try testing.expectEqualStrings("Fix the login redirect", fixture.loop.title());
 }

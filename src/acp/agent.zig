@@ -171,8 +171,8 @@ pub fn serve(self: *Agent) void {
         }
         _ = arena_state.reset(.retain_capacity);
 
-        const busy = if (self.session) |session| session.busy() else false;
-        if (busy) {
+        const ticking = if (self.session) |session| session.busy() or session.stack.titler.busy() else false;
+        if (ticking) {
             self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } }) catch {};
         } else {
             self.wake.waitUncancelable(self.io);

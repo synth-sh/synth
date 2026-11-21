@@ -112,7 +112,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.loop.delegate = self.runner.delegate();
     self.titler = .{ .allocator = allocator, .io = io, .backend = options.backend };
     errdefer {
-        self.titler.deinit();
+        self.titler.deinit(&self.loop);
         self.loop.deinit();
         self.runner.deinit();
     }
@@ -162,7 +162,7 @@ fn named(servers: []const mcp_tools.Server, name: []const u8) bool {
 
 pub fn destroy(self: *Stack) void {
     // Ordered: the loop joins workers writing to the runner; MCP tools point into the host.
-    self.titler.deinit();
+    self.titler.deinit(&self.loop);
     self.loop.deinit();
     self.runner.deinit();
     self.convo.deinit();
