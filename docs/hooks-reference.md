@@ -11,11 +11,12 @@ models with different capabilities in one workflow, with access and authority
 tailored to each model’s role.
 
 A request's **purpose** describes its job, whether that's agent work, approval
-review, or compaction. A model's **tier** is the capability you assign it
-(`small`, `mid`, or `frontier`). Its **trust** label describes where it runs
-(`local` on your machine, `private` on infrastructure you control, or `hosted`
-with a provider). A hook group's `when` filter can match any combination of
-purpose, tier, and trust. See [model trust and tier](#model-trust-and-tier).
+review, or compaction. A model's **tier** is the capability label you assign
+it (`small`, `mid`, `frontier`, or `unknown`). Its **trust** label describes
+where it runs (`local` on your machine, `private` on infrastructure you
+control, or `hosted` with a provider). A hook group's `when` filter can match
+any combination of purpose, tier, and trust. See
+[model trust and tier](#model-trust-and-tier).
 
 Suppose a small self-hosted model is implementing a change and you want a
 frontier cloud model to answer a difficult design question. `ModelResolve`

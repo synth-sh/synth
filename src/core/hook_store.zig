@@ -198,7 +198,10 @@ fn homeReference(word: []const u8) ?HomeReference {
             const relative = std.mem.cutPrefix(u8, inside, "/") orelse return null;
             return .{ .relative = relative };
         }
-        const relative = std.mem.cutPrefix(u8, tail, "/") orelse return null;
+        const relative = std.mem.cutPrefix(u8, tail, "/") orelse blk: {
+            const inside = std.mem.cutPrefix(u8, tail, "\"/") orelse return null;
+            break :blk std.mem.cutSuffix(u8, inside, "\"") orelse return null;
+        };
         return .{ .relative = relative, .unquoted_variable = true };
     }
     return null;
@@ -371,6 +374,8 @@ test "rewriting a script under HOME invalidates trust when Bash expands the path
         .{ .command = "sh $HOME/bin/guard.sh" },
         .{ .command = "sh \"${HOME}/bin/guard.sh\"" },
         .{ .command = "sh \"$HOME\"/bin/guard.sh" },
+        .{ .command = "sh $HOME\"/bin/guard.sh\"" },
+        .{ .command = "sh ${HOME}\"/bin/guard.sh\"" },
         .{ .command = "sh '$HOME/bin/guard.sh'" },
         .{ .command = "sh \"~/bin/guard.sh\"" },
     } };
@@ -384,7 +389,7 @@ test "rewriting a script under HOME invalidates trust when Bash expands the path
 
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "exit 2" });
     const rewritten = try discover(a, io, hooks, root, home, store);
-    for (rewritten.pre_tool_use, [_]bool{ false, false, false, false, true, true }) |hook, trusted| {
+    for (rewritten.pre_tool_use, [_]bool{ false, false, false, false, false, false, true, true }) |hook, trusted| {
         try testing.expectEqual(trusted, hook.trusted);
     }
 }
@@ -536,6 +541,8 @@ test "user hooks share trust across checkouts for fixed home paths" {
         \\{"PreToolUse":[{"hooks":[
         \\  {"command":"/bin/sh \"$HOME/.synth/guard.sh\""},
         \\  {"command":"/bin/sh \"${HOME}\"/.synth/guard.sh"},
+        \\  {"command":"/bin/sh $HOME\"/.synth/guard.sh\""},
+        \\  {"command":"/bin/sh ${HOME}\"/.synth/guard.sh\""},
         \\  {"command":"~/.synth/guard.sh"},
         \\  {"command":"/bin/sh ./guard.sh"},
         \\  {"command":"bash \"$HOME/.synth/guard.sh\""},
@@ -554,7 +561,7 @@ test "user hooks share trust across checkouts for fixed home paths" {
     const first = try discover(a, io, .{}, one, home, store);
     for (first.pre_tool_use) |hook| try store.put(hook.id, .{ .trusted = true });
     const second = try discover(a, io, .{}, two, home, store);
-    const shared = [_]bool{ true, true, true, false, false, false, false };
+    const shared = [_]bool{ true, true, true, true, true, false, false, false, false };
     for (second.pre_tool_use, &shared) |hook, expected| try testing.expectEqual(expected, hook.trusted);
 
     try tmp.dir.writeFile(io, .{ .sub_path = guard, .data = "exit 2" });
