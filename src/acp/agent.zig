@@ -2732,10 +2732,10 @@ const testing = std.testing;
 /// Answers the first turn by thinking aloud and asking to write a note, or,
 /// for a prompt of "ask me", asking which colour; and the second, once the
 /// call is settled, with "done". Each answer waits on
-/// `guard` after the thinking, so a test can catch a request mid-stream. Offers
+/// `gate` after the thinking, so a test can catch a request mid-stream. Offers
 /// two models, each at two efforts; only the first can be shown images.
 pub const Script = struct {
-    guard: std.Io.Event = .is_set,
+    gate: std.Io.Event = .is_set,
     model: []const u8 = offered[0],
     effort: []const u8 = "",
 
@@ -2795,7 +2795,7 @@ pub const Script = struct {
             s.onThinking(s.userdata, "weighing it up");
             s.onThinkingDone(s.userdata);
         }
-        self.guard.waitUncancelable(testing.io);
+        self.gate.waitUncancelable(testing.io);
         if (turn.compacting) return .{ .text = try allocator.dupe(u8, "The story so far.") };
         const last = convo.last();
         if (last != null and last.?.role == .tool) return .{ .text = try allocator.dupe(u8, "done") };
@@ -3119,7 +3119,7 @@ test "a turn runs, its approval asked as a permission request and its prompt ans
     const session = (try client.open(fixture.project)).sessionId;
     const arena = client.arena.allocator();
 
-    fixture.script.guard.reset();
+    fixture.script.gate.reset();
     const prompted = try client.prompt(session, "make a note");
     var thinking: std.ArrayList(u8) = .empty;
     while (!std.mem.eql(u8, thinking.items, "weighing it up")) {
@@ -3127,7 +3127,7 @@ test "a turn runs, its approval asked as a permission request and its prompt ans
         const update = try rpc.parse(synth.StreamUpdate, arena, message.params);
         try thinking.appendSlice(arena, update.stream.thinking);
     }
-    fixture.script.guard.set(testing.io);
+    fixture.script.gate.set(testing.io);
 
     const status = try client.awaitStatus(struct {
         fn matches(_: @This(), got: synth.Status) bool {
@@ -3161,7 +3161,7 @@ test "a prompt sent while busy steers the turn, and both are answered when it en
         .data = "a steered file",
     });
 
-    fixture.script.guard.reset();
+    fixture.script.gate.reset();
     const first = try client.prompt(session, "make a note");
     const second = try client.request(protocol.method.session_prompt, .{
         .sessionId = session,
@@ -3175,7 +3175,7 @@ test "a prompt sent while busy steers the turn, and both are answered when it en
             return got.steering.len == 1;
         }
     }{});
-    fixture.script.guard.set(testing.io);
+    fixture.script.gate.set(testing.io);
     try client.choose((try client.awaitPermission()).id, "once");
 
     const steered = while (true) {

@@ -7,7 +7,7 @@
 //! Every MCP tool needs approval before it runs. The protocol has a
 //! `readOnlyHint` annotation, and the spec is explicit that a server's
 //! description of its own behaviour is untrusted - so a hint from something we
-//! just launched is not grounds for skipping the guard.
+//! just launched is not grounds for skipping the gate.
 
 const std = @import("std");
 const testing = std.testing;
@@ -986,7 +986,7 @@ test "a server's tools are registered, called, and cleaned up" {
     try testing.expectEqual(@as(usize, 0), host.failures.items.len);
 
     const registered = registry.get("mcp__files__read_file") orelse return error.TestUnexpectedResult;
-    // A server's own claim about itself is not grounds for skipping the guard.
+    // A server's own claim about itself is not grounds for skipping the gate.
     try testing.expect(!registered.read_only);
     try testing.expect(std.mem.indexOf(u8, registered.description, "files MCP server") != null);
 

@@ -46,7 +46,7 @@ pub const Context = struct {
     /// Whether this call may touch paths outside the project.
     ///
     /// True only for a call a person approved by hand. A call that skipped the
-    /// guard - a read-only tool, a safe command, a standing allowance - stays
+    /// gate - a read-only tool, a safe command, a standing allowance - stays
     /// inside the root, so a path the approval layer did not think to inspect
     /// is refused rather than quietly allowed.
     allow_outside: bool = false,

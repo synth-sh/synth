@@ -250,7 +250,7 @@ delegate: ?tool.Delegate = null,
 /// What the session's client does in place of the disk and a shell.
 handoff: tool.Handoff = .{},
 /// What the model may do this turn. The tool schema sent with every request is
-/// this agent's list, and the guard refuses anything outside it.
+/// this agent's list, and the gate refuses anything outside it.
 agent: agents.Agent = agents.all[0],
 /// The last batch of tool calls, as tool name and arguments run together, and
 /// how many times running it has come back identical. A step ceiling catches a
@@ -2633,7 +2633,7 @@ fn mayReachOutside(self: *const Loop, call: *const Conversation.ToolCall) bool {
 
 /// Whether a call names a path outside the project.
 ///
-/// Such a call never skips the guard, whatever the tool says about being
+/// Such a call never skips the gate, whatever the tool says about being
 /// read-only: reading `~/.ssh/id_rsa` is not made safe by `read` being a
 /// read-only tool. Anything unparseable counts as escaping, so a malformed
 /// argument is asked about rather than waved through.
