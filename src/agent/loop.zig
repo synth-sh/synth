@@ -489,18 +489,23 @@ fn adoptModel(self: *Loop, now: Provider.Current) !void {
 /// agent's instructions, and remember it on the session.
 pub fn useAgent(self: *Loop, id: []const u8) !void {
     const chosen = agents.findOrDefault(id);
-    const json = try self.registry.schemaJson(self.allocator, chosen.tools);
-    errdefer self.allocator.free(json);
-
-    if (self.tools_json) |old| self.allocator.free(old);
-    self.tools_json = json;
+    try self.setTools(chosen.tools);
     self.agent = chosen;
-
-    self.prompt_cache.invalidate(self.allocator);
 
     if (self.db) |db| {
         if (self.session_id) |session_id| try db.setSessionAgent(session_id, chosen.id);
     }
+}
+
+pub fn refreshTools(self: *Loop) !void {
+    try self.setTools(self.agent.tools);
+}
+
+fn setTools(self: *Loop, allowed: []const []const u8) !void {
+    const json = try self.registry.schemaJson(self.allocator, allowed);
+    if (self.tools_json) |old| self.allocator.free(old);
+    self.tools_json = json;
+    self.prompt_cache.invalidate(self.allocator);
 }
 
 /// Everything one call needs besides the transcript. Assembling it here rather
