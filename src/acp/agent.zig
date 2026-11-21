@@ -171,8 +171,8 @@ pub fn serve(self: *Agent) void {
         }
         _ = arena_state.reset(.retain_capacity);
 
-        const busy = if (self.session) |session| session.busy() else false;
-        if (busy) {
+        const ticking = if (self.session) |session| session.busy() or session.stack.titler.busy() else false;
+        if (ticking) {
             self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } }) catch {};
         } else {
             self.wake.waitUncancelable(self.io);
@@ -1643,6 +1643,7 @@ const Session = struct {
         } else |_| {}
         _ = self.stack.runner.poll() catch |err| self.notice(.@"error", "Subagent failed: {s}", .{@errorName(err)});
         _ = loop.poll() catch |err| self.notice(.@"error", "The turn failed: {s}", .{@errorName(err)});
+        _ = self.stack.titler.poll(loop) catch |err| self.notice(.warning, "Could not name the session: {s}", .{@errorName(err)});
 
         if (loop.takeHookNotice()) |text| {
             defer self.allocator.free(text);
