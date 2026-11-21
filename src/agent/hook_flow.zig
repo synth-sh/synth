@@ -2,12 +2,14 @@ const std = @import("std");
 const Hooks = @import("../core/hooks.zig");
 const HooksCopy = @import("../core/hooks_copy.zig");
 const HookWatch = @import("../core/hook_watch.zig");
+const Conversation = @import("../core/conversation.zig");
 const Flow = @This();
 const Loop = @import("loop.zig");
 const Database = @import("../core/database.zig");
 
 pub const identity_bytes = 16;
 const transcript_buffer_bytes = 4 * 1024;
+const TranscriptHash = std.crypto.hash.Blake3;
 
 pub const Compaction = enum {
     manual,
@@ -59,7 +61,7 @@ parent_call_id: []const u8 = "",
 identity: [identity_bytes * 2]u8 = @splat(0),
 notice: ?[]u8 = null,
 failure: ?[]u8 = null,
-export_path: ?[]u8 = null,
+transcript: Transcript = .{},
 session_handle: ?[]const u8 = null,
 
 pub fn setNotice(self: *Flow, allocator: std.mem.Allocator, notice: ?[]u8) void {
@@ -67,7 +69,8 @@ pub fn setNotice(self: *Flow, allocator: std.mem.Allocator, notice: ?[]u8) void 
     self.notice = notice;
 }
 
-pub fn reset(self: *Flow) void {
+pub fn reset(self: *Flow, allocator: std.mem.Allocator) void {
+    self.transcript.deinit(allocator);
     self.compaction = .manual;
     self.compaction_veto_seq = null;
     self.policy = .{};
@@ -144,27 +147,138 @@ pub fn exportHookInput(self: *Loop, invocation: Hooks.Invocation) !Hooks.Invocat
     }
     if (!needed) return input;
     const runtime = runner.runtime orelse return input;
-    const path = try runtime.privatePath(self.allocator, "jsonl");
-    errdefer self.allocator.free(path);
-    const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true, .permissions = Hooks.private_file_permissions });
-    defer file.close(self.io);
-    errdefer std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
-    var buffer: [transcript_buffer_bytes]u8 = undefined;
-    var writer = file.writer(self.io, &buffer);
-    for (self.conversation.messages.items) |message| {
-        try std.json.Stringify.value(.{ .seq = message.seq, .role = message.role, .text = message.text, .tool_calls = message.tool_calls }, .{}, &writer.interface);
-        try writer.interface.writeByte('\n');
-    }
-    try writer.interface.flush();
-    try runtime.registerSnapshot(path);
-    if (self.hook_flow.export_path) |old| {
-        runtime.releaseSnapshot(old);
-        self.allocator.free(old);
-    }
-    self.hook_flow.export_path = path;
-    input.transcript_path = path;
+    input.transcript_path = try self.hook_flow.transcript.exportSnapshot(self.allocator, runtime, self.conversation.messages.items);
     return input;
 }
+
+const Transcript = struct {
+    current: ?Snapshot = null,
+    rows: std.ArrayList(Row) = .empty,
+
+    const Row = struct { hash: [TranscriptHash.digest_length]u8, end: u64 };
+
+    const Snapshot = struct {
+        path: []u8,
+        runtime: *Hooks.Runtime,
+        stat: std.Io.File.Stat,
+
+        fn open(self: Snapshot, runtime: *Hooks.Runtime) ?std.Io.File {
+            if (self.runtime != runtime) return null;
+            const file = std.Io.Dir.cwd().openFile(runtime.io, self.path, .{
+                .mode = .read_write,
+                .allow_directory = false,
+                .follow_symlinks = false,
+            }) catch return null;
+            if (file.stat(runtime.io)) |stat| {
+                if (stat.kind == .file and stat.nlink == 1 and stat.inode == self.stat.inode and stat.size == self.stat.size and
+                    stat.mtime.nanoseconds == self.stat.mtime.nanoseconds and stat.ctime.nanoseconds == self.stat.ctime.nanoseconds) return file;
+            } else |_| {}
+            file.close(runtime.io);
+            return null;
+        }
+    };
+
+    const Record = struct {
+        seq: u64,
+        role: Conversation.Role,
+        text: []const u8,
+        tool_calls: []const Conversation.ToolCall,
+
+        fn fromMessage(message: Conversation.Message) Record {
+            return .{ .seq = message.seq, .role = message.role, .text = message.text, .tool_calls = message.tool_calls };
+        }
+
+        fn digest(self: Record) [TranscriptHash.digest_length]u8 {
+            var hasher: TranscriptHash = .init(.{});
+            hashField(&hasher, self);
+            var bytes: [TranscriptHash.digest_length]u8 = undefined;
+            hasher.final(&bytes);
+            return bytes;
+        }
+    };
+
+    fn hashField(hasher: *TranscriptHash, value: anytype) void {
+        switch (@typeInfo(@TypeOf(value))) {
+            .pointer => |info| {
+                std.hash.autoHash(hasher, value.len);
+                if (info.child == u8) hasher.update(value) else for (value) |item| hashField(hasher, item);
+            },
+            .optional => {
+                std.hash.autoHash(hasher, value != null);
+                if (value) |item| hashField(hasher, item);
+            },
+            .@"struct" => |info| inline for (info.fields) |field| hashField(hasher, @field(value, field.name)),
+            else => std.hash.autoHash(hasher, value),
+        }
+    }
+
+    fn exportSnapshot(self: *Transcript, allocator: std.mem.Allocator, runtime: *Hooks.Runtime, messages: []const Conversation.Message) ![]const u8 {
+        const io = runtime.io;
+        try self.rows.ensureTotalCapacity(allocator, messages.len);
+        if (self.current) |snapshot| {
+            if (snapshot.open(runtime)) |file| {
+                defer file.close(io);
+                const limit = @min(self.rows.items.len, messages.len);
+                var prefix: usize = 0;
+                for (messages[0..limit], self.rows.items[0..limit]) |message, row| {
+                    const digest = Record.fromMessage(message).digest();
+                    if (!std.mem.eql(u8, &row.hash, &digest)) break;
+                    prefix += 1;
+                }
+                if (prefix == messages.len and prefix == self.rows.items.len) return snapshot.path;
+                // Any worker that can pass this path on to another worker already holds a reference.
+                if (prefix > 0 and runtime.snapshotIsExclusive(snapshot.path)) {
+                    errdefer self.release(allocator);
+                    try self.writeTail(io, file, prefix, messages[prefix..]);
+                    self.current.?.stat = try file.stat(io);
+                    return snapshot.path;
+                }
+            }
+        }
+
+        const path = try runtime.privatePath(allocator, "jsonl");
+        errdefer allocator.free(path);
+        const directory = std.Io.Dir.cwd();
+        const file = try directory.createFile(io, path, .{ .exclusive = true, .permissions = Hooks.private_file_permissions });
+        defer file.close(io);
+        errdefer directory.deleteFile(io, path) catch {};
+        self.release(allocator);
+        try self.writeTail(io, file, 0, messages);
+        const stat = try file.stat(io);
+        try runtime.registerSnapshot(path);
+        self.current = .{ .path = path, .runtime = runtime, .stat = stat };
+        return path;
+    }
+
+    fn writeTail(self: *Transcript, io: std.Io, file: std.Io.File, prefix: usize, tail: []const Conversation.Message) !void {
+        var buffer: [transcript_buffer_bytes]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        if (prefix > 0) try writer.seekToUnbuffered(self.rows.items[prefix - 1].end);
+        self.rows.shrinkRetainingCapacity(prefix);
+        for (tail) |message| {
+            const record = Record.fromMessage(message);
+            try std.json.Stringify.value(record, .{}, &writer.interface);
+            try writer.interface.writeByte('\n');
+            self.rows.appendAssumeCapacity(.{ .hash = record.digest(), .end = writer.logicalPos() });
+        }
+        try writer.end();
+    }
+
+    fn release(self: *Transcript, allocator: std.mem.Allocator) void {
+        if (self.current) |snapshot| {
+            snapshot.runtime.releaseSnapshot(snapshot.path);
+            allocator.free(snapshot.path);
+            self.current = null;
+        }
+        self.rows.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *Transcript, allocator: std.mem.Allocator) void {
+        self.release(allocator);
+        self.rows.deinit(allocator);
+        self.* = .{};
+    }
+};
 
 pub fn begin(self: *Loop, runner: Hooks.Runner, input: Hooks.Invocation, pending: Pending) !void {
     self.hook_flow.dispatch = try Hooks.Dispatch.start(self.allocator, runner, input);
@@ -236,4 +350,54 @@ pub fn lifecycle(self: *Loop, event: Hooks.Event, next: Resume) !bool {
         .source = @tagName(self.hook_flow.session_source),
         .trigger = self.hook_flow.compaction.trigger(),
     }, .{ .lifecycle = next });
+}
+
+test "transcript export reuses unchanged rows and preserves a retained snapshot" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var runtime: Hooks.Runtime = .{ .allocator = a, .io = io, .temp_root = root };
+    defer runtime.deinit();
+    var transcript: Transcript = .{};
+    defer transcript.deinit(a);
+    var calls = [_]Conversation.ToolCall{.{ .id = "c1", .name = "read", .arguments = "{}" }};
+    const messages = [_]Conversation.Message{
+        .{ .seq = 0, .role = .user, .text = "Read the document" },
+        .{ .seq = 1, .role = .assistant, .text = "", .tool_calls = &calls },
+    };
+    const directory = std.Io.Dir.cwd();
+    const limit: std.Io.Limit = .limited(transcript_buffer_bytes);
+
+    const first = try transcript.exportSnapshot(a, &runtime, messages[0..1]);
+    const path = try a.dupe(u8, first);
+    defer a.free(path);
+    const unchanged = try transcript.exportSnapshot(a, &runtime, messages[0..1]);
+    try testing.expectEqualStrings(path, unchanged);
+    const appended = try transcript.exportSnapshot(a, &runtime, &messages);
+    try testing.expectEqualStrings(path, appended);
+
+    calls[0].status = .ok;
+    calls[0].result = "complete";
+    const updated = try transcript.exportSnapshot(a, &runtime, &messages);
+    try testing.expectEqualStrings(path, updated);
+    const old = try directory.readFileAlloc(io, path, a, limit);
+    defer a.free(old);
+    try testing.expect(std.mem.indexOf(u8, old, "\"result\":\"complete\"") != null);
+
+    runtime.retainSnapshot(path);
+    defer runtime.releaseSnapshot(path);
+    const shortened = try transcript.exportSnapshot(a, &runtime, messages[0..1]);
+    try testing.expect(!std.mem.eql(u8, path, shortened));
+    const still_retained = try directory.readFileAlloc(io, path, a, limit);
+    defer a.free(still_retained);
+    try testing.expectEqualStrings(old, still_retained);
+    const current = try directory.readFileAlloc(io, shortened, a, limit);
+    defer a.free(current);
+    try testing.expectEqualStrings("{\"seq\":0,\"role\":\"user\",\"text\":\"Read the document\",\"tool_calls\":[]}\n", current);
+    runtime.releaseSnapshot(path);
+    try testing.expectError(error.FileNotFound, directory.access(io, path, .{}));
 }

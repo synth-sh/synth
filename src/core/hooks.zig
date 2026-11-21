@@ -699,6 +699,11 @@ pub const Runtime = struct {
         defer self.temp_mutex.unlock(self.io);
         if (self.snapshots.getPtr(key)) |refs| refs.* += 1;
     }
+    pub fn snapshotIsExclusive(self: *Runtime, path: []const u8) bool {
+        self.temp_mutex.lockUncancelable(self.io);
+        defer self.temp_mutex.unlock(self.io);
+        return self.snapshots.get(path) == 1;
+    }
     pub fn releaseSnapshot(self: *Runtime, path: ?[]const u8) void {
         const key = path orelse return;
         self.temp_mutex.lockUncancelable(self.io);

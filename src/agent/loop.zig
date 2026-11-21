@@ -440,7 +440,7 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     self.endHookSession("resume");
     if (self.hook_flow.context) |context| self.allocator.free(context);
     self.hook_flow.context = null;
-    self.hook_flow.reset();
+    self.hook_flow.reset(self.allocator);
     self.prompt_cache.invalidate(self.allocator);
     try self.conversation.adopt(loaded, total - @min(total, loaded.len));
 
@@ -468,7 +468,7 @@ pub fn resetForNewSession(self: *Loop) bool {
 
     self.discardHookSubmission();
     self.endHookSession("clear");
-    self.hook_flow.reset();
+    self.hook_flow.reset(self.allocator);
     self.prompt_cache.invalidate(self.allocator);
     self.human_intent.deinit(self.allocator);
     self.conversation.clear();
@@ -803,11 +803,7 @@ pub fn deinit(self: *Loop) void {
     self.allowed.deinit(self.allocator);
     for (self.checkpointed.items) |path| self.allocator.free(path);
     self.checkpointed.deinit(self.allocator);
-    if (self.hook_flow.export_path) |path| {
-        if (self.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(path);
-        self.allocator.free(path);
-    }
-    self.hook_flow.export_path = null;
+    self.hook_flow.transcript.deinit(self.allocator);
     if (self.hook_flow.session_handle) |handle| self.allocator.free(handle);
     self.hook_flow.asks.deinit(self.allocator);
     self.message_ids.deinit(self.allocator);
