@@ -5,6 +5,7 @@ const Patch = @import("../core/hook_result.zig").HttpPatch;
 const max_http_status = 599;
 const redacted_header = "<redacted>";
 const proxy_authorization_header = "proxy-authorization";
+const header_name_punctuation = "!#$%&'*+-.^_`|~";
 const Phase = enum { request, headers, body, event };
 
 pub const Request = struct {
@@ -168,13 +169,21 @@ fn headerName(a: std.mem.Allocator, field: []const u8) ![]const u8 {
     return value;
 }
 
+fn validHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        if (std.mem.indexOfScalar(u8, header_name_punctuation, byte) == null) return false;
+    }
+    return true;
+}
+
 fn updateHeaders(a: std.mem.Allocator, headers: *std.ArrayList(std.http.Header), values: std.json.Value) !void {
     if (values != .object) return error.InvalidHttpHookOutput;
     var it = values.object.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
-        if (name.len == 0) return error.InvalidHttpHookOutput;
-        for (name) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) == null) return error.InvalidHttpHookOutput;
+        if (!validHeaderName(name)) return error.InvalidHttpHookOutput;
         for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "upgrade", proxy_authorization_header, "accept-encoding" }) |reserved| if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ProtectedHttpHeader;
         const value = entry.value_ptr.*;
         if (value != .string and value != .null) return error.InvalidHttpHookOutput;
@@ -207,6 +216,7 @@ test "HTTP overrides reject destination headers injection and invalid payload fi
     var headers: std.ArrayList(std.http.Header) = .empty;
     try std.testing.expectError(error.ProtectedHttpHeader, updateHeaders(a, &headers, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"Host\":\"evil\"}", .{})));
     try std.testing.expectError(error.ProtectedHttpHeader, updateHeaders(a, &headers, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"Accept-Encoding\":\"gzip\"}", .{})));
+    try std.testing.expectError(error.InvalidHttpHookOutput, updateHeaders(a, &headers, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"x:test\":\"value\"}", .{})));
     try std.testing.expectError(error.InvalidHttpHookOutput, updateHeaders(a, &headers, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"x-test\":\"a\\r\\nb\"}", .{})));
     const before = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"model\":\"local\"}", .{});
     const after = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"model\":\"remote\"}", .{});
