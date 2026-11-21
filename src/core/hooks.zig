@@ -1,7 +1,6 @@
 const std = @import("std");
 const ToolInput = @import("hook_tool_input.zig");
 const Filesystem = @import("../tools/filesystem.zig");
-const builtin = @import("builtin");
 const output = @import("hook_result.zig");
 const HooksCopy = @import("hooks_copy.zig");
 const HookCommand = @import("hook_command.zig");
@@ -15,8 +14,6 @@ const task = @import("../tools/task.zig");
 pub const Result = output.Result;
 pub const Permission = output.Permission;
 
-const stderr_limit: usize = 64 * 1024;
-const poll_slice_ms: u64 = 100;
 pub const default_timeout_ms: u64 = 30_000;
 pub const cleanup_timeout_ms: i64 = 3 * std.time.ms_per_s;
 pub const cleanup_handler_timeout_ms: u64 = std.time.ms_per_s;
@@ -43,10 +40,6 @@ const claude_tool_names = std.StaticStringMap([]const u8).initComptime(.{
 const max_timeout_ms: u64 = 86_400_000;
 const background_limit: usize = 64;
 const concurrent_limit = 8;
-const posix_signals = switch (builtin.os.tag) {
-    .windows, .wasi => false,
-    else => true,
-};
 
 pub const Event = enum {
     session_start,
@@ -955,9 +948,17 @@ pub const Runner = struct {
     }
 
     fn executeHook(self: Runner, allocator: std.mem.Allocator, hook: Hook, invocation: Invocation, exit_code: *?u8) !Result {
-        const command = if (hook.type == .command)
-            try self.runCommand(allocator, hook.command, invocation)
-        else blk: {
+        const command = if (hook.type == .command) blk: {
+            var payload: std.Io.Writer.Allocating = .init(allocator);
+            defer payload.deinit();
+            try writeJson(allocator, &payload.writer, self.root, invocation);
+            try payload.writer.writeByte('\n');
+            break :blk try HookCommand.run(self.io, allocator, .{
+                .root = self.root,
+                .timeout_ms = self.timeout_ms,
+                .stop = self.stop,
+            }, hook.command, payload.written());
+        } else blk: {
             const executor = self.mcp_executor orelse return error.McpHooksUnavailable;
             var arena: std.heap.ArenaAllocator = .init(allocator);
             defer arena.deinit();
@@ -969,7 +970,7 @@ pub const Runner = struct {
             const args = try std.json.Stringify.valueAlloc(arena.allocator(), expanded, .{});
             const response = try executor.call(executor.userdata, allocator, hook, args, self.timeout_ms, self.stop);
             errdefer allocator.free(response);
-            break :blk CommandResult{ .code = 0, .stdout = response, .stderr = try allocator.dupe(u8, ""), .overflow = response.len > stderr_limit };
+            break :blk HookCommand.Output{ .code = 0, .stdout = response, .stderr = try allocator.dupe(u8, ""), .overflow = response.len > HookCommand.output_limit };
         };
         exit_code.* = command.code;
         defer allocator.free(command.stderr);
@@ -1016,177 +1017,7 @@ pub const Runner = struct {
         }
         return result;
     }
-
-    const CommandResult = struct {
-        code: u8,
-        stderr: []u8,
-        stdout: []const u8,
-        overflow: bool,
-    };
-
-    fn runCommand(
-        self: Runner,
-        allocator: std.mem.Allocator,
-        command: []const u8,
-        invocation: Invocation,
-    ) !CommandResult {
-        var dir = try std.Io.Dir.cwd().openDir(self.io, self.root, .{});
-        defer dir.close(self.io);
-
-        var payload_writer: std.Io.Writer.Allocating = .init(allocator);
-        errdefer payload_writer.deinit();
-        try writeJson(allocator, &payload_writer.writer, self.root, invocation);
-        try payload_writer.writer.writeByte('\n');
-        const payload = try payload_writer.toOwnedSlice();
-        defer allocator.free(payload);
-
-        if (self.givenUp()) return error.Cancelled;
-        var command_arena: std.heap.ArenaAllocator = .init(allocator);
-        defer command_arena.deinit();
-        const environment = try HookCommand.environment(command_arena.allocator(), self.root);
-        const argv = [_][]const u8{ "env", "-u", "BASH_ENV" } ++ environment ++ [_][]const u8{ "bash", "-c", command };
-        var child = try std.process.spawn(self.io, .{
-            .argv = &argv,
-            .cwd = .{ .dir = dir },
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .pipe,
-            .pgid = if (posix_signals) 0 else null,
-        });
-        var reaped = false;
-        defer if (!reaped) killGroup(self.io, &child);
-
-        var input: InputWrite = .{ .io = self.io, .child = &child, .payload = payload };
-        var input_future = try self.io.concurrent(InputWrite.run, .{&input});
-        defer input_future.cancel(self.io);
-
-        const output_streams = [_]std.Io.File{ child.stderr.?, child.stdout.? };
-        var buffers: std.Io.File.MultiReader.Buffer(output_streams.len) = undefined;
-        var readers: std.Io.File.MultiReader = undefined;
-        readers.init(allocator, self.io, buffers.toStreams(), &output_streams);
-        defer readers.deinit();
-
-        const stderr_reader = readers.reader(0);
-        const stdout_reader = readers.reader(1);
-        var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
-        errdefer stdout_writer.deinit();
-        var overflow = false;
-        var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
-        errdefer stderr_writer.deinit();
-        const deadline = std.Io.Clock.now(.awake, self.io).toMilliseconds() + @as(i64, @intCast(self.timeout_ms));
-        var stderr_done = false;
-
-        while (!stderr_done or !input.done.isSet()) {
-            // Returning runs the `killGroup` defer, taking the whole group.
-            if (self.givenUp()) return error.Cancelled;
-            const left = deadline - std.Io.Clock.now(.awake, self.io).toMilliseconds();
-            if (left <= 0) return error.Timeout;
-            const slice = @min(poll_slice_ms, @as(u64, @intCast(left)));
-
-            if (stderr_done) {
-                input.done.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(slice)), .clock = .awake } }) catch |err| switch (err) {
-                    error.Timeout => {},
-                    else => return err,
-                };
-            } else {
-                readers.fill(64, .{ .duration = .{
-                    .raw = .fromMilliseconds(@intCast(slice)),
-                    .clock = .awake,
-                } }) catch |err| switch (err) {
-                    error.EndOfStream => stderr_done = true,
-                    error.Timeout => {},
-                    else => |other| return other,
-                };
-                const buffered = stderr_reader.buffered();
-                const remaining = stderr_limit - stderr_writer.written().len;
-                try stderr_writer.writer.writeAll(buffered[0..@min(buffered.len, remaining)]);
-                stderr_reader.tossBuffered();
-                const out_buffered = stdout_reader.buffered();
-                const out_remaining = stderr_limit - stdout_writer.written().len;
-                overflow = overflow or out_buffered.len > out_remaining;
-                try stdout_writer.writer.writeAll(out_buffered[0..@min(out_buffered.len, out_remaining)]);
-                stdout_reader.tossBuffered();
-            }
-        }
-
-        input_future.await(self.io);
-        try readers.checkAnyError();
-
-        const pid = child.id.?;
-        var waiter: ChildWait = .{ .io = self.io, .child = &child };
-        var wait_future = try self.io.concurrent(ChildWait.run, .{&waiter});
-        var cancelled = false;
-        while (!waiter.done.isSet()) {
-            const expired = deadline - std.Io.Clock.now(.awake, self.io).toMilliseconds() <= 0;
-            if (self.givenUp() or cancelled or expired) {
-                if (posix_signals) {
-                    std.posix.kill(-pid, .TERM) catch {};
-                    std.posix.kill(-pid, .KILL) catch {};
-                }
-                wait_future.await(self.io);
-                reaped = true;
-                if (expired) return error.Timeout;
-                return error.Cancelled;
-            }
-            const left = deadline - std.Io.Clock.now(.awake, self.io).toMilliseconds();
-            if (left <= 0) continue;
-            waiter.done.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@min(poll_slice_ms, @as(u64, @intCast(left))))), .clock = .awake } }) catch |err| switch (err) {
-                error.Timeout => {},
-                error.Canceled => cancelled = true,
-            };
-        }
-        wait_future.await(self.io);
-        reaped = true;
-        if (cancelled or self.givenUp()) return error.Cancelled;
-        const term = try waiter.term;
-        const stderr = try stderr_writer.toOwnedSlice();
-        errdefer allocator.free(stderr);
-        const code: u8 = switch (term) {
-            .exited => |value| value,
-            else => 1,
-        };
-        return .{ .code = code, .stderr = stderr, .stdout = try stdout_writer.toOwnedSlice(), .overflow = overflow };
-    }
 };
-
-const ChildWait = struct {
-    io: std.Io,
-    child: *std.process.Child,
-    term: std.process.Child.WaitError!std.process.Child.Term = undefined,
-    done: std.Io.Event = .unset,
-
-    fn run(self: *ChildWait) void {
-        self.term = self.child.wait(self.io);
-        self.done.set(self.io);
-    }
-};
-
-const InputWrite = struct {
-    io: std.Io,
-    child: *std.process.Child,
-    payload: []const u8,
-    done: std.Io.Event = .unset,
-
-    fn run(self: *InputWrite) void {
-        defer self.done.set(self.io);
-        defer {
-            if (self.child.stdin) |stdin| stdin.close(self.io);
-            self.child.stdin = null;
-        }
-
-        var buffer: [4096]u8 = undefined;
-        var writer = self.child.stdin.?.writer(self.io, &buffer);
-        writer.interface.writeAll(self.payload) catch return;
-        writer.interface.flush() catch return;
-    }
-};
-
-fn killGroup(io: std.Io, child: *std.process.Child) void {
-    const pid = child.id orelse return;
-    if (posix_signals) std.posix.kill(-pid, .TERM) catch {};
-    child.kill(io);
-    if (posix_signals) std.posix.kill(-pid, .KILL) catch {};
-}
 
 pub const Dispatch = struct {
     arena: std.heap.ArenaAllocator,
@@ -1418,7 +1249,7 @@ test "command and JSON hook denials share the default reason" {
 
 test "a hook with closed pipes still times out" {
     const testing = std.testing;
-    if (!posix_signals) return error.SkipZigTest;
+    if (!HookCommand.supports_process_groups) return error.SkipZigTest;
     const runner: Runner = .{
         .io = testing.io,
         .root = ".",
@@ -1432,7 +1263,7 @@ test "a hook with closed pipes still times out" {
 
 test "raising the stop flag ends a hook that would otherwise run on" {
     const testing = std.testing;
-    if (!posix_signals) return error.SkipZigTest;
+    if (!HookCommand.supports_process_groups) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1508,7 +1339,7 @@ test "large input and stderr cannot block each other" {
         .prompt = prompt,
     });
     defer result.deinit(testing.allocator);
-    try testing.expectEqual(stderr_limit + "[Hook config]\n".len, result.blocked.?.len);
+    try testing.expectEqual(HookCommand.output_limit + "[Hook config]\n".len, result.blocked.?.len);
 }
 
 test "oversized structured stdout is drained and rejected" {
@@ -1553,7 +1384,7 @@ test "protected-path example rejects equivalent paths and symlink targets" {
 }
 
 test "a deadline kills descendants before they can finish later work" {
-    if (!posix_signals) return error.SkipZigTest;
+    if (!HookCommand.supports_process_groups) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
