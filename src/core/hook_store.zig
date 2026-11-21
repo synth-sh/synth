@@ -80,7 +80,7 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
             if (!count.found_existing) count.value_ptr.* = 0;
             const source_path = try std.fs.path.resolve(arena, &.{ root, hook.source });
             const source_is_user = (if (user_source) |path| std.mem.eql(u8, path, hook.source) else false) or !paths.inside(root, source_path);
-            const user_hook = source_is_user and independentCommand(hook.command);
+            const user_hook = source_is_user and independentCommand(hook.command, home);
             var buffer: [hash_writer_buffer_bytes]u8 = undefined;
             var hash = std.Io.Writer.Hashing(Sha256).init(&buffer);
             try std.json.Stringify.value(.{ if (user_hook) "" else root, event.name(), count.value_ptr.*, hook.* }, .{}, &hash.writer);
@@ -181,19 +181,34 @@ fn protectedSystemExecutable(arena: std.mem.Allocator, io: std.Io, command_path:
     return false;
 }
 
-fn expandScriptPath(arena: std.mem.Allocator, root: []const u8, home: ?[]const u8, word: []const u8) ![]const u8 {
-    const path = std.mem.trim(u8, word, "\"'");
-    if (home) |dir| {
-        if (word[0] == '~') {
-            if (std.mem.cutPrefix(u8, path, "~/")) |relative| return std.fs.path.join(arena, &.{ dir, relative });
+const HomeReference = struct {
+    relative: []const u8,
+    unquoted_variable: bool = false,
+};
+
+fn homeReference(word: []const u8) ?HomeReference {
+    if (std.mem.cutPrefix(u8, word, "~/")) |relative| return .{ .relative = relative };
+    const quoted = word[0] == '"';
+    const expression = if (quoted) word[1..] else word;
+    for ([_][]const u8{ "$HOME", "${HOME}" }) |variable| {
+        const tail = std.mem.cutPrefix(u8, expression, variable) orelse continue;
+        if (quoted) {
+            if (std.mem.cutPrefix(u8, tail, "\"/")) |relative| return .{ .relative = relative };
+            const inside = std.mem.cutSuffix(u8, tail, "\"") orelse return null;
+            const relative = std.mem.cutPrefix(u8, inside, "/") orelse return null;
+            return .{ .relative = relative };
         }
-        if (word[0] != '\'') {
-            for ([_][]const u8{ "$HOME/", "${HOME}/", "$HOME\"/", "${HOME}\"/" }) |prefix| {
-                if (std.mem.cutPrefix(u8, path, prefix)) |relative| return std.fs.path.join(arena, &.{ dir, relative });
-            }
-        }
+        const relative = std.mem.cutPrefix(u8, tail, "/") orelse return null;
+        return .{ .relative = relative, .unquoted_variable = true };
     }
-    return HookCommand.expandDirectories(arena, path, root);
+    return null;
+}
+
+fn expandScriptPath(arena: std.mem.Allocator, root: []const u8, home: ?[]const u8, word: []const u8) ![]const u8 {
+    if (home) |dir| {
+        if (homeReference(word)) |reference| return std.fs.path.join(arena, &.{ dir, reference.relative });
+    }
+    return HookCommand.expandDirectories(arena, std.mem.trim(u8, word, "\"'"), root);
 }
 
 fn hashFile(io: std.Io, hasher: *Sha256, path: []const u8) !void {
@@ -216,18 +231,31 @@ fn hashUnreadableFile(hasher: *Sha256, path: []const u8) void {
     hasher.update("\x00");
 }
 
-fn independentCommand(command: []const u8) bool {
-    if (std.mem.indexOfAny(u8, command, ";&|<>()$`\\") != null) return false;
-    var words = std.mem.tokenizeAny(u8, command, " \t\r\n");
-    const program = std.mem.trim(u8, words.next() orelse return false, "\"'");
-    if (!std.fs.path.isAbsolute(program)) return false;
+fn independentCommand(command: []const u8, home: ?[]const u8) bool {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (std.mem.indexOfAny(u8, trimmed, ";&|<>()`\\\r\n") != null) return false;
+    var words = std.mem.tokenizeAny(u8, trimmed, " \t");
+    if (!independentWord(words.next() orelse return false, home, false)) return false;
     while (words.next()) |word| {
-        const value = std.mem.trim(u8, word, "\"'");
-        if (std.fs.path.isAbsolute(value)) continue;
-        const plain_option = std.mem.startsWith(u8, value, "-") and std.mem.indexOfAny(u8, value, "=/\\$`\"'") == null;
-        if (!plain_option) return false;
+        if (!independentWord(word, home, true)) return false;
     }
     return true;
+}
+
+fn independentWord(word: []const u8, home: ?[]const u8, allow_option: bool) bool {
+    if (homeReference(word)) |reference| {
+        const dir = home orelse return false;
+        if (!std.fs.path.isAbsolute(dir)) return false;
+        if (reference.unquoted_variable and std.mem.indexOfAny(u8, dir, " \t\r\n*?[") != null) return false;
+        return std.mem.indexOfAny(u8, reference.relative, "$\"'*?[]{}") == null;
+    }
+    const quote = word[0];
+    const quoted = quote == '\'' or quote == '"';
+    if (quoted and (word.len < 2 or word[word.len - 1] != quote)) return false;
+    const value = if (quoted) word[1 .. word.len - 1] else word;
+    if (std.mem.indexOfAny(u8, value, "$\"'*?[]{}") != null) return false;
+    if (std.fs.path.isAbsolute(value)) return true;
+    return allow_option and std.mem.startsWith(u8, value, "-") and std.mem.indexOfAny(u8, value, "=/") == null;
 }
 
 fn loadFile(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: []const u8) !void {
@@ -493,19 +521,43 @@ pub fn report(allocator: std.mem.Allocator, set: Hooks.Set, timeout_ms: u64, rev
     return @import("ansi.zig").clean(allocator, raw);
 }
 
-test "relative user commands cannot reuse another checkout's trust" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+test "user hooks share trust across checkouts for fixed home paths" {
+    const testing = std.testing;
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".synth");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".synth/hooks.json", .data = "{\"PreToolUse\":[{\"hooks\":[{\"command\":\"bash ./guard.sh\"}]}]}" });
-    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    var store = try Store.init(std.testing.allocator, std.testing.io, null);
+    try tmp.dir.createDirPath(io, "home/.synth");
+    try tmp.dir.createDirPath(io, "one");
+    try tmp.dir.createDirPath(io, "two");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.synth/hooks.json", .data =
+        \\{"PreToolUse":[{"hooks":[
+        \\  {"command":"/bin/sh \"$HOME/.synth/guard.sh\""},
+        \\  {"command":"/bin/sh \"${HOME}\"/.synth/guard.sh"},
+        \\  {"command":"~/.synth/guard.sh"},
+        \\  {"command":"/bin/sh ./guard.sh"},
+        \\  {"command":"bash \"$HOME/.synth/guard.sh\""},
+        \\  {"command":"/bin/sh '$HOME/.synth/guard.sh'"},
+        \\  {"command":"/bin/sh \"$HOME/.synth/guard.sh\"\n/bin/sh ./guard.sh"}
+        \\]}]}
+    });
+    const guard = "home/.synth/guard.sh";
+    try tmp.dir.writeFile(io, .{ .sub_path = guard, .data = "exit 0" });
+    const home = try tmp.dir.realPathFileAlloc(io, "home", a);
+    const one = try tmp.dir.realPathFileAlloc(io, "one", a);
+    const two = try tmp.dir.realPathFileAlloc(io, "two", a);
+    var store = try Store.init(testing.allocator, io, null);
     defer store.deinit();
-    const first = try discover(a, std.testing.io, .{}, "/checkout-one", home, store);
-    try store.put(first.pre_tool_use[0].id, .{ .trusted = true });
-    const next = try discover(a, std.testing.io, .{}, "/checkout-two", home, store);
-    try std.testing.expect(!next.pre_tool_use[0].trusted);
+
+    const first = try discover(a, io, .{}, one, home, store);
+    for (first.pre_tool_use) |hook| try store.put(hook.id, .{ .trusted = true });
+    const second = try discover(a, io, .{}, two, home, store);
+    const shared = [_]bool{ true, true, true, false, false, false, false };
+    for (second.pre_tool_use, &shared) |hook, expected| try testing.expectEqual(expected, hook.trusted);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = guard, .data = "exit 2" });
+    const changed = try discover(a, io, .{}, two, home, store);
+    for (changed.pre_tool_use) |hook| try testing.expect(!hook.trusted);
 }

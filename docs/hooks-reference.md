@@ -757,8 +757,9 @@ when you run `/hooks review` while idle. Editing a declaration or a tracked
 script gives the changed hook a different ID. An ID with no saved state
 starts enabled and untrusted, with its own review or disable decision.
 
-Project hook IDs are scoped to the checkout. User hooks with an absolute
-executable and absolute file arguments can share trust across checkouts.
+Project hook IDs are scoped to the checkout. A user hook can share trust
+across checkouts for a simple command with absolute or home-relative paths,
+such as `/usr/bin/python3 "$HOME/.synth/guard.py"`.
 
 #### What happens pending review
 
