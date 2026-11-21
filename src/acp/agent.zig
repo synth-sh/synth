@@ -1643,6 +1643,7 @@ const Session = struct {
         } else |_| {}
         _ = self.stack.runner.poll() catch |err| self.notice(.@"error", "Subagent failed: {s}", .{@errorName(err)});
         _ = loop.poll() catch |err| self.notice(.@"error", "The turn failed: {s}", .{@errorName(err)});
+        _ = self.stack.titler.poll(loop) catch |err| self.notice(.warning, "Could not name the session: {s}", .{@errorName(err)});
 
         if (loop.takeHookNotice()) |text| {
             defer self.allocator.free(text);

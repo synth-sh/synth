@@ -25,6 +25,7 @@ const web = @import("../tools/web.zig");
 const agents = @import("agent.zig");
 const Loop = @import("loop.zig");
 const subagent = @import("subagent.zig");
+const Titler = @import("titler.zig");
 
 const Stack = @This();
 
@@ -40,6 +41,7 @@ reads: tool.ReadLog,
 convo: Conversation,
 hooks: Hooks.Runner,
 runner: subagent.Runner,
+titler: Titler,
 loop: Loop,
 
 pub const Options = struct {
@@ -108,7 +110,9 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.loop = .init(allocator, io, options.provider, &self.registry, &self.convo, &self.reads, self.project.root);
     self.runner = .{ .parent = &self.loop, .backend = options.backend };
     self.loop.delegate = self.runner.delegate();
+    self.titler = .{ .allocator = allocator, .io = io, .backend = options.backend };
     errdefer {
+        self.titler.deinit();
         self.loop.deinit();
         self.runner.deinit();
     }
@@ -158,6 +162,7 @@ fn named(servers: []const mcp_tools.Server, name: []const u8) bool {
 
 pub fn destroy(self: *Stack) void {
     // Ordered: the loop joins workers writing to the runner; MCP tools point into the host.
+    self.titler.deinit();
     self.loop.deinit();
     self.runner.deinit();
     self.convo.deinit();
