@@ -415,8 +415,8 @@ fn validateDefinition(value: std.json.Value, source: []const u8) !void {
             continue;
         };
         const allowed = switch (field) {
-            .type, .timeout_ms, .timeout, .async, .stream, .transcript, .onFailure => true,
-            .command => kind == .command,
+            .type, .timeout_ms, .timeout, .async, .stream, .transcript => true,
+            .command, .onFailure => kind == .command,
             .server, .tool, .arguments => kind == .mcp_tool,
         };
         if (!allowed) return error.InvalidHookDefinition;
@@ -1475,6 +1475,18 @@ test "upstream hook files load: wrapper, unknown events and keys, input on MCP h
     const set = try parse(a, parsed, "hooks.json");
     try std.testing.expectEqual(@as(usize, 2), set.pre_tool_use.len);
     try std.testing.expect(set.pre_tool_use[1].arguments == .object);
+}
+
+test "MCP hook declarations reject command exit-code overrides" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source =
+        \\{"PreToolUse":[{"hooks":[{"type":"mcp_tool","server":"s","tool":"t","arguments":{},"onFailure":"continue"}]}]}
+    ;
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{});
+    try testing.expectError(error.InvalidHookDefinition, parse(a, parsed, "hooks.json"));
 }
 
 test "a flat hook definition from the old format says how to group it" {

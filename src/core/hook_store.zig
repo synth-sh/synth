@@ -4,11 +4,14 @@ const HookCommand = @import("hook_command.zig");
 const Config = @import("config.zig");
 const paths = @import("paths.zig");
 const SlashCommand = @import("slash_command.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const max_trust_store_bytes = 1024 * 1024;
 const max_hook_file_bytes = 64 * 1024;
 const store_writer_buffer_bytes = 4 * 1024;
 const hash_writer_buffer_bytes = 512;
+const script_hash_buffer_bytes = 4 * 1024;
+const unreadable_file_marker = "\x00\x00unreadable\x00";
 const min_trust_id_chars: usize = 32;
 const min_revoke_id_chars: usize = 8;
 const record_id_padding = "\x00";
@@ -74,10 +77,10 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
             const source_is_user = (if (user_source) |path| std.mem.eql(u8, path, hook.source) else false) or !paths.inside(root, source_path);
             const user_hook = source_is_user and independentCommand(hook.command);
             var buffer: [hash_writer_buffer_bytes]u8 = undefined;
-            var hash = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&buffer);
+            var hash = std.Io.Writer.Hashing(Sha256).init(&buffer);
             try std.json.Stringify.value(.{ if (user_hook) "" else root, event.name(), count.value_ptr.*, hook.* }, .{}, &hash.writer);
-            try hashScripts(arena, io, &hash.writer, root, hook.command);
             try hash.writer.flush();
+            try hashScripts(arena, io, &hash.hasher, root, hook.command);
             hook.id = try arena.dupe(u8, &std.fmt.bytesToHex(hash.hasher.finalResult(), .lower));
             count.value_ptr.* += 1;
             const state = store.get(hook.id);
@@ -89,18 +92,42 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
     return set;
 }
 
-const max_script_bytes = 1024 * 1024;
-
-fn hashScripts(arena: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, root: []const u8, command: []const u8) !void {
+fn hashScripts(arena: std.mem.Allocator, io: std.Io, hasher: *Sha256, root: []const u8, command: []const u8) !void {
     var words = std.mem.tokenizeAny(u8, command, " \t\r\n;&|<>()");
     while (words.next()) |word| {
         const expanded = try HookCommand.expandDirectories(arena, std.mem.trim(u8, word, "\"'"), root);
         if (expanded.len == 0 or expanded[0] == '-') continue;
         const path = try std.fs.path.resolve(arena, &.{ root, expanded });
-        const content = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_script_bytes)) catch continue;
-        try writer.print("\x00{s}\x00", .{path});
-        try writer.writeAll(content);
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue,
+            else => {
+                hashUnreadableFile(hasher, path);
+                continue;
+            },
+        };
+        if (stat.kind != .file) continue;
+        hashFile(io, hasher, path) catch hashUnreadableFile(hasher, path);
     }
+}
+
+fn hashFile(io: std.Io, hasher: *Sha256, path: []const u8) !void {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false });
+    defer file.close(io);
+    if ((try file.stat(io)).kind != .file) return error.InvalidHookFile;
+
+    var buffer: [script_hash_buffer_bytes]u8 = undefined;
+    var reader = file.reader(io, &.{});
+    var next = std.Io.Writer.Hashing(Sha256).initHasher(hasher.*, &buffer);
+    try next.writer.print("\x00{s}\x00", .{path});
+    _ = try reader.interface.streamRemaining(&next.writer);
+    try next.writer.flush();
+    hasher.* = next.hasher;
+}
+
+fn hashUnreadableFile(hasher: *Sha256, path: []const u8) void {
+    hasher.update(unreadable_file_marker);
+    hasher.update(path);
+    hasher.update("\x00");
 }
 
 fn independentCommand(command: []const u8) bool {
@@ -182,6 +209,33 @@ test "rewriting a script a hook runs makes the hook untrusted" {
         const rewritten = try discover(a, std.testing.io, set, root, null, store);
         try std.testing.expect(!rewritten.pre_tool_use[0].trusted);
     }
+}
+
+test "rewriting the end of a large hook script invalidates trust" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const script_path = "large.sh";
+    const script_bytes = 2 * 1024 * 1024;
+    const script = try a.alloc(u8, script_bytes);
+    @memset(script, '\n');
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = script_path, .data = script });
+    var store = try Store.init(testing.allocator, testing.io, null);
+    defer store.deinit();
+    const set: Hooks.Set = .{ .pre_tool_use = &.{.{ .command = "sh ./" ++ script_path }} };
+    const original = try discover(a, testing.io, set, root, null, store);
+    try store.put(original.pre_tool_use[0].id, .{ .trusted = true });
+    const unchanged = try discover(a, testing.io, set, root, null, store);
+    try testing.expect(unchanged.pre_tool_use[0].trusted);
+
+    script[script.len - 1] = '#';
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = script_path, .data = script });
+    const changed = try discover(a, testing.io, set, root, null, store);
+    try testing.expect(!changed.pre_tool_use[0].trusted);
 }
 
 pub const Command = struct { action: Action, id: []const u8 };

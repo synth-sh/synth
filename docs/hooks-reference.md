@@ -222,7 +222,7 @@ matching examples.
 | `type` | `command` (default) or `mcp_tool`. |
 | `timeout_ms` / `timeout` | One per handler. Integer milliseconds or integer seconds, respectively. |
 | `transcript` | With `true`, request a private JSONL transcript snapshot. Read the temporary path from `transcript_path`. |
-| `onFailure` | `block` or `continue` for a command exit status other than 0 or 2. See [exit code output](#exit-code-output). |
+| `onFailure` | Command hooks only. `block` or `continue` for an exit status other than 0 or 2. See [exit code output](#exit-code-output). |
 | `async` | With `true`, run a command in the background where supported. |
 | `stream` | With `true` on `HttpResponse`, also handle decoded stream records. |
 
@@ -301,10 +301,12 @@ Commands receive one JSON object on stdin. An abbreviated `PreToolUse` payload f
 ```
 
 Use `session_id`, `turn_id`, `agent_id`, and `tool_call_id` to correlate
-events. `tool_use_id` aliases `tool_call_id`. Event-specific JSON encoded as
-strings, such as `action`, `request_context`, and `http`, needs a second
-decode. `tool_input` is already an object and `tool_calls` on
-`PostToolBatch` is already an array.
+events. `tool_use_id` aliases `tool_call_id`. In `tool_name`, `bash`, `read`,
+`write`, `edit`, and `task` appear as `Bash`, `Read`, `Write`, `Edit`, and
+`Agent`, respectively. Other tools keep their registered names.
+Event-specific JSON encoded as strings, such as `action`, `request_context`,
+and `http`, needs a second decode. `tool_input` is already an object and
+`tool_calls` on `PostToolBatch` is already an array.
 
 ### Exit code output
 
@@ -735,9 +737,10 @@ it disabled. Enabling an untrusted hook still leaves it pending review.
 
 #### What the hook ID covers
 
-The ID includes the hook declaration and the contents of readable files
-Synth can resolve directly from its command, up to 1 MiB per file. Review
-indirect script dependencies and MCP server implementations separately.
+The ID includes the hook declaration and the contents of regular files Synth
+can resolve directly from its command. For unreadable file references, the ID
+tracks the path and read failure. A change in readability requires review.
+Review indirect script dependencies and MCP server implementations separately.
 
 Synth recomputes IDs when it reloads hooks, such as at the next prompt or
 when you run `/hooks review` while idle. Editing a declaration or a tracked
