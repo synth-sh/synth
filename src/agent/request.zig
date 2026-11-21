@@ -4,6 +4,7 @@ const std = @import("std");
 
 const Provider = @import("../provider/provider.zig");
 const Conversation = @import("../core/conversation.zig");
+const Hooks = @import("../core/hooks.zig");
 const Thought = @import("thought.zig");
 const tool = @import("../tools/tool.zig");
 
@@ -28,10 +29,7 @@ attempt_number: std.atomic.Value(u32) = .init(0),
 thoughts: Thought.Stream,
 /// The answer as it arrives, for the UI to render before the turn lands.
 content: Thought.Stream,
-display_pending: std.ArrayList(u8) = .empty,
-display_index: usize = 0,
-display_bytes: usize = 0,
-display_failed: bool = false,
+display: Display = .{},
 display_id: [display_id_bytes]u8 = @splat(0),
 display_id_len: usize = 0,
 
@@ -50,6 +48,18 @@ progress_ms: std.atomic.Value(i64) = .init(0),
 /// Allocated with `allocator`; ownership passes to whoever calls `join`.
 reply: ?Provider.Reply = null,
 failed: ?anyerror = null,
+
+const Display = struct {
+    mutex: std.Io.Mutex = .init,
+    ready: std.Io.Condition = .init,
+    pending: std.ArrayList(u8) = .empty,
+    tail: std.ArrayList(u8) = .empty,
+    input: ?Hooks.Invocation = null,
+    worker: ?std.Io.Future(void) = null,
+    checked: bool = false,
+    closed: bool = false,
+    failed: bool = false,
+};
 
 /// Spawn the worker. The returned request is owned by the caller, which must
 /// eventually call `join` or `cancel`, then `destroy`.
@@ -162,7 +172,8 @@ pub fn destroy(self: *Request) void {
     const allocator = self.allocator;
     self.thoughts.deinit();
     self.content.deinit();
-    self.display_pending.deinit(allocator);
+    self.display.pending.deinit(allocator);
+    self.display.tail.deinit(allocator);
     if (self.reply) |*reply| reply.deinit(allocator);
     if (self.turn.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(self.turn.hook_input.transcript_path);
     self.freeTurn();
@@ -246,55 +257,88 @@ fn onThinking(ptr: *anyopaque, bytes: []const u8) void {
 fn onText(ptr: *anyopaque, bytes: []const u8) void {
     const self: *Request = @ptrCast(@alignCast(ptr));
     self.markProgress();
-    if (!self.displaysHooks()) {
-        self.content.append(bytes);
-        return;
+    if (bytes.len == 0) return;
+    if (!self.display.checked) {
+        self.display.checked = true;
+        self.display.input = self.displayInvocation() catch null;
+        if (self.display.input != null and self.turn.stream_display) {
+            self.display.worker = self.io.concurrent(renderDisplay, .{self}) catch null;
+        }
     }
-    self.display_bytes += bytes.len;
-    if (!self.turn.stream_display) return;
-    if (self.display_failed) {
+    if (self.display.input == null) {
         self.content.append(bytes);
-        return;
-    }
-    self.display_pending.appendSlice(self.allocator, bytes) catch {
-        self.content.append(self.display_pending.items);
-        self.display_pending.clearRetainingCapacity();
-        self.content.append(bytes);
-        self.display_failed = true;
-        return;
-    };
-    if (std.mem.lastIndexOfScalar(u8, self.display_pending.items, '\n')) |last| {
-        self.displayBatch(self.display_pending.items[0 .. last + 1], false);
-        const remaining = self.display_pending.items.len - last - 1;
-        std.mem.copyForwards(u8, self.display_pending.items[0..remaining], self.display_pending.items[last + 1 ..]);
-        self.display_pending.shrinkRetainingCapacity(remaining);
+    } else if (self.display.worker != null and !self.display.failed) {
+        self.queueDisplay(bytes) catch {
+            self.display.failed = true;
+        };
     }
 }
 
 pub fn displaysHooks(self: *const Request) bool {
-    if (!self.turn.display_messages) return false;
-    const runner = self.turn.hooks orelse return false;
-    var input = self.turn.hook_input;
-    input.event = .message_display;
-    const current = self.provider.current();
-    input.model = current.model;
-    input.provider = if (current.name.len > 0) current.name else self.provider.name;
-    return runner.hasMatching(self.allocator, input, true);
+    return self.display.input != null and !self.display.failed;
 }
 
-fn displayBatch(self: *Request, delta: []const u8, final: bool) void {
-    var runner = self.turn.hooks.?.*;
-    runner.stop = &self.stop;
+fn displayInvocation(self: *Request) !?Hooks.Invocation {
+    if (!self.turn.display_messages) return null;
+    const runner = self.turn.hooks orelse return null;
     var input = self.turn.hook_input;
     input.event = .message_display;
     const current = self.provider.current();
     input.model = current.model;
     input.provider = if (current.name.len > 0) current.name else self.provider.name;
+    if (!runner.hasMatching(self.allocator, input, true)) return null;
+    const a = self.hook_arena.allocator();
+    input.model = try a.dupe(u8, input.model);
+    input.provider = try a.dupe(u8, input.provider);
     input.message_id = self.display_id[0..self.display_id_len];
-    input.index = self.display_index;
+    return input;
+}
+
+fn queueDisplay(self: *Request, bytes: []const u8) !void {
+    const display = &self.display;
+    const last = std.mem.lastIndexOfScalar(u8, bytes, '\n') orelse return display.tail.appendSlice(self.allocator, bytes);
+    const end = last + 1;
+    try display.tail.ensureTotalCapacity(self.allocator, bytes.len - end);
+    {
+        display.mutex.lockUncancelable(self.io);
+        defer display.mutex.unlock(self.io);
+        try display.pending.ensureUnusedCapacity(self.allocator, display.tail.items.len + end);
+        display.pending.appendSliceAssumeCapacity(display.tail.items);
+        display.pending.appendSliceAssumeCapacity(bytes[0..end]);
+        display.ready.signal(self.io);
+    }
+    display.tail.clearRetainingCapacity();
+    display.tail.appendSliceAssumeCapacity(bytes[end..]);
+}
+
+fn renderDisplay(self: *Request) void {
+    const display = &self.display;
+    var batch: std.ArrayList(u8) = .empty;
+    defer batch.deinit(self.allocator);
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        display.mutex.lockUncancelable(self.io);
+        while (display.pending.items.len == 0 and !display.closed) display.ready.waitUncancelable(self.io, &display.mutex);
+        const final = display.pending.items.len == 0;
+        std.mem.swap(std.ArrayList(u8), &display.pending, &batch);
+        display.mutex.unlock(self.io);
+
+        if (final) {
+            if (!display.failed) self.displayBatch(display.tail.items, index, true);
+            return;
+        }
+        self.displayBatch(batch.items, index, false);
+        batch.clearRetainingCapacity();
+    }
+}
+
+fn displayBatch(self: *Request, delta: []const u8, index: usize, final: bool) void {
+    var runner = self.turn.hooks.?.*;
+    runner.stop = &self.stop;
+    var input = self.display.input.?;
+    input.index = index;
     input.final = final;
     input.delta = delta;
-    self.display_index += 1;
     var result = runner.evaluate(self.allocator, input) catch {
         self.content.append(delta);
         return;
@@ -304,11 +348,18 @@ fn displayBatch(self: *Request, delta: []const u8, final: bool) void {
 }
 
 fn finishDisplay(self: *Request) void {
-    if (!self.displaysHooks() or self.display_failed) return;
-    const text = if (self.reply) |reply| reply.text else "";
-    if (!self.turn.stream_display or self.display_bytes == 0) {
-        if (text.len > 0) self.displayBatch(text, true);
-    } else self.displayBatch(self.display_pending.items, true);
+    const display = &self.display;
+    if (display.worker) |*worker| {
+        display.mutex.lockUncancelable(self.io);
+        display.closed = true;
+        display.ready.signal(self.io);
+        display.mutex.unlock(self.io);
+        worker.await(self.io);
+        return;
+    }
+    const text = if (self.reply) |reply| reply.text else return;
+    if (!display.checked) display.input = self.displayInvocation() catch null;
+    if (display.input != null and text.len > 0) self.displayBatch(text, 0, true);
 }
 
 /// Worker thread. Says the connection is still delivering.
@@ -328,10 +379,68 @@ fn stopped(ptr: *anyopaque) bool {
     return self.stop.load(.acquire);
 }
 
+test "display hooks preserve batch order while the provider keeps reading" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Fake = struct {
+        started: std.Io.Event = .unset,
+        received: std.Io.Event = .unset,
+
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } };
+
+        fn respond(ptr: *anyopaque, _: *Conversation, _: Provider.Turn, allocator: std.mem.Allocator, maybe_sink: ?Provider.Sink) !Provider.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const sink = maybe_sink.?;
+            sink.onText(sink.userdata, "first\npar");
+            try self.started.waitTimeout(io, timeout);
+            sink.onText(sink.userdata, "tial\nlast");
+            self.received.set(io);
+            return .{ .text = try allocator.dupe(u8, "first\npartial\nlast") };
+        }
+
+        fn transform(ptr: *anyopaque, allocator: std.mem.Allocator, _: Hooks.Hook, args: []const u8, _: u64, _: ?*const std.atomic.Value(bool)) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const parsed = try std.json.parseFromSlice(struct { index: usize, delta: []const u8, final: bool }, allocator, args, .{});
+            defer parsed.deinit();
+            const indices = [_][]const u8{ "first\n", "partial\n", "last" };
+            try std.testing.expect(parsed.value.index < indices.len);
+            try std.testing.expectEqualStrings(indices[parsed.value.index], parsed.value.delta);
+            try std.testing.expectEqual(parsed.value.index == indices.len - 1, parsed.value.final);
+            if (parsed.value.index == 0) {
+                self.started.set(io);
+                try self.received.waitTimeout(io, timeout);
+            }
+            return std.fmt.allocPrint(allocator, "{{\"hookSpecificOutput\":{{\"hookEventName\":\"MessageDisplay\",\"displayContent\":\"[{d}]\"}}}}", .{parsed.value.index});
+        }
+    };
+    var fake: Fake = .{};
+    const arguments = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"index":"${index}","delta":"${delta}","final":"${final}"}
+    , .{});
+    defer arguments.deinit();
+    const handlers = [_]Hooks.Hook{.{ .type = .mcp_tool, .arguments = arguments.value }};
+    const runner: Hooks.Runner = .{
+        .io = io,
+        .root = ".",
+        .set = .{ .message_display = &handlers },
+        .mcp_executor = .{ .userdata = &fake, .call = Fake.transform },
+    };
+    var convo = Conversation.init(a);
+    defer convo.deinit();
+    const provider: Provider = .{ .userdata = &fake, .name = "fake", .respond = Fake.respond };
+    const request = try start(a, io, provider, &convo, .{ .system = "test", .hooks = &runner, .display_messages = true, .stream_display = true });
+    defer request.destroy();
+    request.join();
+    if (request.failed) |err| return err;
+    try std.testing.expectEqualStrings("first\npartial\nlast", request.reply.?.text);
+    const shown = try request.content.snapshot(a);
+    defer a.free(shown);
+    try std.testing.expectEqualStrings("[0][1][2]", shown);
+}
+
 test "context edits preserve reference history and cannot rewrite reviewer evidence" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const Hooks = @import("../core/hooks.zig");
     const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{ .model_context = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelContext\",\"contextEdits\":[{\"seq\":42,\"text\":\"prepared\"}]}}'" }} } };
     const Fake = struct {
         fn respond(_: *anyopaque, convo: *Conversation, _: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
@@ -362,7 +471,6 @@ test "context edits preserve reference history and cannot rewrite reviewer evide
 test "request settings and retry hooks enforce bounds before transport" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const Hooks = @import("../core/hooks.zig");
     const runner: Hooks.Runner = .{ .io = io, .root = ".", .set = .{
         .model_settings = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelSettings\",\"settings\":{\"temperature\":0.25,\"max_output_tokens\":128,\"attempts\":2}}}'" }},
         .model_retry = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"ModelRetry\",\"retryDelayMs\":7}}'" }},

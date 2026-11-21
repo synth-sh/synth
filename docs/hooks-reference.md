@@ -375,7 +375,8 @@ Exit 2 or `decision: "block"` rejects the expansion.
 
 Receives `message_id`, `index`, `delta`, and `final`. Return
 `displayContent` to replace this display batch while the model retains
-the original text.
+the original text. Slow hooks can delay rendered text while Synth keeps
+reading the response. Complete lines waiting to be displayed can share a batch.
 
 ### PreToolUse
 
