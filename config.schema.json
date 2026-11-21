@@ -336,7 +336,7 @@
                 "matcher": {
                     "type": "string",
                     "default": "",
-                    "description": "Event matcher: tool aliases and documented event fields; FileChanged uses literal project-relative paths."
+                    "description": "Matches exact names, pipe-separated names, or a regular expression against the event field. FileChanged uses literal project-relative paths."
                 },
                 "hooks": {
                     "type": "array",

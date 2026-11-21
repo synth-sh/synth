@@ -178,9 +178,13 @@ such as `{"command": "..."}` in a group as `{"hooks": [{"command": "..."}]}`.
 
 ### Matcher patterns
 
-Use a regular expression like `^(write|edit)$`. Omit `matcher`, or use `""`
-or `"*"`, to match every value for regex-based events. `FileChanged` needs
-explicit paths to watch. Events outside this table ignore the matcher.
+| Pattern | Matches |
+| --- | --- |
+| Omitted, `""`, or `"*"` | Every value. `FileChanged` needs explicit paths to watch. |
+| `edit`, `write\|edit`, `code-reviewer` | Exact names. Use letters, digits, `_`, or `-`, with `\|` between alternatives. |
+| `^mcp__docs__.*` | A regular expression. Use `^` and `$` when it should match the whole value. |
+
+Events outside the table below ignore the matcher.
 
 | Events | Matcher value |
 | --- | --- |
@@ -197,7 +201,7 @@ explicit paths to watch. Events outside this table ignore the matcher.
 
 Tool matchers accept both Synth names and the aliases `Bash`, `Read`,
 `Write`, `Edit`, and `Agent` for `task`. For an MCP tool, match the
-registered name, such as `^mcp__docs__lookup$`.
+registered name, such as `mcp__docs__lookup`.
 
 #### Filter by agent, request purpose, or model
 

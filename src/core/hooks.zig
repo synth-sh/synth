@@ -385,8 +385,8 @@ fn parseHandler(a: std.mem.Allocator, definition: std.json.Value, declaration: D
     if (hook.async and (declaration.event.requestStage() or declaration.event == .permission_evaluate)) return error.InvalidHookAsync;
     if (hook.async and declaration.event == .session_end) return error.AsyncSessionEndHookUnsupported;
     if (hook.timeout_ms) |ms| try validTimeout(ms);
-    const has_pattern = declaration.event.matcherValue(.{ .event = declaration.event }) != null and declaration.event != .file_changed and hook.matcher.len > 0 and !std.mem.eql(u8, hook.matcher, "*");
-    if (has_pattern) {
+    const uses_regex = declaration.event != .file_changed and !isExactMatcher(hook.matcher) and !std.mem.eql(u8, hook.matcher, "*");
+    if (uses_regex and declaration.event.matcherValue(.{ .event = declaration.event }) != null) {
         var compiled = try compileMatcher(a, hook.matcher);
         compiled.deinit();
     }
@@ -1101,6 +1101,25 @@ pub const Dispatch = struct {
     }
 };
 
+fn isExactMatcher(pattern: []const u8) bool {
+    for (pattern) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '|' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn matchesExact(pattern: []const u8, value: []const u8, alias: ?[]const u8) bool {
+    var names = std.mem.tokenizeScalar(u8, pattern, '|');
+    while (names.next()) |name| {
+        if (std.mem.eql(u8, name, value)) return true;
+        if (alias) |alias_name| if (std.mem.eql(u8, name, alias_name)) return true;
+    }
+    return false;
+}
+
 fn compileMatcher(allocator: std.mem.Allocator, pattern: []const u8) !regex.Regex {
     if (std.mem.indexOf(u8, pattern, "(?") != null) return error.UnsupportedHookRegex;
     var index: usize = 0;
@@ -1120,17 +1139,15 @@ fn hookMatches(allocator: std.mem.Allocator, root: []const u8, hook: Hook, invoc
     if (invocation.event == .file_changed) {
         const directory = std.mem.trimEnd(u8, root, "/");
         if (value.len <= directory.len or !std.mem.startsWith(u8, value, directory) or value[directory.len] != '/') return false;
-        const relative = value[directory.len + 1 ..];
-        var names = std.mem.tokenizeScalar(u8, hook.matcher, '|');
-        while (names.next()) |name| if (std.mem.eql(u8, relative, name)) return true;
-        return false;
+        return matchesExact(hook.matcher, value[directory.len + 1 ..], null);
     }
+    const alias = if (invocation.event.toolMatcher()) claude_tool_names.get(value) else null;
+    if (isExactMatcher(hook.matcher)) return matchesExact(hook.matcher, value, alias);
     var compiled = try compileMatcher(allocator, hook.matcher);
     defer compiled.deinit();
     if (try compiled.checkedMatches(value)) return true;
-    if (!invocation.event.toolMatcher()) return false;
-    const alias = claude_tool_names.get(value) orelse return false;
-    return compiled.checkedMatches(alias);
+    if (alias) |alias_name| return compiled.checkedMatches(alias_name);
+    return false;
 }
 
 fn writeJson(
@@ -1305,17 +1322,25 @@ const StopAfter = struct {
     }
 };
 
-test "a matcher leaves other tools alone" {
+test "plain matchers select exact tool names and aliases" {
     const testing = std.testing;
-    const hook = Hook{ .matcher = "write", .command = "exit 2" };
-    const runner: Runner = .{
-        .io = testing.io,
-        .root = ".",
-        .set = .{ .pre_tool_use = &.{hook} },
+    const cases = [_]struct { matcher: []const u8, tool_name: []const u8, matched: bool }{
+        .{ .matcher = "edit", .tool_name = "edit", .matched = true },
+        .{ .matcher = "edit", .tool_name = "mcp__x__edit_file", .matched = false },
+        .{ .matcher = "Edit|Write", .tool_name = "edit", .matched = true },
+        .{ .matcher = "Edit|Write", .tool_name = "write", .matched = true },
+        .{ .matcher = "Edit|Write", .tool_name = "read", .matched = false },
+        .{ .matcher = "mcp__x__edit_file", .tool_name = "mcp__x__edit_file_extra", .matched = false },
+        .{ .matcher = "mcp__example-server__edit_file", .tool_name = "mcp__example-server__edit_file_extra", .matched = false },
+        .{ .matcher = ".*edit.*", .tool_name = "mcp__x__edit_file", .matched = true },
+        .{ .matcher = "^Edit$", .tool_name = "edit", .matched = true },
     };
-    var result = try runner.evaluate(testing.allocator, .{ .event = .pre_tool_use, .tool_name = "read" });
-    defer result.deinit(testing.allocator);
-    try testing.expect(result.blocked == null);
+    for (cases) |case| {
+        const runner: Runner = .{ .io = testing.io, .root = ".", .set = .{ .pre_tool_use = &.{.{ .matcher = case.matcher, .command = "exit 2" }} } };
+        var result = try runner.evaluate(testing.allocator, .{ .event = .pre_tool_use, .tool_name = case.tool_name });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(case.matched, result.blocked != null);
+    }
 }
 
 test "large input and stderr cannot block each other" {
