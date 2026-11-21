@@ -1,18 +1,20 @@
 const std = @import("std");
 
 pub const Trust = enum { local, private, hosted };
-pub const Tier = enum { small, mid, frontier };
+pub const Tier = enum { unknown, small, mid, frontier };
+
+const default_tier: Tier = .mid;
 
 pub const Class = struct {
     model: []const u8,
     provider: ?[]const u8 = null,
     trust: Trust = .hosted,
-    tier: Tier = .small,
+    tier: Tier = default_tier,
 };
 
 pub const Resolved = struct {
     trust: Trust = .hosted,
-    tier: Tier = .small,
+    tier: Tier = default_tier,
 };
 
 pub fn resolve(classes: []const Class, provider: []const u8, model: []const u8) Resolved {
@@ -58,8 +60,13 @@ pub fn Choice(comptime T: type) type {
     };
 }
 
-test "a model with no declared class is hosted and small" {
-    const classes = [_]Class{.{ .model = "qwen3:27b", .trust = .local, .tier = .mid }};
-    try std.testing.expectEqual(Resolved{ .trust = .local, .tier = .mid }, resolve(&classes, "ollama", "qwen3:27b"));
-    try std.testing.expectEqual(Resolved{}, resolve(&classes, "ollama", "unknown"));
+test "omitted tiers default to mid and an explicit unknown tier is preserved" {
+    const testing = std.testing;
+    const parsed = try std.json.parseFromSlice([]const Class, testing.allocator,
+        \\[{"model":"local-worker","trust":"local"},{"model":"experiment","tier":"unknown"}]
+    , .{});
+    defer parsed.deinit();
+    try testing.expectEqual(Resolved{ .trust = .hosted, .tier = .mid }, resolve(parsed.value, "openai", "unlisted"));
+    try testing.expectEqual(Resolved{ .trust = .local, .tier = .mid }, resolve(parsed.value, "ollama", "local-worker"));
+    try testing.expectEqual(Resolved{ .trust = .hosted, .tier = .unknown }, resolve(parsed.value, "openai", "experiment"));
 }

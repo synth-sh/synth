@@ -107,15 +107,14 @@ flowchart LR
 Use `trust` to describe where the model runs. Choose `local` for your machine,
 `private` for a server you control, or `hosted` for a provider. Set `tier` to
 `small`, `mid`, or `frontier` based on the model's capability for your work.
+Set it to `unknown` to give a model with unassessed capability its own rules.
 A project can use both labels to require human approval when a small or
 mid-tier hosted model proposes a shell command.
 
-If `model_classes` is omitted from `config.json` or set to `[]`, Synth uses
-`trust: "hosted"` and `tier: "small"` for every model when matching hooks,
-including models running locally. A model with no matching entry uses the
-same defaults. Within an entry, an omitted `trust` or `tier` uses its default.
-Defaulting to `small` lets hooks that require extra review for that tier apply
-to unclassified models from their first request.
+If a model has no entry in `model_classes`, Synth uses `trust: "hosted"`
+and `tier: "mid"` when matching hooks. Within an entry, omitted fields
+use those same defaults. Filters for `small` or `unknown` match models
+explicitly assigned those tiers.
 
 Synth takes the first entry matching the model and, if specified, the
 provider. Hook input exposes the labels as `model_trust` and `model_tier`.
@@ -149,7 +148,7 @@ fields.
 | `qwen3:27b` via `local-ollama` | No. Its trust is `local`. |
 | `hosted-worker` | Yes. It is `hosted` and `mid`. |
 | `hosted-large` | No. Its tier is `frontier`. |
-| An unlisted model | Yes. It defaults to `hosted` and `small`. |
+| An unlisted model | Yes. It defaults to `hosted` and `mid`. |
 
 Model classes affect matching. Synth still checks [hook trust](#workspace-trust)
 and [tool permissions](#permissionrequest) independently. Apply a context policy
@@ -214,7 +213,7 @@ value or a list of alternatives.
 | `request_purpose` | `agent`, `approval_judge`, `compaction` |
 | `agent_type`, `model`, `provider` | Exact string |
 | `trust` | `local`, `private`, `hosted` |
-| `tier` | `small`, `mid`, `frontier` |
+| `tier` | `unknown`, `small`, `mid`, `frontier` |
 
 See [model trust and tier](#model-trust-and-tier) for class declarations and
 matching examples.

@@ -1541,12 +1541,14 @@ test "when filters on the declared class of the model and reaches the hook input
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     const source =
-        \\{"PreToolUse":[{"when":{"trust":["local","private"],"tier":"small"},"hooks":[{"command":"cat > payload; printf '{\"decision\":\"block\",\"reason\":\"small local model\"}'"}]}]}
+        \\{"PreToolUse":[{"when":{"trust":["local","private"],"tier":"small"},"hooks":[{"command":"cat > payload; printf '{\"decision\":\"block\",\"reason\":\"small local model\"}'"}]}],
+        \\ "PostToolUse":[{"when":{"tier":"unknown"},"hooks":[{"command":"true"}]}]}
     ;
     const set = try parse(a, try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{}), "hooks.json");
     const classes = [_]ModelClass.Class{
         .{ .model = "qwen3:27b", .trust = .local, .tier = .small },
         .{ .model = "astra", .trust = .hosted, .tier = .frontier },
+        .{ .model = "experiment", .tier = .unknown },
     };
     const runner: Runner = .{ .io = std.testing.io, .root = root, .set = set, .classes = &classes };
     var local = try runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash", .model = "qwen3:27b" });
@@ -1557,4 +1559,6 @@ test "when filters on the declared class of the model and reaches the hook input
     try std.testing.expect(frontier.blocked == null);
     const payload = try tmp.dir.readFileAlloc(std.testing.io, "payload", a, .limited(1 << 16));
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"model_trust\":\"local\"") != null);
+    try std.testing.expect(runner.hasMatching(a, .{ .event = .post_tool_use, .model = "experiment" }, false));
+    try std.testing.expect(!runner.hasMatching(a, .{ .event = .post_tool_use, .model = "unlisted" }, false));
 }

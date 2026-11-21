@@ -220,7 +220,7 @@
         },
         "model_classes": {
             "type": "array",
-            "description": "What you say about each model: where it runs (trust) and how capable it is (tier). Hooks can filter on both. A model not listed here is hosted and small.",
+            "description": "Where each model runs (trust) and how capable it is (tier). Hooks can filter on both. The defaults are hosted and mid.",
             "items": {
                 "type": "object",
                 "required": ["model"],
@@ -437,7 +437,7 @@
         },
         "modelRequestPurpose": { "enum": ["agent", "approval_judge", "compaction"] },
         "modelTrust": { "enum": ["local", "private", "hosted"] },
-        "modelTier": { "enum": ["small", "mid", "frontier"] },
+        "modelTier": { "enum": ["unknown", "small", "mid", "frontier"] },
         "hookWhen": {
             "type": "object",
             "minProperties": 1,
