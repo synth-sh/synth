@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const testing = std.testing;
 
 const posix = std.posix;
+const paths = @import("../core/paths.zig");
 
 const suffix = ".sock";
 
@@ -28,11 +29,11 @@ pub fn ensureDir(io: std.Io, path: []const u8) !void {
         error.PathAlreadyExists => {},
         else => return err,
     };
-    if (!isPrivate(try ownership(path))) return error.UnsafeSocketDir;
+    if (!isPrivate(try paths.ownershipNoFollow(path))) return error.UnsafeSocketDir;
 }
 
-fn isPrivate(found: Ownership) bool {
-    return found.is_dir and found.uid == uid() and found.mode & 0o077 == 0;
+fn isPrivate(found: paths.Ownership) bool {
+    return found.kind() == .directory and found.uid == uid() and found.mode & 0o077 == 0;
 }
 
 /// The socket a session listens on. Too long a path for a socket address is
@@ -79,7 +80,7 @@ pub fn connect(path: []const u8) !std.Io.File {
 /// listens there. A directory others could have planted the socket in is
 /// refused: the client sends secrets, such as API keys, over it.
 pub fn reach(allocator: std.mem.Allocator, socket_dir: []const u8, handle: []const u8) !?std.Io.File {
-    const found = ownership(socket_dir) catch |err| switch (err) {
+    const found = paths.ownershipNoFollow(socket_dir) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -274,33 +275,6 @@ fn uid() posix.uid_t {
     return if (builtin.os.tag == .linux) std.os.linux.getuid() else std.c.getuid();
 }
 
-const Ownership = struct { is_dir: bool, uid: posix.uid_t, mode: u32 };
-
-/// Who owns `path` and what it lets others do, without following a link: a
-/// link planted where the directory should be is refused, not trusted.
-fn ownership(path: []const u8) !Ownership {
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&buffer, "{s}", .{path});
-    if (builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        var found: linux.Statx = undefined;
-        const rc = linux.statx(linux.AT.FDCWD, name, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true }, &found);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .NOENT => return error.FileNotFound,
-            else => return error.StatFailed,
-        }
-        return .{ .is_dir = linux.S.ISDIR(found.mode), .uid = found.uid, .mode = found.mode & 0o7777 };
-    }
-    var found: std.c.Stat = undefined;
-    switch (posix.errno(std.c.fstatat(std.c.AT.FDCWD, name, &found, std.c.AT.SYMLINK_NOFOLLOW))) {
-        .SUCCESS => {},
-        .NOENT => return error.FileNotFound,
-        else => return error.StatFailed,
-    }
-    return .{ .is_dir = std.c.S.ISDIR(found.mode), .uid = found.uid, .mode = @intCast(found.mode & 0o7777) };
-}
-
 fn tmpPath(tmp: *testing.TmpDir, buffer: []u8, name: []const u8) ![]const u8 {
     var root: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(testing.io, &root);
@@ -315,7 +289,7 @@ test "a socket directory is made private, and refused once others can enter it" 
 
     try ensureDir(testing.io, path);
     try ensureDir(testing.io, path);
-    try testing.expectEqual(@as(u32, 0o700), (try ownership(path)).mode);
+    try testing.expectEqual(@as(u32, 0o700), (try paths.ownershipNoFollow(path)).mode & 0o7777);
 
     var opened = try std.Io.Dir.cwd().openDir(testing.io, path, .{ .iterate = true });
     defer opened.close(testing.io);

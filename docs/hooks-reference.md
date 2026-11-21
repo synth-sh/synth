@@ -746,9 +746,11 @@ it disabled. Enabling an untrusted hook still leaves it pending review.
 
 The ID includes the hook declaration and the contents of regular files Synth
 can resolve directly from its command, including paths starting with `~/` or
-`$HOME/`. For unreadable file references, the ID tracks the path and read
-failure. A change in readability requires review.
-Review indirect script dependencies and MCP server implementations separately.
+`$HOME/`. On macOS and Linux, Synth records standard system executables by
+path when the executable and its symlink chain are protected from user
+writes. Updating a system Python keeps the hook trusted. Editing the script
+it runs requires review. For unreadable file references, the ID tracks the
+path and read failure. Review indirect dependencies and MCP servers separately.
 
 Synth recomputes IDs when it reloads hooks, such as at the next prompt or
 when you run `/hooks review` while idle. Editing a declaration or a tracked

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Hooks = @import("hooks.zig");
 const HookCommand = @import("hook_command.zig");
 const Config = @import("config.zig");
@@ -12,6 +13,10 @@ const store_writer_buffer_bytes = 4 * 1024;
 const hash_writer_buffer_bytes = 512;
 const script_hash_buffer_bytes = 4 * 1024;
 const unreadable_file_marker = "\x00\x00unreadable\x00";
+const system_executable_marker = "\x00\x00system-executable\x00";
+const max_system_symlink_hops = 16;
+const system_bin_dirs = [_][]const u8{ "/bin", "/sbin", "/usr/bin", "/usr/sbin" };
+const root_uid: std.posix.uid_t = 0;
 const min_trust_id_chars: usize = 32;
 const min_revoke_id_chars: usize = 8;
 const record_id_padding = "\x00";
@@ -97,6 +102,12 @@ fn hashScripts(arena: std.mem.Allocator, io: std.Io, hasher: *Sha256, root: []co
     while (words.next()) |word| {
         const expanded = try expandScriptPath(arena, root, home, word);
         if (expanded.len == 0 or expanded[0] == '-') continue;
+        if (try protectedSystemExecutable(arena, io, expanded)) {
+            hasher.update(system_executable_marker);
+            hasher.update(expanded);
+            hasher.update("\x00");
+            continue;
+        }
         const path = try std.fs.path.resolve(arena, &.{ root, expanded });
         const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => continue,
@@ -108,6 +119,66 @@ fn hashScripts(arena: std.mem.Allocator, io: std.Io, hasher: *Sha256, root: []co
         if (stat.kind != .file) continue;
         hashFile(io, hasher, path) catch hashUnreadableFile(hasher, path);
     }
+}
+
+fn isSystemExecutablePath(path: []const u8) bool {
+    const directory = std.fs.path.dirname(path) orelse return false;
+    for (system_bin_dirs) |system_dir| {
+        if (std.mem.eql(u8, directory, system_dir)) return true;
+    }
+    return false;
+}
+
+fn protectedSystemEntry(io: std.Io, path: []const u8, found: paths.Ownership) bool {
+    const mode = std.posix.S;
+    if (found.uid != root_uid) return false;
+    if (found.kind() == .sym_link) return true;
+    if (found.mode & (mode.IWGRP | mode.IWOTH) != 0) return false;
+    std.Io.Dir.cwd().access(io, path, .{ .write = true }) catch |err| return switch (err) {
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => true,
+        else => false,
+    };
+    return false;
+}
+
+fn protectedSystemExecutable(arena: std.mem.Allocator, io: std.Io, command_path: []const u8) !bool {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return false;
+    if (!isSystemExecutablePath(command_path)) return false;
+    const uid = std.c.geteuid();
+    if (uid == root_uid or std.c.getuid() != uid) return false;
+    const root = paths.ownershipNoFollow("/") catch return false;
+    if (root.kind() != .directory or !protectedSystemEntry(io, "/", root)) return false;
+
+    var path = command_path;
+    var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    resolve_links: for (0..max_system_symlink_hops + 1) |_| {
+        if (!isSystemExecutablePath(path)) return false;
+        var components = std.mem.tokenizeScalar(u8, path, '/');
+        while (components.next()) |_| {
+            const entry_path = path[0..components.index];
+            const found = paths.ownershipNoFollow(entry_path) catch return false;
+            if (!protectedSystemEntry(io, entry_path, found)) return false;
+            // Every link in the chain must have a protected parent, even when its final target is in /usr/bin.
+            if (found.kind() == .sym_link) {
+                const len = std.Io.Dir.cwd().readLink(io, entry_path, &target_buffer) catch return false;
+                if (len == target_buffer.len) return false;
+                const target = target_buffer[0..len];
+                const remaining = components.rest();
+                path = if (std.fs.path.isAbsolute(target))
+                    try std.fs.path.join(arena, &.{ target, remaining })
+                else
+                    try std.fs.path.join(arena, &.{ std.fs.path.dirname(entry_path).?, target, remaining });
+                continue :resolve_links;
+            }
+            if (components.index == path.len) {
+                const mode = std.posix.S;
+                return found.kind() == .file and found.mode & (mode.IXUSR | mode.IXGRP | mode.IXOTH) != 0;
+            }
+            if (found.kind() != .directory) return false;
+        }
+        return false;
+    }
+    return false;
 }
 
 fn expandScriptPath(arena: std.mem.Allocator, root: []const u8, home: ?[]const u8, word: []const u8) ![]const u8 {
@@ -205,6 +276,7 @@ test "rewriting a script a hook runs makes the hook untrusted" {
     var store = try Store.init(std.testing.allocator, std.testing.io, null);
     defer store.deinit();
     const cases = [_]struct { path: []const u8, command: []const u8 }{
+        .{ .path = "guard.sh", .command = "/bin/sh ./guard.sh" },
         .{ .path = "guard.sh", .command = "sh \"$SYNTH_PROJECT_DIR/guard.sh\"" },
         .{ .path = ".synth/plugin-data/guard.sh", .command = "sh \"${CLAUDE_PLUGIN_DATA}/guard.sh\"" },
         .{ .path = ".synth/plugin-data/guard.sh", .command = "sh \"$PLUGIN_DATA/guard.sh\"" },
@@ -224,6 +296,33 @@ test "rewriting a script a hook runs makes the hook untrusted" {
         const rewritten = try discover(a, std.testing.io, set, root, null, store);
         try std.testing.expect(!rewritten.pre_tool_use[0].trusted);
     }
+}
+
+test "only a protected executable path omits the system binary's contents from trust" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (std.c.geteuid() == root_uid) return error.SkipZigTest;
+    const testing = std.testing;
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const interpreter = "/bin/sh";
+    var system: Sha256 = .init(.{});
+    try hashScripts(a, io, &system, root, null, interpreter);
+    var by_path: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(system_executable_marker ++ interpreter ++ "\x00", &by_path, .{});
+    try testing.expectEqual(by_path, system.finalResult());
+
+    const link = "interpreter";
+    try tmp.dir.symLink(io, interpreter, link, .{});
+    var aliased: Sha256 = .init(.{});
+    try hashScripts(a, io, &aliased, root, null, "./" ++ link);
+    var by_contents: Sha256 = .init(.{});
+    try hashFile(io, &by_contents, try std.fs.path.join(a, &.{ root, link }));
+    try testing.expectEqual(by_contents.finalResult(), aliased.finalResult());
 }
 
 test "rewriting a script under HOME invalidates trust when Bash expands the path" {

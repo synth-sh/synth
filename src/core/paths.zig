@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const posix = std.posix;
 
 pub const synth_config_dir = ".synth";
 pub const default_temp_root = "/tmp";
@@ -8,6 +10,45 @@ pub fn tempRoot(environ: *const std.process.Environ.Map) []const u8 {
     if (!std.fs.path.isAbsolute(path)) return default_temp_root;
     const trimmed = std.mem.trimEnd(u8, path, "/");
     return if (trimmed.len == 0) path[0..1] else trimmed;
+}
+
+pub const Ownership = struct {
+    uid: posix.uid_t,
+    mode: u32,
+
+    pub fn kind(self: Ownership) std.Io.File.Kind {
+        return switch (self.mode & posix.S.IFMT) {
+            posix.S.IFDIR => .directory,
+            posix.S.IFREG => .file,
+            posix.S.IFLNK => .sym_link,
+            else => .unknown,
+        };
+    }
+};
+
+pub fn ownershipNoFollow(path: []const u8) !Ownership {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.BadPathName;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&buffer, "{s}", .{path});
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var found: linux.Statx = undefined;
+        const rc = linux.statx(linux.AT.FDCWD, name, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true }, &found);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .NOENT => return error.FileNotFound,
+            else => return error.StatFailed,
+        }
+        if (!found.mask.TYPE or !found.mask.MODE or !found.mask.UID) return error.StatFailed;
+        return .{ .uid = found.uid, .mode = found.mode };
+    }
+    var found: std.c.Stat = undefined;
+    switch (posix.errno(std.c.fstatat(std.c.AT.FDCWD, name, &found, std.c.AT.SYMLINK_NOFOLLOW))) {
+        .SUCCESS => {},
+        .NOENT => return error.FileNotFound,
+        else => return error.StatFailed,
+    }
+    return .{ .uid = found.uid, .mode = @intCast(found.mode) };
 }
 
 pub fn resolve(io: std.Io, a: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]const u8 {
