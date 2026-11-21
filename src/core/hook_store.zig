@@ -80,7 +80,7 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
             var hash = std.Io.Writer.Hashing(Sha256).init(&buffer);
             try std.json.Stringify.value(.{ if (user_hook) "" else root, event.name(), count.value_ptr.*, hook.* }, .{}, &hash.writer);
             try hash.writer.flush();
-            try hashScripts(arena, io, &hash.hasher, root, hook.command);
+            try hashScripts(arena, io, &hash.hasher, root, home, hook.command);
             hook.id = try arena.dupe(u8, &std.fmt.bytesToHex(hash.hasher.finalResult(), .lower));
             count.value_ptr.* += 1;
             const state = store.get(hook.id);
@@ -92,10 +92,10 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
     return set;
 }
 
-fn hashScripts(arena: std.mem.Allocator, io: std.Io, hasher: *Sha256, root: []const u8, command: []const u8) !void {
+fn hashScripts(arena: std.mem.Allocator, io: std.Io, hasher: *Sha256, root: []const u8, home: ?[]const u8, command: []const u8) !void {
     var words = std.mem.tokenizeAny(u8, command, " \t\r\n;&|<>()");
     while (words.next()) |word| {
-        const expanded = try HookCommand.expandDirectories(arena, std.mem.trim(u8, word, "\"'"), root);
+        const expanded = try expandScriptPath(arena, root, home, word);
         if (expanded.len == 0 or expanded[0] == '-') continue;
         const path = try std.fs.path.resolve(arena, &.{ root, expanded });
         const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
@@ -108,6 +108,21 @@ fn hashScripts(arena: std.mem.Allocator, io: std.Io, hasher: *Sha256, root: []co
         if (stat.kind != .file) continue;
         hashFile(io, hasher, path) catch hashUnreadableFile(hasher, path);
     }
+}
+
+fn expandScriptPath(arena: std.mem.Allocator, root: []const u8, home: ?[]const u8, word: []const u8) ![]const u8 {
+    const path = std.mem.trim(u8, word, "\"'");
+    if (home) |dir| {
+        if (word[0] == '~') {
+            if (std.mem.cutPrefix(u8, path, "~/")) |relative| return std.fs.path.join(arena, &.{ dir, relative });
+        }
+        if (word[0] != '\'') {
+            for ([_][]const u8{ "$HOME/", "${HOME}/", "$HOME\"/", "${HOME}\"/" }) |prefix| {
+                if (std.mem.cutPrefix(u8, path, prefix)) |relative| return std.fs.path.join(arena, &.{ dir, relative });
+            }
+        }
+    }
+    return HookCommand.expandDirectories(arena, path, root);
 }
 
 fn hashFile(io: std.Io, hasher: *Sha256, path: []const u8) !void {
@@ -208,6 +223,42 @@ test "rewriting a script a hook runs makes the hook untrusted" {
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = case.path, .data = "exit 2" });
         const rewritten = try discover(a, std.testing.io, set, root, null, store);
         try std.testing.expect(!rewritten.pre_tool_use[0].trusted);
+    }
+}
+
+test "rewriting a script under HOME invalidates trust when Bash expands the path" {
+    const testing = std.testing;
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = arena.allocator();
+    const path = "home/bin/guard.sh";
+    try tmp.dir.createDirPath(io, "home/bin");
+    try tmp.dir.createDirPath(io, "project");
+    const home = try tmp.dir.realPathFileAlloc(io, "home", a);
+    const root = try tmp.dir.realPathFileAlloc(io, "project", a);
+    const hooks: Hooks.Set = .{ .pre_tool_use = &.{
+        .{ .command = "sh ~/bin/guard.sh" },
+        .{ .command = "sh $HOME/bin/guard.sh" },
+        .{ .command = "sh \"${HOME}/bin/guard.sh\"" },
+        .{ .command = "sh \"$HOME\"/bin/guard.sh" },
+        .{ .command = "sh '$HOME/bin/guard.sh'" },
+        .{ .command = "sh \"~/bin/guard.sh\"" },
+    } };
+    var store = try Store.init(testing.allocator, io, null);
+    defer store.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "exit 0" });
+    const original = try discover(a, io, hooks, root, home, store);
+    for (original.pre_tool_use) |hook| try store.put(hook.id, .{ .trusted = true });
+    const unchanged = try discover(a, io, hooks, root, home, store);
+    for (unchanged.pre_tool_use) |hook| try testing.expect(hook.trusted);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "exit 2" });
+    const rewritten = try discover(a, io, hooks, root, home, store);
+    for (rewritten.pre_tool_use, [_]bool{ false, false, false, false, true, true }) |hook, trusted| {
+        try testing.expectEqual(trusted, hook.trusted);
     }
 }
 

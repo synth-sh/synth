@@ -739,8 +739,9 @@ it disabled. Enabling an untrusted hook still leaves it pending review.
 #### What the hook ID covers
 
 The ID includes the hook declaration and the contents of regular files Synth
-can resolve directly from its command. For unreadable file references, the ID
-tracks the path and read failure. A change in readability requires review.
+can resolve directly from its command, including paths starting with `~/` or
+`$HOME/`. For unreadable file references, the ID tracks the path and read
+failure. A change in readability requires review.
 Review indirect script dependencies and MCP server implementations separately.
 
 Synth recomputes IDs when it reloads hooks, such as at the next prompt or
