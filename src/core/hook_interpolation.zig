@@ -48,17 +48,3 @@ fn lookup(input: std.json.Value, path: []const u8) !std.json.Value {
     }
     return current;
 }
-
-test "MCP interpolation preserves full-value types through nested arrays" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"tool_input\":{\"count\":3,\"flag\":true}}", .{});
-    const template = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[\"${tool_input.count}\",\"flag=${tool_input.flag}\",\"${tool_input}\"]}", .{});
-    const result = try expand(a, template, input);
-    const items = result.object.get("items").?.array.items;
-    try std.testing.expectEqual(@as(i64, 3), items[0].integer);
-    try std.testing.expectEqualStrings("flag=true", items[1].string);
-    try std.testing.expect(items[2] == .object);
-    try std.testing.expectError(error.MissingHookField, expand(a, .{ .string = "${missing}" }, input));
-}

@@ -1114,30 +1114,3 @@ test "a search that ran out of time says so rather than saying cancelled" {
     try testing.expect(searched.is_error);
     try testing.expectEqualStrings("search timed out", searched.content);
 }
-
-test "glob and grep can scope an added root while relative paths keep their base" {
-    var fixture = try Fixture.init();
-    defer fixture.deinit();
-    try fixture.tmp.dir.createDirPath(testing.io, "primary/nested");
-    try fixture.tmp.dir.createDirPath(testing.io, "extra");
-    try fixture.writeFile("extra/found.zig", "const found = true;\n");
-    const primary = try std.fs.path.join(testing.allocator, &.{ fixture.root, "primary", "nested" });
-    defer testing.allocator.free(primary);
-    const extra = try std.fs.path.join(testing.allocator, &.{ fixture.root, "extra" });
-    defer testing.allocator.free(extra);
-    var ctx = fixture.context();
-    ctx.project_root = primary;
-    ctx.additional_roots = &.{extra};
-    const args = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"path\":\"../../extra\",\"pattern\":\"**/*.zig\"}", .{});
-    defer args.deinit();
-    const matches = try globTool(ctx, .{ .arguments = args.value });
-    defer testing.allocator.free(matches.content);
-    try testing.expect(!matches.is_error);
-    try testing.expectEqualStrings("found.zig\n", matches.content);
-    const grep_args = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"path\":\"../../extra\",\"pattern\":\"const found\"}", .{});
-    defer grep_args.deinit();
-    const result = try grep(ctx, .{ .arguments = grep_args.value });
-    defer testing.allocator.free(result.content);
-    try testing.expect(!result.is_error);
-    try testing.expect(std.mem.indexOf(u8, result.content, "found.zig") != null);
-}

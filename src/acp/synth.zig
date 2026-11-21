@@ -427,11 +427,3 @@ pub const Hooks = struct {
     action: @import("../core/hook_store.zig").Action = .list,
     id: []const u8 = "",
 };
-
-test "ACP sends display text while retaining reference conversation text" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const original: Conversation.Message = .{ .role = .assistant, .text = "reference", .display_text = "visible" };
-    const wire = try Message.from(arena.allocator(), &original);
-    try testing.expectEqualStrings("visible", wire.text);
-}

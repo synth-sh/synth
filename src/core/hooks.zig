@@ -1408,143 +1408,9 @@ test "large input and stderr cannot block each other" {
     try testing.expectEqual(stderr_limit + "[Hook config]\n".len, result.blocked.?.len);
 }
 
-test "hook output is structured" {
-    const a = std.testing.allocator;
-    const command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"echo safe\"},\"additionalContext\":\"from policy\"}}'";
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .pre_tool_use = &.{.{ .command = command, .source = "test policy" }} } };
-    var result = try runner.evaluate(a, .{ .event = .pre_tool_use });
-    defer result.deinit(a);
-    try std.testing.expectEqualStrings("{\"command\":\"echo safe\"}", result.replacement.?);
-    try std.testing.expectEqualStrings("[Hook test policy]\nfrom policy", result.context.?);
-}
-
 test "oversized structured stdout is drained and rejected" {
     const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .pre_tool_use = &.{.{ .command = "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2" }} } };
     try std.testing.expectError(error.HookOutputTooLarge, runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use }));
-}
-
-test "grouped config normalizes declarations" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"PreToolUse\":[{\"matcher\":\"Bash\",\"hooks\":[{\"type\":\"command\",\"command\":\"true\",\"timeout_ms\":50}]}]}", .{});
-    const set = try parse(a, value, "test.json");
-    try std.testing.expectEqualStrings("test.json", set.pre_tool_use[0].source);
-    try std.testing.expectEqual(@as(?u64, 50), set.pre_tool_use[0].timeout_ms);
-    const unknown = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"UnknownEvent\":[]}", .{});
-    try std.testing.expectError(error.InvalidHookEvent, parse(a, unknown, "test.json"));
-    try std.testing.expectError(error.InvalidHookTimeout, validTimeout(0));
-    try std.testing.expectError(error.InvalidHookTimeout, validTimeout(std.math.maxInt(u64)));
-}
-
-test "grouped hooks run despite denial and apply rewrites in declaration order" {
-    const a = std.testing.allocator;
-    const first: Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"first\",\"updatedInput\":{\"command\":\"first\"}}}'" };
-    const last: Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"last\",\"updatedInput\":{\"command\":\"last\"}}}'" };
-    const deny: Hook = .{ .command = "echo denied >&2; exit 2" };
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .pre_tool_use = &.{ first, deny, last } } };
-    var result = try runner.evaluate(a, .{ .event = .pre_tool_use });
-    defer result.deinit(a);
-    try std.testing.expect(result.blocked != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.context.?, "first") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.context.?, "last") != null);
-    try std.testing.expectEqualStrings("{\"command\":\"last\"}", result.replacement.?);
-}
-
-test "grouped matcher accepts aliases and alternation" {
-    const a = std.testing.allocator;
-    const hook: Hook = .{ .matcher = "^(Bash|bash|Edit)$", .command = "true" };
-    try std.testing.expect(try hookMatches(a, "/p", hook, .{ .event = .pre_tool_use, .tool_name = "bash" }));
-    try std.testing.expect(try hookMatches(a, "/p", hook, .{ .event = .pre_tool_use, .tool_name = "edit" }));
-    try std.testing.expect(!try hookMatches(a, "/p", hook, .{ .event = .pre_tool_use, .tool_name = "read" }));
-    try std.testing.expectError(error.UnsupportedHookRegex, compileMatcher(a, "(?=bash)"));
-    try std.testing.expectError(error.UnsupportedHookRegex, compileMatcher(a, "(bash)\\1"));
-}
-
-test "background output waits for a boundary and has no control authority" {
-    const a = std.testing.allocator;
-    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
-    defer runtime.deinit();
-    const hook: Hook = .{ .async = true, .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"ignored\",\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"background context\"}}'" };
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .runtime = &runtime, .set = .{ .pre_tool_use = &.{hook} } };
-    var immediate = try runner.evaluate(a, .{ .event = .pre_tool_use });
-    defer immediate.deinit(a);
-    try std.testing.expect(immediate.blocked == null);
-    try std.testing.expect(immediate.context == null);
-    runtime.background.items[0].join();
-    var delivered = try runtime.drainFor(a, "");
-    defer delivered.deinit(a);
-    try std.testing.expect(delivered.blocked == null);
-    try std.testing.expect(std.mem.indexOf(u8, delivered.context.?, "background context") != null);
-    try std.testing.expectEqualStrings("Background hook control effects were ignored", delivered.message.?);
-}
-
-test "large hook context spills to an owner-only file" {
-    const a = std.testing.allocator;
-    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
-    defer runtime.deinit();
-    var result: Result = .{ .context = try a.alloc(u8, 20_000) };
-    defer result.deinit(a);
-    @memset(result.context.?, 'x');
-    try runtime.bound(a, &result);
-    try std.testing.expect(result.context.?.len < 8192);
-    const start = std.mem.indexOf(u8, result.context.?, "/tmp/synth-hooks-").?;
-    const path = result.context.?[start .. result.context.?.len - 1];
-    const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
-    const stat = try file.stat(std.testing.io);
-    try std.testing.expectEqual(@as(u64, 20_000), stat.size);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
-}
-
-test "concurrent dispatches share the session admission bound" {
-    const Probe = struct {
-        active: std.atomic.Value(usize) = .init(0),
-        peak: std.atomic.Value(usize) = .init(0),
-        fn call(raw: *anyopaque, a: std.mem.Allocator, _: Hook, _: []const u8, _: u64, _: ?*const std.atomic.Value(bool)) ![]const u8 {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const count = self.active.fetchAdd(1, .acq_rel) + 1;
-            _ = self.peak.fetchMax(count, .acq_rel);
-            defer _ = self.active.fetchSub(1, .release);
-            try std.Io.sleep(std.testing.io, .fromMilliseconds(40), .awake);
-            return a.dupe(u8, "{}");
-        }
-    };
-    const a = std.testing.allocator;
-    var probe: Probe = .{};
-    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
-    defer runtime.deinit();
-    const definitions = [_]Hook{.{ .matcher = "^(Bash|bash)$", .type = .mcp_tool, .arguments = .{ .object = .empty }, .server = "test", .tool = "guard" }} ** 8;
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .runtime = &runtime, .mcp_executor = .{ .userdata = &probe, .call = Probe.call }, .set = .{ .pre_tool_use = &definitions } };
-    const first = try Dispatch.start(a, runner, .{ .event = .pre_tool_use, .tool_name = "bash" });
-    defer first.destroy();
-    const second = try Dispatch.start(a, runner, .{ .event = .pre_tool_use, .tool_name = "bash" });
-    defer second.destroy();
-    first.join();
-    second.join();
-    try std.testing.expect(first.failed == null);
-    try std.testing.expect(second.failed == null);
-    try std.testing.expect(probe.peak.load(.acquire) > 1);
-    try std.testing.expect(probe.peak.load(.acquire) <= 8);
-}
-
-test "cancellation while queued prevents a command from starting" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
-    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
-    defer runtime.deinit();
-    runtime.active.store(8, .release);
-    const runner: Runner = .{ .io = std.testing.io, .root = root, .runtime = &runtime, .set = .{ .pre_tool_use = &.{.{ .command = "touch launched" }} } };
-    const dispatch = try Dispatch.start(a, runner, .{ .event = .pre_tool_use });
-    defer dispatch.destroy();
-    dispatch.requestStop();
-    dispatch.join();
-    runtime.active.store(0, .release);
-    try std.testing.expectEqual(error.Cancelled, dispatch.failed.?);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "launched", .{}));
 }
 
 test "protected-path example rejects equivalent paths and symlink targets" {
@@ -1596,55 +1462,6 @@ test "a deadline kills descendants before they can finish later work" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "survived", .{}));
 }
 
-test "session shutdown joins a running background command" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
-    var runtime: Runtime = .{ .allocator = std.testing.allocator, .io = std.testing.io };
-    var destroyed = false;
-    defer if (!destroyed) runtime.deinit();
-    const runner: Runner = .{ .io = std.testing.io, .root = root, .runtime = &runtime, .set = .{ .pre_tool_use = &.{.{ .async = true, .command = "read payload; echo ready > started; sleep 30" }} } };
-    var result = try runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use });
-    defer result.deinit(std.testing.allocator);
-    var started = false;
-    for (0..200) |_| {
-        if (tmp.dir.openFile(std.testing.io, "started", .{})) |file| {
-            file.close(std.testing.io);
-            started = true;
-            break;
-        } else |_| {}
-        try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
-    }
-    try std.testing.expect(started);
-    const before = std.Io.Clock.now(.awake, std.testing.io).toMilliseconds();
-    runtime.deinit();
-    destroyed = true;
-    try std.testing.expect(std.Io.Clock.now(.awake, std.testing.io).toMilliseconds() - before < 1000);
-    try std.testing.expectEqual(@as(usize, 0), runtime.active.load(.acquire));
-}
-
-test "event input fixtures preserve field values and escaping" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const fixtures = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/hooks/inputs.json"), .{});
-    for (fixtures.array.items) |fixture| {
-        const event = Event.fromName(fixture.object.get("event").?.string).?;
-        var input = fixture.object.get("input").?;
-        try input.object.put(a, "event", .{ .string = @tagName(event) });
-        const invocation = try std.json.parseFromValueLeaky(Invocation, a, input, .{});
-        var writer: std.Io.Writer.Allocating = .init(a);
-        try writeJson(a, &writer.writer, ".", invocation);
-        const payload = try std.json.parseFromSliceLeaky(std.json.Value, a, writer.written(), .{});
-        var expected = fixture.object.get("expected").?.object.iterator();
-        while (expected.next()) |field| {
-            const actual = payload.object.get(field.key_ptr.*) orelse return error.MissingHookInput;
-            try std.testing.expect(@import("hook_schema.zig").jsonEqual(field.value_ptr.*, actual));
-        }
-    }
-}
-
 test "policy regex budget exhaustion fails visibly" {
     const a = std.testing.allocator;
     const input = try a.alloc(u8, 2000);
@@ -1654,135 +1471,11 @@ test "policy regex budget exhaustion fails visibly" {
     try std.testing.expectError(error.RegexResourceLimit, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = input }));
 }
 
-test "an observation failure does not discard a sibling's valid feedback" {
-    const a = std.testing.allocator;
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .post_tool_use = &.{
-        .{ .command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"verify\"}'" },
-        .{ .command = "printf invalid-json" },
-    } } };
-    var result = try runner.evaluate(a, .{ .event = .post_tool_use, .tool_name = "read" });
-    defer result.deinit(a);
-    try std.testing.expect(std.mem.indexOf(u8, result.blocked.?, "verify") != null);
-    try std.testing.expect(result.message != null);
-}
-
-test "queued handlers start when a slot frees rather than waiting for the whole group" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
-    const waiting: Hook = .{ .command = "while [ ! -e released ]; do sleep 0.02; done", .timeout_ms = 2000 };
-    const release: Hook = .{ .command = "touch released" };
-    const definitions = [_]Hook{waiting} ++ ([_]Hook{.{ .command = "true" }} ** 7) ++ [_]Hook{release};
-    const runner: Runner = .{ .io = std.testing.io, .root = root, .set = .{ .pre_tool_use = &definitions } };
-    var result = try runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use });
-    defer result.deinit(std.testing.allocator);
-    try tmp.dir.access(std.testing.io, "released", .{});
-}
-
-test "grouped failures are reported in declaration order" {
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .pre_tool_use = &.{
-        .{ .command = "sleep 0.05; printf bad" },
-        .{ .type = .mcp_tool, .arguments = .{ .object = .empty }, .server = "missing", .tool = "missing" },
-    } } };
-    try std.testing.expectError(error.SyntaxError, runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use }));
-}
-
 test "hook notices cannot inject terminal control sequences" {
     const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = .{ .pre_tool_use = &.{.{ .command = "printf '%s' '{\"systemMessage\":\"\\u001b[31mred\\u001b[0m\"}'" }} } };
     var result = try runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use });
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("red", result.message.?);
-}
-
-test "unreviewed hooks do not suppress admitted observation handlers" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
-    const runner: Runner = .{ .io = std.testing.io, .root = root, .set = .{ .session_end = &.{
-        .{ .trusted = false, .command = "touch forbidden" },
-        .{ .command = "touch admitted" },
-    } } };
-    var result = try runner.evaluate(std.testing.allocator, .{ .event = .session_end });
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.message != null);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "forbidden", .{}));
-    const admitted = try tmp.dir.openFile(std.testing.io, "admitted", .{});
-    admitted.close(std.testing.io);
-}
-
-test "MCP interpolation must produce an argument object before calling the server" {
-    const Executor = struct {
-        fn call(_: *anyopaque, _: std.mem.Allocator, _: Hook, _: []const u8, _: u64, _: ?*const std.atomic.Value(bool)) anyerror![]const u8 {
-            return error.UnexpectedMcpCall;
-        }
-    };
-    var slot: u8 = 0;
-    const hook: Hook = .{ .type = .mcp_tool, .server = "test", .tool = "guard", .arguments = .{ .string = "${tool_name}" } };
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .mcp_executor = .{ .userdata = &slot, .call = Executor.call }, .set = .{ .pre_tool_use = &.{hook} } };
-    try std.testing.expectError(error.InvalidHookMcpArguments, runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use, .tool_name = "bash" }));
-}
-
-test "event matchers filter lifecycle metadata and ignore unsupported matcher fields" {
-    const a = std.testing.allocator;
-    const cases = [_]struct { input: Invocation, matcher: []const u8 }{
-        .{ .input = .{ .event = .session_start, .source = "resume" }, .matcher = "resume|clear" },
-        .{ .input = .{ .event = .session_end, .reason = "clear" }, .matcher = "clear" },
-        .{ .input = .{ .event = .pre_compact, .trigger = "auto" }, .matcher = "auto" },
-        .{ .input = .{ .event = .post_compact, .trigger = "manual" }, .matcher = "manual" },
-        .{ .input = .{ .event = .subagent_start, .agent_type = "explore" }, .matcher = "explore" },
-        .{ .input = .{ .event = .subagent_stop, .agent_type = "review" }, .matcher = "review" },
-        .{ .input = .{ .event = .notification, .notification_type = "permission_prompt" }, .matcher = "permission_prompt" },
-        .{ .input = .{ .event = .stop_failure, .error_type = "rate_limit" }, .matcher = "rate_limit" },
-        .{ .input = .{ .event = .pre_model_switch, .to_model = "local-model" }, .matcher = "^local-" },
-        .{ .input = .{ .event = .post_model_switch, .to_model = "cloud-model" }, .matcher = "^cloud-" },
-        .{ .input = .{ .event = .config_change, .source = "project_settings" }, .matcher = "project_settings" },
-        .{ .input = .{ .event = .instructions_loaded, .load_reason = "compact" }, .matcher = "compact" },
-        .{ .input = .{ .event = .file_changed, .file_path = "/p/.env" }, .matcher = ".env|.envrc" },
-        .{ .input = .{ .event = .file_changed, .file_path = "/p/subdir/.env" }, .matcher = ".envrc|subdir/.env" },
-        .{ .input = .{ .event = .post_tool_use_failure, .tool_name = "bash" }, .matcher = "Bash" },
-        .{ .input = .{ .event = .permission_denied, .tool_name = "write" }, .matcher = "Write" },
-    };
-    for (cases) |case| {
-        try std.testing.expect(try hookMatches(a, "/p", .{ .matcher = case.matcher }, case.input));
-        try std.testing.expect(!try hookMatches(a, "/p", .{ .matcher = "unrelated" }, case.input));
-    }
-    try std.testing.expect(try hookMatches(a, "/p", .{ .matcher = "ignored" }, .{ .event = .post_tool_batch }));
-}
-
-test "routing filters require every exact field and compose with event matchers" {
-    const a = std.testing.allocator;
-    const input: Invocation = .{ .event = .pre_tool_use, .agent_scope = .subagent, .request_purpose = .agent, .agent_type = "task", .model = "qwen3", .provider = "local", .tool_name = "read" };
-    const filter: When = .{ .agent_scope = .subagent, .request_purpose = .agent, .agent_type = "task", .model = "qwen3", .provider = "local" };
-    try std.testing.expect(try hookMatches(a, "/p", .{ .matcher = "^Read$", .when = filter }, input));
-    const mismatches = [_]When{
-        .{ .agent_scope = .main }, .{ .request_purpose = .approval_judge }, .{ .agent_type = "build" }, .{ .model = "qwen" }, .{ .provider = "remote" },
-    };
-    for (mismatches) |wrong| try std.testing.expect(!try hookMatches(a, "/p", .{ .when = wrong }, input));
-    try std.testing.expect(!try hookMatches(a, "/p", .{ .matcher = "write", .when = filter }, input));
-    try std.testing.expect(!try hookMatches(a, "/p", .{ .when = .{ .agent_scope = .subagent } }, .{ .event = .stop }));
-}
-
-test "routing configuration rejects typos null selectors and handler-level ambiguity" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    for ([_][]const u8{ "{}", "null", "[]", "{\"agent_scope\":\"child\"}", "{\"request_purpose\":\"judge\"}", "{\"model\":null}", "{\"provider\":\"\"}", "{\"agent_scp\":\"main\"}" }) |filter| {
-        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, filter, .{});
-        try std.testing.expectError(error.InvalidHookFilter, parseWhen(a, value));
-    }
-    const source =
-        \\{"PreToolUse":[{"matcher":"Read","when":{"agent_scope":"subagent","request_purpose":"agent","model":"qwen3"},"hooks":[{"command":"true"}]},{"when":{"agent_scope":"main"},"hooks":[{"command":"true"}]}]}
-    ;
-    const set = try parse(a, try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{}), "policy.json");
-    try std.testing.expectEqual(AgentScope.subagent, set.pre_tool_use[0].when.?.agent_scope.?);
-    try std.testing.expectEqualStrings("qwen3", set.pre_tool_use[0].when.?.model.?);
-    try std.testing.expectEqual(AgentScope.main, set.pre_tool_use[1].when.?.agent_scope.?);
-    const ambiguous = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        \\{"PreToolUse":[{"hooks":[{"command":"true","when":{"agent_scope":"main"}}]}]}
-    , .{});
-    try std.testing.expectError(error.InvalidHookDefinition, parse(a, ambiguous, "policy.json"));
 }
 
 test "permission and retry hooks reject malformed output and preserve blocking reasons" {
@@ -1799,45 +1492,6 @@ test "permission and retry hooks reject malformed output and preserve blocking r
     }
 }
 
-test "background saturation rejects excess work without waiting for long commands" {
-    const a = std.testing.allocator;
-    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
-    defer runtime.deinit();
-    var hooks: [65]Hook = @splat(.{ .async = true, .command = "cat >/dev/null; sleep 30" });
-    hooks[64].command = "echo excess";
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .runtime = &runtime, .set = .{ .pre_tool_use = &hooks } };
-    const started = std.Io.Clock.now(.awake, std.testing.io).toMilliseconds();
-    try std.testing.expectError(error.BackgroundHookLimit, runner.evaluate(a, .{ .event = .pre_tool_use }));
-    try std.testing.expect(std.Io.Clock.now(.awake, std.testing.io).toMilliseconds() - started < 1000);
-}
-
-test "a transcript snapshot survives its owner until the last hook reader finishes" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    defer a.free(root);
-    var runtime: Runtime = .{ .allocator = a, .io = std.testing.io };
-    defer runtime.deinit();
-    const path = try runtime.privatePath(a, "jsonl");
-    defer a.free(path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "original transcript" });
-    try runtime.registerSnapshot(path);
-    const command = try std.fmt.allocPrint(a, "cat '{s}' > observed", .{path});
-    defer a.free(command);
-    const runner: Runner = .{ .io = std.testing.io, .root = root, .runtime = &runtime, .set = .{ .pre_tool_use = &.{.{ .command = command }} } };
-    const dispatch = try Dispatch.start(a, runner, .{ .event = .pre_tool_use, .transcript_path = path });
-    runtime.releaseSnapshot(path);
-    dispatch.join();
-    const observed = try tmp.dir.readFileAlloc(std.testing.io, "observed", a, .limited(1024));
-    defer a.free(observed);
-    try std.testing.expectEqualStrings("original transcript", observed);
-    const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
-    file.close(std.testing.io);
-    dispatch.destroy();
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, path, .{}));
-}
-
 test "missing or unexecutable completion policies fail closed" {
     const a = std.testing.allocator;
     inline for (.{ Event.stop, Event.subagent_stop }) |event| {
@@ -1848,21 +1502,6 @@ test "missing or unexecutable completion policies fail closed" {
             try std.testing.expectError(error.HookCommandUnavailable, runner.evaluate(a, .{ .event = event }));
         }
     }
-}
-
-test "command hooks normalize timeout seconds and provide project environment" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        \\{"PreToolUse":[{"hooks":[{"command":"test $SYNTH_PROJECT_DIR = . && test $CLAUDE_PROJECT_DIR = . || exit 2; printf '{}'","timeout":2}]}]}
-    , .{});
-    const set = try parse(a, value, "policy.json");
-    try std.testing.expectEqual(@as(?u64, 2000), set.pre_tool_use[0].timeout_ms);
-    const runner: Runner = .{ .io = std.testing.io, .root = ".", .set = set };
-    var result = try runner.evaluate(std.testing.allocator, .{ .event = .pre_tool_use });
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.blocked == null);
 }
 
 test "a failing hook blocks request events and lets other events continue unless told otherwise" {

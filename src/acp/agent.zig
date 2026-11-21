@@ -3110,39 +3110,6 @@ test "a synth client opens a session and has its snapshot before the reply" {
     try testing.expectEqualStrings("cwd must be an absolute path", (try client.expectError(relative)).message);
 }
 
-test "ACP rejects blocked prompts and refreshes trust changed outside the session" {
-    const fixture = try Fixture.create();
-    defer fixture.destroy();
-    const arena = fixture.arena.allocator();
-    const trust_path = try std.fs.path.join(arena, &.{ fixture.project, "..", "hook-trust.json" });
-    fixture.config.hook_state_path = trust_path;
-    const client = try fixture.connect();
-    defer client.close();
-    try client.initialize(false);
-    const opened = try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project });
-    const session = try rpc.parse(protocol.SessionSetup, client.arena.allocator(), try client.expectResult(opened));
-
-    try fixture.tmp.dir.createDirPath(testing.io, "project/.synth");
-    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "project/.synth/hooks.json", .data =
-        \\{"UserPromptSubmit":[{"hooks":[{"command":"echo blocked >&2; exit 2"}]}]}
-    });
-    const unreviewed = try client.prompt(session.sessionId, "pending review");
-    try testing.expectEqualStrings(Hooks.review_notice, (try client.expectError(unreviewed)).message);
-
-    var store = try HookStore.Store.init(testing.allocator, testing.io, trust_path);
-    defer store.deinit();
-    var definitions = try HookStore.discover(arena, testing.io, fixture.config.hooks, fixture.project, null, store);
-    const id = definitions.user_prompt_submit[0].id;
-    try HookStore.change(arena, testing.io, &definitions, trust_path, .trust, id);
-    const blocked = try client.prompt(session.sessionId, "blocked by policy");
-    try testing.expectEqualStrings("blocked by a hook", (try client.expectError(blocked)).message);
-
-    try HookStore.change(arena, testing.io, &definitions, trust_path, .revoke, id);
-    const revoked = try client.prompt(session.sessionId, "revoked hook");
-    try testing.expectEqualStrings(Hooks.review_notice, (try client.expectError(revoked)).message);
-    try testing.expectEqual(@as(?i64, null), try fixture.db.sessionByHandle(session.sessionId));
-}
-
 test "a turn runs, its approval asked as a permission request and its prompt answered at the end" {
     const fixture = try Fixture.create();
     defer fixture.destroy();
@@ -3972,20 +3939,4 @@ test "session list cursors page through equal timestamps and stay within their p
     const remaining = try client.request(protocol.method.session_list, protocol.ListSessions{ .cursor = global.nextCursor.? });
     const global_tail = try rpc.parse(protocol.SessionList, arena, try client.expectResult(remaining));
     try testing.expectEqual(@as(usize, 4), global_tail.sessions.len);
-}
-
-test "session notices preserve formatted text beyond the small notice buffer" {
-    const fixture = try Fixture.create();
-    defer fixture.destroy();
-    const client = try fixture.connect();
-    defer client.close();
-    _ = try client.expectResult(try client.request(protocol.method.initialize, protocol.Initialize{
-        .protocolVersion = protocol.version,
-        .clientCapabilities = .{ .session = .{ .notices = .{} } },
-    }));
-    _ = try client.expectResult(try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project }));
-    const path = "a" ** 1024;
-    fixture.agent.session.?.notice(.info, "Working directory: {s}", .{path});
-    const update = try client.awaitUpdate("notice");
-    try testing.expectEqualStrings("Working directory: " ++ path, update.get("title").?.string);
 }

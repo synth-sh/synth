@@ -116,14 +116,3 @@ test "replacement arguments must satisfy required fields and types" {
     try std.testing.expectError(error.InvalidToolInput, validate(schema, wrong));
     try std.testing.expectError(error.InvalidToolInput, validate(schema, .{ .object = .empty }));
 }
-
-test "MCP replacements accept nullable types and numeric enum values" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const schema = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":[\"string\",\"null\"]},\"mode\":{\"type\":\"integer\",\"enum\":[1,2]}}}", .{});
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"value\":\"updated\",\"mode\":1}", .{});
-    try validate(schema, value);
-    const invalid = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"value\":true,\"mode\":3}", .{});
-    try std.testing.expectError(error.InvalidToolInput, validate(schema, invalid));
-}

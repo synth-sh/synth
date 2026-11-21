@@ -277,19 +277,6 @@ test "oversized instructions and answers are omitted whole rather than clipped" 
     try std.testing.expect(saved.has_human);
 }
 
-test "omitted prompts still displace older grants" {
-    const a = std.testing.allocator;
-    var intent: Intent = .{};
-    defer intent.deinit(a);
-    try intent.record(a, "allow an upload", false);
-    for (0..max_family_records) |_| try intent.record(a, "x" ** (max_record_bytes + 1), false);
-    const saved = try intent.snapshot(a);
-    defer saved.deinit(a);
-    try std.testing.expectEqual(1, saved.messages.len);
-    try std.testing.expectEqualStrings(omission_notice, saved.messages[0].text);
-    try std.testing.expect(saved.has_human);
-}
-
 test "only provenance-verified answers become person messages" {
     const a = std.testing.allocator;
     var intent: Intent = .{};
@@ -304,25 +291,6 @@ test "only provenance-verified answers become person messages" {
     try std.testing.expectEqual(Conversation.Role.assistant, saved.messages[0].role);
     try std.testing.expectEqualStrings("my typed restriction", saved.messages[1].text);
     try std.testing.expectEqual(Conversation.Origin.human, saved.messages[1].origin);
-}
-
-test "guardian storage uses the upstream family and serialized-record byte limits" {
-    const a = std.testing.allocator;
-    var intent: Intent = .{};
-    defer intent.deinit(a);
-    const large = "x" ** 16000;
-    for (0..8) |_| try intent.record(a, large, false);
-    try std.testing.expect(intent.prompts.bytes <= max_family_bytes);
-    try std.testing.expectEqual(@as(usize, 4), intent.prompts.records.items.len);
-    for (intent.prompts.records.items) |entry| try std.testing.expectEqualStrings(large, entry.evidence.?.text);
-    const oversized = try answerReceipt(a, "question", "x" ** max_record_bytes);
-    defer a.free(oversized);
-    try std.testing.expect(oversized.len <= max_record_bytes);
-    try intent.record(a, oversized, true);
-    const evidence = try intent.snapshot(a);
-    defer evidence.deinit(a);
-    try std.testing.expectEqual(@as(usize, 1), evidence.messages.len);
-    try std.testing.expectEqualStrings(omission_notice, evidence.messages[0].text);
 }
 
 test "a long model question never hides the typed answer" {

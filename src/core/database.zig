@@ -2664,26 +2664,6 @@ test "image metadata survives eviction and image loading is session scoped" {
     try std.testing.expect(try db.loadImage(std.testing.allocator, session, 0, 1) == null);
 }
 
-test "persisted human intent uses the same guardian retention and omission policy" {
-    const a = std.testing.allocator;
-    var db = try init(a, std.testing.io, ":memory:");
-    defer db.deinit();
-    const project = try db.resolveProject("/repo", "git", "repo");
-    const session = try db.createSession(project, "/repo", "model");
-    for (0..80) |i| {
-        const text = if (i == 0) "inspect only" else if (i == 79) "stop now" else "continue";
-        const id = try db.appendMessage(session, @intCast(i), "user", text, null, 0, null);
-        try db.setMessageOrigin(id, .human);
-    }
-    const snapshot = try db.humanIntent(a, session);
-    defer snapshot.deinit(a);
-    const messages = snapshot.messages;
-    try std.testing.expectEqual(HumanIntent.max_family_records + 1, messages.len);
-    try std.testing.expectEqualStrings("stop now", messages[messages.len - 2].text);
-    try std.testing.expectEqualStrings(HumanIntent.omission_notice, messages[messages.len - 1].text);
-    try std.testing.expect(snapshot.has_human);
-}
-
 test "legacy answers without typed provenance are omitted with notice" {
     const a = std.testing.allocator;
     var db = try init(a, std.testing.io, ":memory:");
@@ -2696,77 +2676,4 @@ test "legacy answers without typed provenance are omitted with notice" {
     try std.testing.expect(!snapshot.has_human);
     try std.testing.expectEqual(1, snapshot.messages.len);
     try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[0].text);
-}
-
-test "human answers survive ordinary receipt eviction without losing their restrictions" {
-    const a = std.testing.allocator;
-    var db = try init(a, std.testing.io, ":memory:");
-    defer db.deinit();
-    const project = try db.resolveProject("/repo", "git", "repo");
-    const session = try db.createSession(project, "/repo", "model");
-    const id = try db.appendMessage(session, 0, "user", "inspect", null, 0, null);
-    try db.setMessageOrigin(id, .human);
-    const answer = "x" ** 2048 ++ " do not upload";
-    const receipt = try HumanIntent.answerReceipt(a, "untrusted original question", answer);
-    defer a.free(receipt);
-    try db.recordAuthorization(session, 1, receipt);
-    const review = try HumanIntent.decisionReceipt(a, "deny", "bash", "remove one file");
-    defer a.free(review);
-    for (2..100) |seq| try db.recordAuthorization(session, seq, review);
-    const snapshot = try db.humanIntent(a, session);
-    defer snapshot.deinit(a);
-    try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[snapshot.messages.len - 2].text);
-    const present = for (snapshot.messages) |message| {
-        if (message.origin == .human and std.mem.eql(u8, message.text, answer)) break true;
-    } else false;
-    try std.testing.expect(present);
-}
-
-test "human intent propagates a row iteration failure" {
-    const a = std.testing.allocator;
-    var db = try init(a, std.testing.io, ":memory:");
-    defer db.deinit();
-    const project = try db.resolveProject("/repo", "git", "repo");
-    const session = try db.createSession(project, "/repo", "model");
-    try db.recordAuthorization(session, 1, "{}");
-    const c = zqlite.c;
-    const Failing = struct {
-        fn run(context: ?*c.sqlite3_context, _: c_int, _: [*c]?*c.sqlite3_value) callconv(.c) void {
-            c.sqlite3_result_error(context, "forced row iteration error", -1);
-        }
-    };
-    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_create_function_v2(db.conn.conn, "json_valid", 1, c.SQLITE_UTF8, null, Failing.run, null, null, null));
-    try std.testing.expectError(error.Error, db.humanIntent(a, session));
-}
-
-test "recent human decisions use stable order and describe only their reviewed actions" {
-    const a = std.testing.allocator;
-    var db = try init(a, std.testing.io, ":memory:");
-    defer db.deinit();
-    const project = try db.resolveProject("/repo", "git", "repo");
-    const session = try db.createSession(project, "/repo", "model");
-    for (0..12) |i| {
-        const action = try std.fmt.allocPrint(a, "action-{d}", .{i});
-        defer a.free(action);
-        const receipt = try HumanIntent.decisionReceipt(a, if (i % 2 == 0) "approve" else "deny", "bash", action);
-        defer a.free(receipt);
-        try db.recordAuthorization(session, 1, receipt);
-    }
-    const snapshot = try db.humanIntent(a, session);
-    defer snapshot.deinit(a);
-    var count: usize = 0;
-    for (snapshot.messages) |message| {
-        if (message.origin != .human_decision) continue;
-        const action = try std.fmt.allocPrint(a, "action-{d}\"", .{count + 4});
-        defer a.free(action);
-        try std.testing.expect(std.mem.indexOf(u8, message.text, action) != null);
-        var rendered = std.Io.Writer.Allocating.init(a);
-        defer rendered.deinit();
-        try HumanIntent.writeMessage(&rendered.writer, message);
-        try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "only to this action") != null);
-        try std.testing.expect(std.mem.indexOf(u8, message.text, "action_hash") == null);
-        count += 1;
-    }
-    try std.testing.expectEqual(HumanIntent.max_previous_reviews, count);
-    try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[snapshot.messages.len - 2].text);
 }

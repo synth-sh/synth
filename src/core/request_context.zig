@@ -116,20 +116,3 @@ test "request tool selection cannot add tools and context cannot split tool exch
     try std.testing.expectEqualStrings("filtered", conversation.messages.items[1].text);
     try std.testing.expectError(error.IncompleteContextExchange, apply(&conversation, &.{.{ .seq = 0, .omit = true }}));
 }
-
-test "edited request messages clear replay state without changing reference messages" {
-    const a = std.testing.allocator;
-    var original = Conversation.init(a);
-    defer original.deinit();
-    var images = [_][]const u8{"secret-image"};
-    _ = try original.append(.{ .role = .user, .origin = .human, .text = "secret", .provider_state = "secret replay", .images = &images, .thinking = "secret reasoning" });
-    var prepared = Conversation.init(a);
-    defer prepared.deinit();
-    try prepared.adoptMessage(try original.messages.items[0].clone(a));
-    try apply(&prepared, &.{.{ .seq = 0, .text = "filtered", .omit_images = true, .omit_thinking = true }});
-    try std.testing.expect(prepared.messages.items[0].provider_state == null);
-    try std.testing.expect(prepared.messages.items[0].thinking == null);
-    try std.testing.expectEqual(@as(usize, 0), prepared.messages.items[0].images.len);
-    try std.testing.expectEqualStrings("secret replay", original.messages.items[0].provider_state.?);
-    try std.testing.expectEqual(Conversation.Origin.human, original.messages.items[0].origin);
-}

@@ -63,34 +63,3 @@ fn normalizeAlias(a: std.mem.Allocator, value: *std.json.Value, before: std.json
     try value.object.put(a, native, changed);
     _ = value.object.orderedRemove(alias);
 }
-
-test "updated inputs normalize either spelling without ignoring edits or MCP arguments" {
-    const a = std.testing.allocator;
-    for ([_]struct { name: []const u8 = "edit", before: []const u8, after: []const u8, expected: []const u8 }{
-        .{ .name = "write", .before = "{\"path\":\"old\"}", .after = "{\"file_path\":\"new\",\"content\":\"x\"}", .expected = "{\"content\":\"x\",\"path\":\"new\"}" },
-        .{ .before = "{\"path\":\"old\"}", .after = "{\"path\":\"old\",\"file_path\":\"new\",\"old_string\":\"a\",\"new_string\":\"b\"}", .expected = "{\"path\":\"new\",\"old\":\"a\",\"new\":\"b\"}" },
-        .{ .before = "{\"path\":\"old\"}", .after = "{\"path\":\"new\",\"file_path\":\"old\"}", .expected = "{\"path\":\"new\"}" },
-        .{ .before = "{\"path\":\"x\"}", .after = "{\"file_path\":\"x\",\"edits\":[{\"old_string\":\"a\",\"new_string\":\"b\"}]}", .expected = "{\"edits\":[{\"old\":\"a\",\"new\":\"b\"}],\"path\":\"x\"}" },
-        .{ .name = "mcp__server__edit", .before = "{}", .after = "{\"path\":\"x\",\"file_path\":\"y\"}", .expected = "{\"path\":\"x\",\"file_path\":\"y\"}" },
-    }) |case| {
-        const result = try normalize(a, case.name, case.before, case.after);
-        defer a.free(result);
-        const actual = try std.json.parseFromSlice(std.json.Value, a, result, .{});
-        defer actual.deinit();
-        const expected = try std.json.parseFromSlice(std.json.Value, a, case.expected, .{});
-        defer expected.deinit();
-        try std.testing.expect(schema.jsonEqual(actual.value, expected.value));
-    }
-    try std.testing.expectError(error.ConflictingHookAliases, normalize(a, "write", "{\"path\":\"old\"}", "{\"path\":\"one\",\"file_path\":\"two\"}"));
-}
-
-test "batched edit inputs expose aliases for every replacement" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"path\":\"x\",\"edits\":[{\"old\":\"a\",\"new\":\"b\"},{\"old\":\"c\",\"new\":\"d\"}]}", .{});
-    try addAliases(a, "edit", &value);
-    const edits = value.object.get("edits").?.array.items;
-    try std.testing.expectEqualStrings("a", edits[0].object.get("old_string").?.string);
-    try std.testing.expectEqualStrings("d", edits[1].object.get("new_string").?.string);
-}

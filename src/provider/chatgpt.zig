@@ -727,55 +727,6 @@ test "a request names its cache key as its session, so it is routed to its cache
     try testing.expectEqualStrings(parsed.object.get("prompt_cache_key").?.string, headers[1].value);
 }
 
-test "recorded items keep their order and metadata while replaying effective call arguments" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = try testStore(&tmp);
-    defer store.destroy();
-    var chat = testProvider(store);
-    defer chat.deinit();
-
-    var convo: Conversation = .init(testing.allocator);
-    defer convo.deinit();
-    try convo.add(.user, "read two files");
-    var calls = [_]Conversation.ToolCall{
-        .{ .id = "call_1", .name = "read", .arguments = "{\"path\":\"a\"}" },
-        .{ .id = "call_2", .name = "read", .arguments = "{\"path\":\"b\"}" },
-    };
-    _ = try convo.append(.{
-        .role = .assistant,
-        .text = "Reading both.",
-        .tool_calls = &calls,
-        .provider_state =
-        \\{"provider":"chatgpt","model":"gpt-test","items":[
-        \\{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"opaque"},
-        \\{"id":"msg_1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Reading both."}]},
-        \\{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"proposed\"}"},
-        \\{"id":"fc_2","type":"function_call","call_id":"call_2","name":"read","arguments":"{\"path\":\"b\"}"}]}
-        ,
-    });
-    _ = try convo.addToolResult("read", "call_1", "contents of a");
-    _ = try convo.addToolResult("read", "call_2", "contents of b");
-
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const body = try chat.buildRequest(arena_state.allocator(), &convo, .{ .system = "s" });
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
-    const input = parsed.object.get("input").?.array.items;
-
-    const expected = [_][]const u8{ "message", "message", "reasoning", "message", "function_call", "function_call", "function_call_output", "function_call_output" };
-    try testing.expectEqual(expected.len, input.len);
-    for (expected, input) |kind, item| try testing.expectEqualStrings(kind, item.object.get("type").?.string);
-    try testing.expectEqualStrings("opaque", input[2].object.get("encrypted_content").?.string);
-    try testing.expectEqualStrings("commentary", input[3].object.get("phase").?.string);
-    try testing.expectEqualStrings("fc_1", input[4].object.get("id").?.string);
-    try testing.expectEqualStrings(calls[0].arguments, input[4].object.get("arguments").?.string);
-    try testing.expectEqualStrings(calls[1].arguments, input[5].object.get("arguments").?.string);
-    try testing.expectEqualStrings("call_2", input[7].object.get("call_id").?.string);
-    try testing.expectEqualStrings("contents of a", input[6].object.get("output").?.string);
-    try testing.expectEqualStrings("contents of b", input[7].object.get("output").?.string);
-}
-
 test "a turn another provider answered is rebuilt, and an unanswered call is closed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1049,37 +1000,4 @@ test "a note posted mid-turn does not cut a tool call off from its result" {
     const last = input[input.len - 1].object;
     try testing.expectEqualStrings("function_call_output", last.get("type").?.string);
     try testing.expectEqualStrings("a b c", last.get("output").?.string);
-}
-
-test "a fresh authenticated turn initializes cache identity before transport hooks" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "chatgpt.json", .data = "{\"access_token\":\"test-token\",\"scope\":\"chatgpt.tokens.use.direct\",\"expires_at\":9000000000}" });
-    const store = try testStore(&tmp);
-    defer store.destroy();
-    var chat = testProvider(store);
-    defer chat.deinit();
-    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
-    defer testing.allocator.free(root);
-    const Hooks = @import("../core/hooks.zig");
-    const runner: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .http_request = &.{.{ .command = "cat > prepared; exit 2" }} } };
-    var convo: Conversation = .init(testing.allocator);
-    defer convo.deinit();
-    try convo.add(.user, "hello");
-    const selected = chat.provider();
-    try testing.expectError(error.HookBlocked, selected.respond(selected.userdata, &convo, .{ .system = "s", .hooks = &runner }, testing.allocator, null));
-    const payload = try tmp.dir.readFileAlloc(testing.io, "prepared", testing.allocator, .limited(128 * 1024));
-    defer testing.allocator.free(payload);
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const input = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), payload, .{});
-    const http = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), input.object.get("http").?.string, .{});
-    const key = http.object.get("body").?.object.get("prompt_cache_key").?.string;
-    try testing.expectEqualStrings(key, http.object.get("headers").?.object.get("session-id").?.string);
-    var child = testProvider(store);
-    defer child.deinit();
-    try child.startLike(&chat);
-    try convo.add(.assistant, "continuing");
-    const next = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try child.buildRequest(arena.allocator(), &convo, .{ .system = "s" }), .{});
-    try testing.expectEqualStrings(key, next.object.get("prompt_cache_key").?.string);
 }

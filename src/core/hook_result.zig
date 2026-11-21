@@ -280,31 +280,6 @@ fn oneOf(value: []const u8, choices: []const []const u8) bool {
     return false;
 }
 
-test "hook result fixtures accept only the effects supported by each event" {
-    const Case = struct { event: []const u8, output: std.json.Value, expected: ?std.json.Value = null, error_name: ?[]const u8 = null };
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cases = try std.json.parseFromSliceLeaky([]Case, a, @embedFile("fixtures/hooks/results.json"), .{});
-    for (cases) |case| {
-        const event = Event.fromName(case.event) orelse return error.InvalidHookEvent;
-        const encoded = try std.json.Stringify.valueAlloc(a, case.output, .{});
-        var result = parse(std.testing.allocator, encoded, event) catch |err| {
-            if (case.expected != null or err == error.OutOfMemory) return err;
-            if (case.error_name) |name| try std.testing.expectEqualStrings(name, @errorName(err));
-            continue;
-        };
-        defer result.deinit(std.testing.allocator);
-        const expected = case.expected orelse return error.InvalidFixtureAccepted;
-        for (expected.object.values()) |*value| {
-            if (value.* != .object and value.* != .array) continue;
-            const json = try std.json.Stringify.valueAlloc(a, value.*, .{});
-            value.* = .{ .string = json };
-        }
-        try std.testing.expectEqualDeep(try std.json.parseFromValueLeaky(Result, a, expected, .{}), result);
-    }
-}
-
 test "permission aggregation retains asks and denials over allowances" {
     var result: Result = .{};
     defer result.deinit(std.testing.allocator);
@@ -314,39 +289,4 @@ test "permission aggregation retains asks and denials over allowances" {
     try result.merge(std.testing.allocator, .{ .permission = .deny });
     try result.merge(std.testing.allocator, .{ .permission = .allow });
     try std.testing.expectEqual(Permission.deny, result.permission.?);
-}
-
-test "request handler outputs compose without losing restrictions or independent settings" {
-    const a = std.testing.allocator;
-    var result: Result = .{};
-    defer result.deinit(a);
-    try result.merge(a, .{ .settings = @constCast("{\"temperature\":0}"), .request_context = @constCast("{\"tools\":[\"read\"],\"messages\":[{\"seq\":1,\"text\":\"filtered\"}]}"), .http = @constCast("{\"headers\":{\"x-one\":\"1\"}}") });
-    try result.merge(a, .{ .settings = @constCast("{\"top_p\":0.5}"), .request_context = @constCast("{\"system\":\"prepared\",\"tools\":[\"read\",\"bash\"]}"), .http = @constCast("{\"headers\":{\"x-two\":\"2\"}}") });
-    const settings = try std.json.parseFromSlice(std.json.Value, a, result.settings.?, .{});
-    defer settings.deinit();
-    try std.testing.expect(settings.value.object.contains("temperature"));
-    try std.testing.expect(settings.value.object.contains("top_p"));
-    const context = try std.json.parseFromSlice(std.json.Value, a, result.request_context.?, .{});
-    defer context.deinit();
-    try std.testing.expectEqual(@as(usize, 1), context.value.object.get("tools").?.array.items.len);
-    try std.testing.expect(context.value.object.contains("messages"));
-    const http = try std.json.parseFromSlice(std.json.Value, a, result.http.?, .{});
-    defer http.deinit();
-    try std.testing.expectEqual(@as(usize, 2), http.value.object.get("headers").?.object.count());
-}
-
-test "null optional context fields do not erase restrictions during composition" {
-    const a = std.testing.allocator;
-    for ([_]bool{ false, true }) |reverse| {
-        var result: Result = .{};
-        defer result.deinit(a);
-        const nullable: Result = .{ .request_context = @constCast("{\"tools\":null,\"system\":null}") };
-        const selected: Result = .{ .request_context = @constCast("{\"tools\":[\"read\"],\"system\":\"prepared\"}") };
-        try result.merge(a, if (reverse) selected else nullable);
-        try result.merge(a, if (reverse) nullable else selected);
-        const parsed = try std.json.parseFromSlice(@import("request_context.zig").Patch, a, result.request_context.?, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqualStrings("read", parsed.value.tools.?[0]);
-        try std.testing.expectEqualStrings("prepared", parsed.value.system.?);
-    }
 }

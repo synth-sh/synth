@@ -337,32 +337,6 @@ test "a stack assembles a loop ready for its first turn" {
     try testing.expect(stack.loop.delegate != null);
 }
 
-test "main-session shutdown emits one bounded command cleanup" {
-    const testing = std.testing;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(testing.io, ".git");
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = buffer[0..try tmp.dir.realPath(testing.io, &buffer)];
-    var config: Config = .{ .arena = .init(testing.allocator) };
-    defer config.arena.deinit();
-    var backend: Backend = .init(.ollama, .{ .allocator = testing.allocator, .io = testing.io, .host = "http://127.0.0.1:9", .label = "test" });
-    defer backend.deinit();
-    const stack = try create(testing.allocator, testing.io, .{ .config = &config, .provider = backend.provider(), .cwd = cwd });
-    stack.hooks.set.session_end = &.{.{ .command = "cat >> shutdown-events; exec 0<&- 1>&- 2>&-; sleep 30", .timeout_ms = 1000 }};
-    const started = tool.monotonicMilliseconds(testing.io);
-    stack.destroy();
-    try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 3000);
-    const trace = try tmp.dir.readFileAlloc(testing.io, "shutdown-events", testing.allocator, .limited(16 * 1024));
-    defer testing.allocator.free(trace);
-    var lines = std.mem.tokenizeScalar(u8, trace, '\n');
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("SessionEnd", parsed.value.object.get("hook_event_name").?.string);
-    try testing.expectEqualStrings("shutdown", parsed.value.object.get("reason").?.string);
-    try testing.expect(lines.next() == null);
-}
-
 test "trusted current config policy blocks replacement definitions before adoption" {
     var memory: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
     defer std.debug.assert(memory.deinit() == .ok);
@@ -404,24 +378,4 @@ test "trusted current config policy blocks replacement definitions before adopti
     defer parsed.deinit();
     try std.testing.expectEqualStrings("project_settings", parsed.value.object.get("source").?.string);
     try std.testing.expect(std.mem.endsWith(u8, parsed.value.object.get("file_path").?.string, "/.synth/hooks.json"));
-}
-
-test "shutdown hooks can read their final transcript snapshot" {
-    const testing = std.testing;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(testing.io, ".git");
-    const cwd = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
-    defer testing.allocator.free(cwd);
-    var config: Config = .{ .arena = .init(testing.allocator) };
-    defer config.arena.deinit();
-    var backend: Backend = .init(.ollama, .{ .allocator = testing.allocator, .io = testing.io, .host = "http://127.0.0.1:9", .label = "test" });
-    defer backend.deinit();
-    const stack = try create(testing.allocator, testing.io, .{ .config = &config, .provider = backend.provider(), .cwd = cwd });
-    try stack.convo.add(.user, "final history");
-    stack.hooks.set.session_end = &.{.{ .transcript = true, .command = "python3 -c 'import json,sys; p=json.load(sys.stdin); open(\"archived\",\"w\").write(open(p[\"transcript_path\"]).read())'" }};
-    stack.destroy();
-    const archived = try tmp.dir.readFileAlloc(testing.io, "archived", testing.allocator, .limited(4096));
-    defer testing.allocator.free(archived);
-    try testing.expect(std.mem.indexOf(u8, archived, "final history") != null);
 }

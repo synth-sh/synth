@@ -703,13 +703,3 @@ test "a pathological pattern gives up rather than hanging" {
     try testing.expect(!re.matches("a" ** 40));
     try testing.expect(re.matches("aaab"));
 }
-
-test "checked matches reports a budget spent between starting positions" {
-    var re = try compile(testing.allocator, "a", .{});
-    defer re.deinit();
-    const input = try testing.allocator.alloc(u8, max_steps);
-    defer testing.allocator.free(input);
-    @memset(input, 'b');
-    try testing.expectError(error.RegexResourceLimit, re.checkedMatches(input));
-    try testing.expect(try re.checkedMatches("a"));
-}

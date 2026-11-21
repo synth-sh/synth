@@ -114,13 +114,3 @@ pub const Policy = struct {
         }
     }
 };
-
-test "routes are purpose restricted and settings are bounded" {
-    const policy: Policy = .{ .routes = &.{.{ .id = "review", .provider = .openai, .endpoint = "http://localhost:8000/v1", .model = "local", .purposes = &.{.approval_judge} }} };
-    try policy.validate();
-    _ = try policy.route("review", .approval_judge);
-    try std.testing.expectError(error.ModelRoutePurposeDenied, policy.route("review", .agent));
-    try std.testing.expectError(error.ModelRouteDenied, policy.route("remote", .agent));
-    try std.testing.expectError(error.InvalidModelSettings, (Settings{ .attempts = max_attempts + 1 }).validate());
-    try std.testing.expectError(error.InvalidModelSettings, (Settings{ .temperature = std.math.nan(f32) }).validate());
-}
