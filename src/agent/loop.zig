@@ -2046,7 +2046,7 @@ fn action(self: *Loop, call: *const Conversation.ToolCall) ![]u8 {
     var roots: std.ArrayList([]const u8) = .empty;
     try roots.append(a, self.resolveAgainstProject(a, self.project_root) orelse return error.UnresolvedActionTarget);
     for (self.additional_roots.items) |root| try roots.append(a, self.resolveAgainstProject(a, root) orelse return error.UnresolvedActionTarget);
-    return std.json.Stringify.valueAlloc(self.allocator, .{
+    return std.json.Stringify.valueAlloc(self.allocator, action_paths.Snapshot{
         .call_id = call.id,
         .tool = call.name,
         .arguments = input,
@@ -2054,7 +2054,7 @@ fn action(self: *Loop, call: *const Conversation.ToolCall) ![]u8 {
         .allowed_roots = roots.items,
         .resolved_targets = try action_paths.resolvedTargets(self.io, a, self.workingDirectory(), input.object),
         .agent_id = &self.hook_flow.identity,
-        .parent_agent_id = if (self.parent) |parent| @as([]const u8, &parent.hook_flow.identity) else "",
+        .parent_agent_id = if (self.parent) |parent| &parent.hook_flow.identity else "",
         .parent_tool_call_id = self.hook_flow.parent_call_id,
     }, .{});
 }

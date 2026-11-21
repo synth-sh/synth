@@ -237,9 +237,9 @@ Set `server` and `tool` to a connected server and its advertised tool name.
   "server": "project-policy",
   "tool": "check_edit",
   "arguments": {
-    "file": "${input.tool_input.path}",
-    "args": "${input.tool_input}",
-    "origin": "synth:${input.session_id}"
+    "file": "${tool_input.path}",
+    "args": "${tool_input}",
+    "origin": "synth:${session_id}"
   }
 }
 ```

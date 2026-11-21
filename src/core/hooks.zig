@@ -4,6 +4,7 @@ const Filesystem = @import("../tools/filesystem.zig");
 const builtin = @import("builtin");
 const output = @import("hook_result.zig");
 const HooksCopy = @import("hooks_copy.zig");
+const HookCommand = @import("hook_command.zig");
 const regex = @import("regex.zig");
 const ansi = @import("ansi.zig");
 const ModelClass = @import("model_class.zig");
@@ -34,22 +35,10 @@ const output_file_buffer_bytes = 4 * 1024;
 const blocking_exit_code = 2;
 const not_executable_exit_code = 126;
 const command_not_found_exit_code = 127;
-const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT" };
 
 const claude_tool_names = std.StaticStringMap([]const u8).initComptime(.{
     .{ shell.tool_name, "Bash" }, .{ @tagName(Filesystem.Name.read), "Read" }, .{ @tagName(Filesystem.Name.write), "Write" }, .{ @tagName(Filesystem.Name.edit), "Edit" }, .{ task.tool_name, "Agent" },
 });
-
-pub fn expandProjectDir(arena: std.mem.Allocator, word: []const u8, root: []const u8) ![]const u8 {
-    var expanded = word;
-    for (project_dir_variables) |name| {
-        const braced = try std.fmt.allocPrint(arena, "${{{s}}}", .{name});
-        const bare = try std.fmt.allocPrint(arena, "${s}", .{name});
-        expanded = try std.mem.replaceOwned(u8, arena, expanded, braced, root);
-        expanded = try std.mem.replaceOwned(u8, arena, expanded, bare, root);
-    }
-    return expanded;
-}
 
 const max_timeout_ms: u64 = 86_400_000;
 const background_limit: usize = 64;
@@ -1052,20 +1041,12 @@ pub const Runner = struct {
         defer allocator.free(payload);
 
         if (self.givenUp()) return error.Cancelled;
-        const project_env = try std.fmt.allocPrint(allocator, "SYNTH_PROJECT_DIR={s}", .{self.root});
-        defer allocator.free(project_env);
-        const compatibility_env = try std.fmt.allocPrint(allocator, "CLAUDE_PROJECT_DIR={s}", .{self.root});
-        defer allocator.free(compatibility_env);
-        const claude_plugin_root_env = try std.fmt.allocPrint(allocator, "CLAUDE_PLUGIN_ROOT={s}", .{self.root});
-        defer allocator.free(claude_plugin_root_env);
-        const plugin_root_env = try std.fmt.allocPrint(allocator, "PLUGIN_ROOT={s}", .{self.root});
-        defer allocator.free(plugin_root_env);
-        const claude_plugin_data_env = try std.fmt.allocPrint(allocator, "CLAUDE_PLUGIN_DATA={s}/.synth/plugin-data", .{self.root});
-        defer allocator.free(claude_plugin_data_env);
-        const plugin_data_env = try std.fmt.allocPrint(allocator, "PLUGIN_DATA={s}/.synth/plugin-data", .{self.root});
-        defer allocator.free(plugin_data_env);
+        var command_arena: std.heap.ArenaAllocator = .init(allocator);
+        defer command_arena.deinit();
+        const environment = try HookCommand.environment(command_arena.allocator(), self.root);
+        const argv = [_][]const u8{ "env", "-u", "BASH_ENV" } ++ environment ++ [_][]const u8{ "bash", "-c", command };
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{ "env", "-u", "BASH_ENV", project_env, compatibility_env, claude_plugin_root_env, plugin_root_env, claude_plugin_data_env, plugin_data_env, "bash", "-c", command },
+            .argv = &argv,
             .cwd = .{ .dir = dir },
             .stdin = .pipe,
             .stdout = .pipe,

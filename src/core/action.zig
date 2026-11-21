@@ -5,6 +5,22 @@ const filesystem = @import("../tools/filesystem.zig");
 
 pub const path_fields = [_][]const u8{ filesystem.path_field, "file" };
 
+pub const Snapshot = struct {
+    call_id: []const u8 = "",
+    tool: []const u8,
+    arguments: std.json.Value,
+    cwd: []const u8,
+    allowed_roots: []const []const u8 = &.{},
+    resolved_targets: []const []const u8,
+    agent_id: []const u8 = "",
+    parent_agent_id: []const u8 = "",
+    parent_tool_call_id: []const u8 = "",
+
+    pub fn parse(a: std.mem.Allocator, json: []const u8) !Snapshot {
+        return std.json.parseFromSliceLeaky(Snapshot, a, json, .{ .ignore_unknown_fields = true });
+    }
+};
+
 pub fn resolvedTargets(io: std.Io, arena: std.mem.Allocator, cwd: []const u8, input: std.json.ObjectMap) ![]const []const u8 {
     var targets: std.ArrayList([]const u8) = .empty;
     for (path_fields) |field| {
@@ -15,8 +31,7 @@ pub fn resolvedTargets(io: std.Io, arena: std.mem.Allocator, cwd: []const u8, in
 }
 
 pub fn verify(io: std.Io, a: std.mem.Allocator, cwd: []const u8, name: []const u8, arguments: []const u8, snapshot: []const u8) !void {
-    const Action = struct { tool: []const u8, arguments: std.json.Value, cwd: []const u8, resolved_targets: []const []const u8 };
-    const approved = try std.json.parseFromSliceLeaky(Action, a, snapshot, .{ .ignore_unknown_fields = true });
+    const approved = try Snapshot.parse(a, snapshot);
     if (!std.mem.eql(u8, name, approved.tool) or !std.mem.eql(u8, try paths.resolve(io, a, cwd, "."), approved.cwd)) return error.ApprovedActionChanged;
     const input = try std.json.parseFromSliceLeaky(std.json.Value, a, arguments, .{});
     if (input != .object) return error.ApprovedActionChanged;

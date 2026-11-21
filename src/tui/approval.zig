@@ -8,6 +8,7 @@ const vxfw = vaxis.vxfw;
 
 const Loop = @import("../agent/loop.zig");
 const permission = @import("../agent/permission.zig");
+const Snapshot = @import("../core/action.zig").Snapshot;
 const diff = @import("diff.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
@@ -177,8 +178,7 @@ pub fn draw(self: *Approval, ctx: vxfw.DrawContext, parent: vxfw.Widget, args: D
 }
 
 fn withPreparedTargets(arena: std.mem.Allocator, snapshot: ?[]const u8, arguments: []const Line) ![]const Line {
-    const Action = struct { cwd: []const u8, resolved_targets: []const []const u8 };
-    const action = std.json.parseFromSliceLeaky(Action, arena, snapshot orelse return arguments, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    const action = Snapshot.parse(arena, snapshot orelse return arguments) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return arguments,
     };

