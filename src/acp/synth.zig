@@ -24,6 +24,7 @@ pub const version: u32 = 2;
 /// extension, and what the agent answers with.
 pub const Hello = struct {
     protocol: u32,
+    browser: bool = false,
 };
 
 pub const method = struct {
@@ -37,6 +38,7 @@ pub const method = struct {
     /// Something to tell the person: a hook refused a prompt, a command failed.
     pub const notice = "_synth/notice";
     pub const session_stopped = "_synth/session_stopped";
+    pub const browser = "_synth/browser";
 
     /// Client to agent.
     pub const compact = "_synth/compact";

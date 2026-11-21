@@ -38,6 +38,7 @@ const SignInTask = @import("../provider/sign_in.zig");
 const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
 const Provider = @import("../provider/provider.zig");
 const mcp_tools = @import("../tools/mcp.zig");
+const browser = @import("browser.zig");
 const skill_tool = @import("../tools/skill.zig");
 const shell = @import("../tools/shell.zig");
 const tool = @import("../tools/tool.zig");
@@ -107,6 +108,7 @@ calls: std.AutoHashMapUnmanaged(i64, *ClientCall) = .empty,
 /// Prompts answered when the turn they started or steered ends.
 prompts: std.ArrayList(Prompting) = .empty,
 next_id: i64 = 1,
+next_connection_id: u64 = 1,
 /// Says this process hosts the live session.
 lock: ?SessionLock = null,
 
@@ -140,6 +142,8 @@ fn add(self: *Agent, input: std.Io.File, output: std.Io.File, guest: bool) !void
     try self.connections.ensureUnusedCapacity(self.allocator, 1);
     const connection = try Connection.create(self, input, output);
     connection.guest = guest;
+    connection.serial = self.next_connection_id;
+    self.next_connection_id += 1;
     self.connections.appendAssumeCapacity(connection);
 }
 
@@ -328,7 +332,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     }
     if (eql(u8, method, protocol.method.session_prompt)) {
         const request = try rpc.parse(protocol.Prompt, arena, params);
-        try (try self.sessionFor(request.sessionId)).prompt(arena, request.prompt);
+        try (try self.sessionFor(request.sessionId)).prompt(arena, connection, request.prompt);
         const owned = try Prompting.init(self.allocator, connection, asked);
         self.prompts.append(self.allocator, owned) catch |err| {
             var unsent = owned;
@@ -473,6 +477,7 @@ fn initialize(self: *Agent, connection: *Connection, id: rpc.Id, request: protoc
         connection.writes_files = fs.writeTextFile;
     }
     connection.terminals = request.clientCapabilities.terminal;
+    connection.browser = if (asked) |hello| hello.browser else false;
     connection.notices = request.clientCapabilities.session.notices != null;
     connection.compactions = request.clientCapabilities.session.compaction != null;
     connection.reply(id, protocol.Initialized{
@@ -1031,11 +1036,32 @@ fn offering(self: *Agent, comptime offer: Offer) ?*Connection {
 /// Put `method` to `connection` from a tool's thread and wait for the reply,
 /// which the caller destroys. A call given up on is taken back.
 fn callClient(self: *Agent, ctx: tool.Context, connection: *Connection, method: []const u8, params: anytype) !*Inbound {
-    var call: ClientCall = .{ .connection = connection };
+    return self.callTarget(ctx, .{ .connection = connection }, method, params);
+}
+
+const ClientTarget = union(enum) {
+    connection: *Connection,
+    browser: u64,
+};
+
+fn resolveTarget(self: *Agent, target: ClientTarget) ?*Connection {
+    for (self.connections.items) |connection| {
+        if (connection.finished.load(.acquire)) continue;
+        switch (target) {
+            .connection => |wanted| if (connection == wanted) return connection,
+            .browser => |serial| if (connection.serial == serial) return connection,
+        }
+    }
+    return null;
+}
+
+fn callTarget(self: *Agent, ctx: tool.Context, target: ClientTarget, method: []const u8, params: anytype) !*Inbound {
+    var call: ClientCall = undefined;
     const id = blk: {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (std.mem.indexOfScalar(*Connection, self.connections.items, connection) == null) return error.ClientGone;
+        const connection = self.resolveTarget(target) orelse return error.ClientGone;
+        call = .{ .connection = connection };
         const id = self.next_id;
         self.next_id += 1;
         try self.calls.put(self.allocator, id, &call);
@@ -1050,7 +1076,7 @@ fn callClient(self: *Agent, ctx: tool.Context, connection: *Connection, method: 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.calls.remove(id)) continue;
-        connection.notify(protocol.method.cancel_request, protocol.CancelRequest{ .requestId = .{ .integer = id } });
+        call.connection.notify(protocol.method.cancel_request, protocol.CancelRequest{ .requestId = .{ .integer = id } });
         return error.Canceled;
     }
     const reply = call.reply orelse return error.ClientGone;
@@ -1166,6 +1192,7 @@ const Connection = struct {
     /// Came in on the session's socket, rather than being the client that
     /// started the agent.
     guest: bool = false,
+    serial: u64 = 0,
     /// Set by `initialize`. Session's thread only.
     dialect: ?Dialect = null,
     /// Opened or loaded the session, so it can be put what the session asks.
@@ -1178,6 +1205,7 @@ const Connection = struct {
     reads_files: bool = false,
     writes_files: bool = false,
     terminals: bool = false,
+    browser: bool = false,
     /// Shows `notice` updates.
     notices: bool = false,
     /// Follows compactions through `compaction_update`.
@@ -1401,6 +1429,7 @@ const Session = struct {
     /// The terminal each call ran in, for those a client ran. Guarded by the
     /// agent's `mutex`: tools note them from their own threads.
     terminals: std.AutoHashMapUnmanaged(Place, []u8) = .empty,
+    browser_client: ?u64 = null,
     /// The reply they have been streamed so far, which the message it lands
     /// as is told after.
     told_text: std.ArrayList(u8) = .empty,
@@ -1662,7 +1691,7 @@ const Session = struct {
 
     /// Start a turn on `blocks`, or steer the one running. A prompt of
     /// `/skill args` runs that skill, and `/compact` compacts.
-    fn prompt(self: *Session, arena: std.mem.Allocator, blocks: []const std.json.Value) !void {
+    fn prompt(self: *Session, arena: std.mem.Allocator, connection: *const Connection, blocks: []const std.json.Value) !void {
         var text: std.ArrayList(u8) = .empty;
         var attachments: std.ArrayList(mention.Attachment) = .empty;
         var images: std.ArrayList([]const u8) = .empty;
@@ -1678,6 +1707,7 @@ const Session = struct {
         };
 
         const loop = &self.stack.loop;
+        if (!loop.isBusy()) try self.configureBrowser(if (connection.browser) connection.serial else null);
         if (std.mem.startsWith(u8, text.items, "/")) {
             if (skill.findIn(self.stack.skills.skills, skill.idOf(text.items))) |found| {
                 if (loop.isBusy()) return error.Busy;
@@ -1694,6 +1724,36 @@ const Session = struct {
         }
         const extras: Loop.Extras = .{ .attachments = attachments.items, .images = images.items };
         if (!try loop.steer(text.items, extras)) try loop.submit(text.items, extras);
+    }
+
+    fn configureBrowser(self: *Session, client: ?u64) !void {
+        if (self.browser_client == null and client != null) {
+            try browser.install(&self.stack.registry, self, runBrowser);
+            errdefer browser.remove(&self.stack.registry);
+            try self.stack.loop.refreshTools();
+        } else if (self.browser_client != null and client == null) {
+            browser.remove(&self.stack.registry);
+            errdefer browser.install(&self.stack.registry, self, runBrowser) catch {};
+            try self.stack.loop.refreshTools();
+        }
+        self.browser_client = client;
+    }
+
+    fn runBrowser(ctx: tool.Context, operation: browser.Operation, arguments: std.json.Value) !tool.Output {
+        const self: *Session = @ptrCast(@alignCast(ctx.userdata.?));
+        const serial = self.browser_client orelse return error.ClientGone;
+        const reply = self.agent.callTarget(ctx, .{ .browser = serial }, synth.method.browser, .{
+            .sessionId = self.handle,
+            .operation = operation,
+            .arguments = arguments,
+        }) catch |err| switch (err) {
+            error.ClientGone => return tool.Output.err(try ctx.allocator.dupe(u8, "The Synth Desktop browser is disconnected.")),
+            else => return err,
+        };
+        defer reply.destroy();
+        const result = try rpc.parse(browser.Result, reply.arena.allocator(), reply.message.result);
+        const content = try ctx.allocator.dupe(u8, result.content);
+        return .{ .content = content, .is_error = result.isError };
     }
 
     /// A linked file in the project, attached as a mention of it would be.
