@@ -109,120 +109,48 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "SessionStart": {
-                    "$ref": "#/$defs/hookList"
-                },
+                "SessionStart": { "$ref": "#/$defs/hookList" },
                 "SessionEnd": {
                     "type": "array",
                     "items": {
                         "$ref": "#/$defs/sessionEndHookGroup"
                     }
                 },
-                "UserPromptSubmit": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PreToolUse": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PermissionRequest": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PostToolUse": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PreCompact": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PostCompact": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "SubagentStart": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "SubagentStop": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "Stop": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "Interrupt": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PreModelRequest": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PostModelRequest": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PostToolUseFailure": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PostToolBatch": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PermissionDenied": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "StopFailure": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "Notification": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "InstructionsLoaded": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "ConfigChange": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "FileChanged": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PreModelSwitch": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PostModelSwitch": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "TaskCreated": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "TaskCompleted": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "UserPromptExpansion": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "MessageDisplay": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "CwdChanged": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "DirectoryAdded": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "ModelResolve": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "ModelContext": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "ModelSettings": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "ModelRetry": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "PermissionEvaluate": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "HttpRequest": {
-                    "$ref": "#/$defs/hookList"
-                },
-                "HttpResponse": {
-                    "$ref": "#/$defs/hookList"
-                }
+                "UserPromptSubmit": { "$ref": "#/$defs/hookList" },
+                "PreToolUse": { "$ref": "#/$defs/hookList" },
+                "PermissionRequest": { "$ref": "#/$defs/hookList" },
+                "PostToolUse": { "$ref": "#/$defs/hookList" },
+                "PreCompact": { "$ref": "#/$defs/hookList" },
+                "PostCompact": { "$ref": "#/$defs/hookList" },
+                "SubagentStart": { "$ref": "#/$defs/hookList" },
+                "SubagentStop": { "$ref": "#/$defs/hookList" },
+                "Stop": { "$ref": "#/$defs/hookList" },
+                "Interrupt": { "$ref": "#/$defs/hookList" },
+                "PreModelRequest": { "$ref": "#/$defs/hookList" },
+                "PostModelRequest": { "$ref": "#/$defs/hookList" },
+                "PostToolUseFailure": { "$ref": "#/$defs/hookList" },
+                "PostToolBatch": { "$ref": "#/$defs/hookList" },
+                "PermissionDenied": { "$ref": "#/$defs/hookList" },
+                "StopFailure": { "$ref": "#/$defs/hookList" },
+                "Notification": { "$ref": "#/$defs/hookList" },
+                "InstructionsLoaded": { "$ref": "#/$defs/hookList" },
+                "ConfigChange": { "$ref": "#/$defs/hookList" },
+                "FileChanged": { "$ref": "#/$defs/hookList" },
+                "PreModelSwitch": { "$ref": "#/$defs/hookList" },
+                "PostModelSwitch": { "$ref": "#/$defs/hookList" },
+                "TaskCreated": { "$ref": "#/$defs/hookList" },
+                "TaskCompleted": { "$ref": "#/$defs/hookList" },
+                "UserPromptExpansion": { "$ref": "#/$defs/hookList" },
+                "MessageDisplay": { "$ref": "#/$defs/hookList" },
+                "CwdChanged": { "$ref": "#/$defs/hookList" },
+                "DirectoryAdded": { "$ref": "#/$defs/hookList" },
+                "ModelResolve": { "$ref": "#/$defs/hookList" },
+                "ModelContext": { "$ref": "#/$defs/hookList" },
+                "ModelSettings": { "$ref": "#/$defs/hookList" },
+                "ModelRetry": { "$ref": "#/$defs/hookList" },
+                "PermissionEvaluate": { "$ref": "#/$defs/hookList" },
+                "HttpRequest": { "$ref": "#/$defs/hookList" },
+                "HttpResponse": { "$ref": "#/$defs/hookList" }
             },
             "description": "Additive lifecycle hooks. Each new or changed declaration requires explicit trust."
         },
@@ -416,9 +344,7 @@
                         "$ref": "#/$defs/hookHandler"
                     }
                 },
-                "when": {
-                    "$ref": "#/$defs/hookWhen"
-                }
+                "when": { "$ref": "#/$defs/hookWhen" }
             }
         },
         "hookOnFailure": {
@@ -443,32 +369,17 @@
                     "minLength": 1,
                     "description": "Shell command run from the original project root."
                 },
-                "timeout_ms": {
-                    "$ref": "#/$defs/hookTimeoutMs"
-                },
+                "timeout_ms": { "$ref": "#/$defs/hookTimeoutMs" },
                 "async": {
                     "type": "boolean",
                     "default": false
                 },
-                "onFailure": {
-                    "$ref": "#/$defs/hookOnFailure"
-                },
-                "transcript": {
-                    "$ref": "#/$defs/hookTranscript"
-                },
-                "stream": {
-                    "$ref": "#/$defs/hookStream"
-                },
-                "timeout": {
-                    "$ref": "#/$defs/hookTimeout"
-                }
+                "onFailure": { "$ref": "#/$defs/hookOnFailure" },
+                "transcript": { "$ref": "#/$defs/hookTranscript" },
+                "stream": { "$ref": "#/$defs/hookStream" },
+                "timeout": { "$ref": "#/$defs/hookTimeout" }
             },
-            "not": {
-                "required": [
-                    "timeout",
-                    "timeout_ms"
-                ]
-            }
+            "not": { "$ref": "#/$defs/hookTimeoutConflict" }
         },
         "mcpHookHandler": {
             "type": "object",
@@ -483,18 +394,12 @@
                 "type": {
                     "const": "mcp_tool"
                 },
-                "timeout_ms": {
-                    "$ref": "#/$defs/hookTimeoutMs"
-                },
+                "timeout_ms": { "$ref": "#/$defs/hookTimeoutMs" },
                 "async": {
                     "const": false
                 },
-                "onFailure": {
-                    "$ref": "#/$defs/hookOnFailure"
-                },
-                "transcript": {
-                    "$ref": "#/$defs/hookTranscript"
-                },
+                "onFailure": { "$ref": "#/$defs/hookOnFailure" },
+                "transcript": { "$ref": "#/$defs/hookTranscript" },
                 "server": {
                     "type": "string",
                     "minLength": 1
@@ -509,19 +414,10 @@
                         "string"
                     ]
                 },
-                "stream": {
-                    "$ref": "#/$defs/hookStream"
-                },
-                "timeout": {
-                    "$ref": "#/$defs/hookTimeout"
-                }
+                "stream": { "$ref": "#/$defs/hookStream" },
+                "timeout": { "$ref": "#/$defs/hookTimeout" }
             },
-            "not": {
-                "required": [
-                    "timeout",
-                    "timeout_ms"
-                ]
-            }
+            "not": { "$ref": "#/$defs/hookTimeoutConflict" }
         },
         "sessionEndHookGroup": {
             "$ref": "#/$defs/hookGroup",
@@ -540,6 +436,7 @@
                 }
             }
         },
+        "modelRequestPurpose": { "enum": ["agent", "approval_judge", "compaction"] },
         "modelTrust": { "enum": ["local", "private", "hosted"] },
         "modelTier": { "enum": ["small", "mid", "frontier"] },
         "hookWhen": {
@@ -554,11 +451,7 @@
                     ]
                 },
                 "request_purpose": {
-                    "enum": [
-                        "agent",
-                        "approval_judge",
-                        "compaction"
-                    ]
+                    "$ref": "#/$defs/modelRequestPurpose"
                 },
                 "agent_type": {
                     "type": "string",
@@ -693,11 +586,7 @@
                     "type": "array",
                     "minItems": 1,
                     "items": {
-                        "enum": [
-                            "agent",
-                            "approval_judge",
-                            "compaction"
-                        ]
+                        "$ref": "#/$defs/modelRequestPurpose"
                     }
                 },
                 "settings": {
@@ -727,6 +616,7 @@
                 "$ref": "#/$defs/hookGroup"
             }
         },
+        "hookTimeoutConflict": { "required": ["timeout", "timeout_ms"] },
         "hookTimeoutMs": {
             "type": "integer",
             "minimum": 1,
