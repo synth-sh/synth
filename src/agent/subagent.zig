@@ -226,14 +226,28 @@ pub const Runner = struct {
             &child.reads,
             parent.project_root,
         );
+        errdefer if (!child.started) child.loop.deinit();
+        if (parent.working_directory) |path| child.loop.working_directory = try parent.allocator.dupe(u8, path);
+        for (parent.additional_roots.items) |path| {
+            const owned = try parent.allocator.dupe(u8, path);
+            errdefer parent.allocator.free(owned);
+            try child.loop.additional_roots.append(parent.allocator, owned);
+        }
         child.loop.project = parent.project;
         child.loop.skills = parent.skills;
+        child.loop.hooks = parent.hooks;
+        child.loop.control_files = parent.control_files;
+        child.loop.backend = if (child.backend) |backend| &backend.backend else parent.backend;
+        child.loop.model_policy = parent.model_policy;
         child.loop.system_prompt = parent.system_prompt;
         child.loop.commit_trailer = parent.commit_trailer;
         child.loop.delegate = null;
         // Its calls are not the session's, so they have no card for a terminal to show in.
         child.loop.handoff = .{ .files = parent.handoff.files };
         child.loop.parent = parent.parent orelse parent;
+        for (parent.conversation.messages.items) |message| {
+            if (message.seq == parent.pending_seq and child.index < message.tool_calls.len) child.loop.hook_flow.parent_call_id = message.tool_calls[child.index].id;
+        }
         child.loop.approvals = parent.approvals;
         // A standing allowance is the person's, not something to inherit.
         child.loop.auto_approve_safe = false;
@@ -420,6 +434,9 @@ fn report(child: *Loop, allocator: std.mem.Allocator, outcome: Outcome) ![]const
         .halted => haltNote(&buffer, halt.reason),
     };
 
+    if (child.hook_flow.failure orelse child.hook_flow.notice) |notice| {
+        return std.fmt.allocPrint(allocator, "{s}{s}\n\n<note>Subagent hook: {s}</note>", .{ answer, note, notice });
+    }
     if (answer.len == 0 and note.len == 0) return allocator.dupe(u8, "");
     if (answer.len == 0) {
         return std.fmt.allocPrint(allocator, "The subagent produced no answer.{s}", .{note});
@@ -778,6 +795,7 @@ const Fake = struct {
     /// Time spent in a busy loop rather than a sleep, so the worker is deaf to
     /// both the stop flag and the signal. Stands in for a blocked socket read.
     deaf_ms: u64 = 0,
+    expected_context: ?[]const u8 = null,
 
     const Provider = @import("../provider/provider.zig");
 
@@ -793,12 +811,19 @@ const Fake = struct {
 
     fn respond(
         ptr: *anyopaque,
-        _: *Conversation,
+        convo: *Conversation,
         _: Provider.Turn,
         allocator: std.mem.Allocator,
         _: ?Provider.Sink,
     ) anyerror!Provider.Reply {
         const self: *Fake = @ptrCast(@alignCast(ptr));
+        if (self.expected_context) |expected| {
+            var found = false;
+            for (convo.messages.items) |message| {
+                if (message.origin == .hook and std.mem.indexOf(u8, message.text, expected) != null) found = true;
+            }
+            try testing.expect(found);
+        }
         if (self.deaf_ms > 0) {
             const until = tool.monotonicMilliseconds(testing.io) + @as(i64, @intCast(self.deaf_ms));
             while (tool.monotonicMilliseconds(testing.io) < until) {}
@@ -823,3 +848,42 @@ const Fake = struct {
         };
     }
 };
+
+test "child tools inherit pre-tool denial and return its reason to the parent" {
+    const harness = try Harness.init();
+    defer harness.deinit();
+    const Hooks = @import("../core/hooks.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(testing.io, &buffer)];
+    harness.parent.project_root = root;
+    const hooks: Hooks.Runner = .{ .io = testing.io, .root = root, .set = .{ .pre_tool_use = &.{
+        .{ .matcher = "read", .command = "touch wrong-main-policy", .when = .{ .agent_scope = .main } },
+        .{ .matcher = "read", .command = "cat > child-policy.json; echo child read denied >&2; exit 2", .when = .{ .agent_scope = .subagent, .agent_type = "task", .model = "fake" } },
+    } } };
+    harness.parent.hooks = &hooks;
+    var parent_calls = [_]Conversation.ToolCall{.{ .id = "delegate-42", .name = "task", .arguments = "{}" }};
+    const parent_call = try harness.convo.append(.{ .role = .assistant, .text = "delegating", .tool_calls = &parent_calls });
+    harness.parent.pending_seq = parent_call.seq;
+    harness.fake.script = &.{
+        .{ .call = .{ .name = "read", .arguments = "{\"path\":\"README.md\",\"agent_scope\":\"main\",\"request_purpose\":\"approval_judge\",\"model\":\"spoofed\"}" } },
+        .{ .text = "checked" },
+    };
+    const answer = try runTask(harness, .{ .agent = "task", .prompt = "read a file" });
+    defer testing.allocator.free(answer);
+    try testing.expect(std.mem.indexOf(u8, answer, "child read denied") != null);
+    try testing.expect(std.mem.indexOf(u8, answer, "Subagent hook") != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, "wrong-main-policy", .{}));
+    const trace = try tmp.dir.readFileAlloc(testing.io, "child-policy.json", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(trace);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, trace, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("subagent", parsed.value.object.get("agent_scope").?.string);
+    try testing.expectEqualStrings("fake", parsed.value.object.get("model").?.string);
+    try testing.expectEqualStrings("spoofed", parsed.value.object.get("tool_input").?.object.get("model").?.string);
+    try testing.expectEqualStrings("agent", parsed.value.object.get("request_purpose").?.string);
+    try testing.expectEqualStrings("delegate-42", parsed.value.object.get("parent_tool_call_id").?.string);
+    try testing.expectEqualStrings(&harness.parent.hook_flow.identity, parsed.value.object.get("parent_agent_id").?.string);
+    try testing.expect(!std.mem.eql(u8, &harness.parent.hook_flow.identity, parsed.value.object.get("agent_id").?.string));
+}

@@ -25,6 +25,7 @@ const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
 const SessionPicker = @import("session_picker.zig");
 const Slash = @import("slash.zig");
+const SlashCommand = @import("../core/slash_command.zig");
 
 /// Most transcript hits `/search` will show at once.
 const search_limit: usize = 20;
@@ -33,7 +34,7 @@ const themes = @import("themes.zig");
 const humanize = @import("../core/humanize.zig");
 
 pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !bool {
-    const line = std.mem.trim(u8, value, " \t\r\n");
+    const line = std.mem.trim(u8, value, SlashCommand.whitespace);
     if (line.len == 0 or line[0] != '/') return false;
     self.slash.close();
 
@@ -54,7 +55,22 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         try pruneNow(self, ctx);
         return true;
     }
-    if (std.mem.eql(u8, line, "/compact")) {
+    const cd = "/" ++ SlashCommand.cd;
+    if (isCommand(line, cd)) {
+        if (self.mirror.isBusy()) return refuseCommand(self, ctx, line);
+        const path = std.mem.trim(u8, line[cd.len..], " ");
+        if (path.len == 0) {
+            try self.notification.showFmt(ctx, .info, "{s}", .{self.mirror.status.cwd});
+        } else try self.mirror.changeDirectory(path);
+        return true;
+    }
+    const add_dir = "/" ++ SlashCommand.add_dir;
+    if (isCommand(line, add_dir)) {
+        if (self.mirror.isBusy()) return refuseCommand(self, ctx, line);
+        try self.mirror.addDirectory(std.mem.trim(u8, line[add_dir.len..], " "));
+        return true;
+    }
+    if (std.mem.eql(u8, line, "/" ++ SlashCommand.compact)) {
         if (try offerProvidersInstead(self)) return true;
         if (self.mirror.isBusy()) return refuseCommand(self, ctx, line);
         try self.startCompaction(ctx);
@@ -109,6 +125,15 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     if (std.mem.eql(u8, line, "/rewind")) {
         self.rewind_picker.requested = true;
         try self.mirror.listCheckpoints();
+        return true;
+    }
+    const hooks = "/" ++ SlashCommand.hooks;
+    if (std.mem.eql(u8, line, hooks) or std.mem.startsWith(u8, line, hooks ++ " ")) {
+        const command = @import("../core/hook_store.zig").parseCommand(line) catch {
+            try self.notification.show(ctx, .warn, "Use /hooks list, review, trust, revoke, enable or disable [id]");
+            return true;
+        };
+        try self.mirror.hooks(command.action, command.id);
         return true;
     }
     if (std.mem.eql(u8, line, "/permissions")) {
@@ -263,6 +288,12 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             } else {
                 try self.rewind_picker.preview(rewound.seq, rewound.files);
             }
+            ctx.redraw = true;
+        },
+        .hooks => |text| {
+            defer answer.deinit(self.allocator);
+            _ = try self.conversation.append(.{ .role = .assistant, .text = text });
+            self.scroll = 0;
             ctx.redraw = true;
         },
         .approvals => |standing| {

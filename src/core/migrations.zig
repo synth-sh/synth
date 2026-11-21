@@ -35,6 +35,7 @@ pub const all = [_]Migration{
     .{ .version = 7, .sql = @embedFile("migrations/007_mcp_auth.sql") },
     .{ .version = 8, .sql = @embedFile("migrations/008_checkpoint.sql") },
     .{ .version = 9, .sql = @embedFile("migrations/009_tool_result_call.sql") },
+    .{ .version = 10, .sql = @embedFile("migrations/010_message_origin.sql") },
 };
 
 /// The version this build writes. Derived, so adding a migration is one edit.

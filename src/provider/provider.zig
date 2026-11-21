@@ -1,6 +1,20 @@
 const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
+const Hooks = @import("../core/hooks.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
+const retry = @import("retry.zig");
+const ModelSettings = @import("../core/model_policy.zig").Settings;
+const http_status_digits = 3;
+
+pub const json_content_type = "application/json";
+pub const identity_encoding = "identity";
+pub const sse_data_prefix = "data:";
+
+pub fn writeNumericSetting(w: *std.Io.Writer, settings: ModelSettings, comptime field: std.meta.FieldEnum(ModelSettings)) !void {
+    const name = @tagName(field);
+    if (@field(settings, name)) |value| try w.print(",\"" ++ name ++ "\":{d}", .{value});
+}
 
 /// The seam every model backend plugs into.
 const Provider = @This();
@@ -12,6 +26,7 @@ name: []const u8,
 /// `name`, which is the backend ("Ollama"). Shown together as
 /// "model · backend".
 model: []const u8 = "",
+observes_attempts: bool = false,
 /// Context window in tokens, or 0 when unknown.
 context_limit: u32 = 0,
 /// Whether the model can be shown images. False means an attached image is
@@ -56,6 +71,10 @@ abort: ?*const fn (*anyopaque) void = null,
 /// decisions a backend has no business making, and a backend that assembled its
 /// own prompt would have to be told about agents to do it.
 pub const Turn = struct {
+    backend: ?*@import("backend.zig") = null,
+    stop: ?*const std.atomic.Value(bool) = null,
+    model_policy: @import("../core/model_policy.zig").Policy = .{},
+    settings: ModelSettings = .{},
     /// The system prompt, complete. Borrowed for the length of the call.
     system: []const u8,
     /// Tool definitions as JSON, from `Registry.schemaJson`. Empty means the
@@ -66,6 +85,72 @@ pub const Turn = struct {
     instruction: []const u8 = "",
     /// Reserve less output space while summarizing, but never discard history.
     compacting: bool = false,
+    display_messages: bool = false,
+    stream_display: bool = true,
+    hooks: ?*const Hooks.Runner = null,
+    attempts: ?*std.atomic.Value(u32) = null,
+    hook_input: Hooks.Invocation = .{ .event = .pre_model_request },
+};
+
+pub const Attempt = struct {
+    allocator: std.mem.Allocator,
+    turn: Turn,
+    sink: ?Sink,
+    status: enum { failed, completed, cancelled } = .failed,
+    finished: bool = false,
+    error_message: []const u8 = "",
+    usage: Usage = .{},
+
+    pub fn begin(turn: Turn, allocator: std.mem.Allocator, sink: ?Sink) Attempt {
+        var attempt: Attempt = .{ .allocator = allocator, .turn = turn, .sink = sink };
+        attempt.turn.hook_input.attempt = if (turn.attempts) |counter| counter.fetchAdd(1, .acq_rel) + 1 else 1;
+        attempt.emit(.pre_model_request);
+        return attempt;
+    }
+    pub fn complete(self: *Attempt, usage: Usage) void {
+        self.status = .completed;
+        self.usage = usage;
+    }
+    pub fn finish(self: *Attempt) void {
+        if (self.finished) return;
+        self.finished = true;
+        if (self.sink) |sink| {
+            if (sink.stopped(sink.userdata)) self.status = .cancelled;
+        }
+        self.emit(.post_model_request);
+    }
+    fn emit(self: *Attempt, event: Hooks.Event) void {
+        const configured = self.turn.hooks orelse return;
+        var runner = configured.*;
+        runner.stop = null;
+        const cleaning_up = event == .post_model_request and self.status == .cancelled;
+        const protection = if (cleaning_up) runner.io.swapCancelProtection(.blocked) else null;
+        defer if (protection) |previous| {
+            _ = runner.io.swapCancelProtection(previous);
+        };
+        if (cleaning_up) {
+            runner.timeout_ms = @min(runner.timeout_ms, Hooks.cleanup_handler_timeout_ms);
+            runner.deadline_ms = std.Io.Clock.now(.awake, runner.io).toMilliseconds() + Hooks.cleanup_timeout_ms;
+        }
+        var invocation = self.turn.hook_input;
+        invocation.event = event;
+        invocation.status = if (event == .post_model_request) @tagName(self.status) else "";
+        invocation.error_message = self.error_message;
+        invocation.input_tokens = self.usage.prompt_tokens;
+        invocation.output_tokens = self.usage.completion_tokens;
+        var result = runner.evaluate(self.allocator, invocation) catch |err| {
+            if (runner.runtime) |runtime| {
+                const message = std.fmt.allocPrint(self.allocator, HooksCopy.named_failure, .{ event.name(), @errorName(err) }) catch return;
+                defer self.allocator.free(message);
+                runtime.notice(message) catch {};
+            }
+            return;
+        };
+        defer result.deinit(self.allocator);
+        if (result.message) |message| {
+            if (runner.runtime) |runtime| runtime.notice(message) catch {};
+        }
+    }
 };
 
 /// Where a backend should point, and what to call it there. The label is the
@@ -140,6 +225,28 @@ pub fn mentionsOverflow(why: []const u8) bool {
     return false;
 }
 
+pub fn errorType(err: anyerror, details: []const u8) []const u8 {
+    switch (err) {
+        error.ContextTooLarge => return @tagName(retry.ErrorType.invalid_request),
+        error.NotSignedIn => return @tagName(retry.ErrorType.authentication_failed),
+        else => {},
+    }
+    var words = std.mem.tokenizeAny(u8, details, " \t\r\n:");
+    while (words.next()) |word| {
+        if (word.len != http_status_digits) continue;
+        const code = std.fmt.parseInt(u16, word, 10) catch continue;
+        const status: std.http.Status = @enumFromInt(code);
+        const phrase = status.phrase() orelse continue;
+        switch (status.class()) {
+            .client_error, .server_error => {},
+            else => continue,
+        }
+        const rest = std.mem.trimStart(u8, words.rest(), " \t");
+        if (std.ascii.startsWithIgnoreCase(rest, phrase)) return @tagName(retry.errorType(status));
+    }
+    return @tagName(retry.ErrorType.unknown);
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     var i: usize = 0;
@@ -208,9 +315,19 @@ pub const Reply = struct {
     }
 };
 
-/// Where a provider pushes partial output as it arrives. Every callback runs on
-/// the worker thread, so implementations must be thread safe.
+pub const RetryInfo = struct {
+    attempt: usize,
+    allowed: bool,
+    delay_ms: u64,
+    status: u16 = 0,
+    error_type: []const u8 = "",
+    error_message: []const u8 = "",
+};
+
+/// Callbacks run on the provider worker thread.
 pub const Sink = struct {
+    onRetry: ?*const fn (*anyopaque, RetryInfo) ?u64 = null,
+
     userdata: *anyopaque,
     /// A fragment of the model's thinking output.
     onThinking: *const fn (*anyopaque, []const u8) void,
@@ -226,6 +343,10 @@ pub const Sink = struct {
     /// killed, so a provider that streams must check between chunks and return
     /// early - otherwise quitting mid-turn blocks until the model is done.
     stopped: *const fn (*anyopaque) bool,
+    pub fn retryDecision(self: Sink, info: RetryInfo) ?u64 {
+        if (self.onRetry) |callback| return callback(self.userdata, info);
+        return if (info.allowed) info.delay_ms else null;
+    }
 };
 
 fn ignoreThinkingDone(_: *anyopaque) void {}
@@ -234,4 +355,14 @@ test "a TGI length refusal reads as an overflow, a quota refusal does not" {
     const testing = std.testing;
     try testing.expect(mentionsOverflow("Input validation error: `inputs` must have less than 2048 tokens. Given: 4194"));
     try testing.expect(!mentionsOverflow("You exceeded your current quota, please check your plan and billing details."));
+}
+
+test "error classification does not mistake token counts for HTTP failures" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("unknown", errorType(error.HttpError, "context service rejected 1500 tokens"));
+    try testing.expectEqualStrings("invalid_request", errorType(error.ContextTooLarge, "503 Service Unavailable"));
+    try testing.expectEqualStrings("rate_limit", errorType(error.HttpError, "429 Too Many Requests: wait"));
+    try testing.expectEqualStrings("authentication_failed", errorType(error.HttpError, "401 Unauthorized: expired"));
+    try testing.expectEqualStrings("unknown", errorType(error.HttpError, "1500 Internal Server Error tokens"));
+    try testing.expectEqualStrings("server_error", errorType(error.HttpError, "Example rejected the request: 503 Service Unavailable: overloaded"));
 }

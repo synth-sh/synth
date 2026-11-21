@@ -29,6 +29,8 @@ const instruction_files: []const []const u8 = &.{ "AGENTS.md", "CLAUDE.md" };
 pub const Cache = struct {
     text: ?[]const u8 = null,
     built_at: ?std.Io.Timestamp = null,
+    instruction_path: ?[]const u8 = null,
+    generation: u64 = 0,
 
     pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
         self.invalidate(allocator);
@@ -38,6 +40,8 @@ pub const Cache = struct {
         if (self.text) |text| allocator.free(text);
         self.text = null;
         self.built_at = null;
+        if (self.instruction_path) |path| allocator.free(path);
+        self.instruction_path = null;
     }
 
     /// The prompt, rebuilding it when the last one has gone stale. The result
@@ -58,10 +62,14 @@ pub const Cache = struct {
             if (age < cache_ms * std.time.ns_per_ms) return text;
         }
 
-        const built = try buildWithAgent(allocator, io, base_prompt, agent_prompt, project, available, commit_trailer);
+        var instruction_path: ?[]const u8 = null;
+        errdefer if (instruction_path) |path| allocator.free(path);
+        const built = try buildWithAgent(allocator, io, base_prompt, agent_prompt, project, available, commit_trailer, &instruction_path);
         self.invalidate(allocator);
         self.text = built;
         self.built_at = now;
+        self.instruction_path = instruction_path;
+        self.generation += 1;
         return built;
     }
 };
@@ -77,12 +85,13 @@ fn buildWithAgent(
     project: *const Project,
     available: []const skills.Skill,
     commit_trailer: []const u8,
+    instruction_path: ?*?[]const u8,
 ) ![]const u8 {
-    if (agent_prompt.len == 0) return build(allocator, io, base, project, available, commit_trailer);
+    if (agent_prompt.len == 0) return buildObserved(allocator, io, base, project, available, commit_trailer, instruction_path);
 
     const joined = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ base, agent_prompt });
     defer allocator.free(joined);
-    return build(allocator, io, joined, project, available, commit_trailer);
+    return buildObserved(allocator, io, joined, project, available, commit_trailer, instruction_path);
 }
 
 /// Assemble the full system prompt. Caller owns the result.
@@ -94,13 +103,25 @@ pub fn build(
     available: []const skills.Skill,
     commit_trailer: []const u8,
 ) ![]const u8 {
+    return buildObserved(allocator, io, base_prompt, project, available, commit_trailer, null);
+}
+
+fn buildObserved(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    base_prompt: []const u8,
+    project: *const Project,
+    available: []const skills.Skill,
+    commit_trailer: []const u8,
+    instruction_path: ?*?[]const u8,
+) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
 
     try w.writeAll(base_prompt);
 
-    try writeInstructions(w, io, allocator, project.root);
+    try writeInstructions(w, io, allocator, project.root, instruction_path);
     try writeSkills(w, available);
     try writeCommits(w, project, commit_trailer);
     try writeEnvironment(w, project);
@@ -193,6 +214,7 @@ fn writeInstructions(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: []const u8,
+    instruction_path: ?*?[]const u8,
 ) !void {
     for (instruction_files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ root, file_name });
@@ -202,6 +224,7 @@ fn writeInstructions(
         defer allocator.free(source);
 
         try w.print("\n<{s}>\n{s}\n</{s}>\n", .{ file_name, source, file_name });
+        if (instruction_path) |target| target.* = try allocator.dupe(u8, path);
         return;
     }
 }

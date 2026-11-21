@@ -8,6 +8,9 @@ const pkg = @import("pkg");
 const Hooks = @import("hooks.zig");
 const Database = @import("database.zig");
 
+pub const ModelPolicy = @import("model_policy.zig");
+const ModelClass = @import("model_class.zig");
+
 const Config = @This();
 
 /// `$XDG_CONFIG_HOME/<name>/config.json`, or `~/.config/<name>/config.json`. A
@@ -112,6 +115,8 @@ think: bool = true,
 auto_approve_safe_commands: bool = true,
 /// Who decides a call that would otherwise stop for approval.
 approvals: Approvals = .ask,
+model_requests: ModelPolicy.Policy = .{},
+model_classes: []const ModelClass.Class = &.{},
 /// How long one turn may run, and what it may spend, before the loop gives up
 /// on it. Zero turns either off. Null means the built-in default: what a
 /// runaway turn costs is the loop's business, not this file's.
@@ -137,6 +142,7 @@ skill_paths: []const []const u8 = &.{},
 /// be repeating its shape. Borrowed from this config's arena.
 mcp: ?std.json.Value = null,
 hooks: Hooks.Set = .{},
+hook_state_path: ?[]const u8 = null,
 hook_timeout_ms: u64 = Hooks.default_timeout_ms,
 /// What a startup prune is allowed to throw away.
 prune: Database.Policy = .{ .shed_after_days = 30 },
@@ -167,6 +173,8 @@ const File = struct {
     think: ?bool = null,
     auto_approve_safe_commands: ?bool = null,
     approvals: ?Approvals = null,
+    model_requests: ?std.json.Value = null,
+    model_classes: ?[]const ModelClass.Class = null,
     debug_log: ?[]const u8 = null,
     max_turn_ms: ?i64 = null,
     max_turn_tokens: ?u64 = null,
@@ -176,7 +184,7 @@ const File = struct {
     web: ?struct {
         search_api_key: ?[]const u8 = null,
     } = null,
-    hooks: ?Hooks.File = null,
+    hooks: ?std.json.Value = null,
     hook_timeout_ms: ?u64 = null,
     prune: ?struct {
         delete_after_days: ?u32 = null,
@@ -265,9 +273,10 @@ pub fn load(
     errdefer self.arena.deinit();
 
     self.database_path = try self.arena.allocator().dupe(u8, db_path);
-    self.path = try self.arena.allocator().dupe(u8, path);
-    try self.applyFile(io, path);
+    self.path = try std.fs.path.resolve(self.arena.allocator(), &.{path});
+    try self.applyFile(io, self.path);
     try self.applyEnv(env);
+    self.hook_state_path = privateDataPath(self.arena.allocator(), env, "hook-trust.json") catch null;
 
     return self;
 }
@@ -295,8 +304,16 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.max_stall_ms) |value| self.max_stall_ms = value;
     if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
-    if (parsed.hooks) |value| self.hooks = value.set();
-    if (parsed.hook_timeout_ms) |value| self.hook_timeout_ms = value;
+    if (parsed.model_requests) |value| {
+        self.model_requests = try std.json.parseFromValueLeaky(ModelPolicy.Policy, arena, value, .{});
+        try self.model_requests.validate();
+    }
+    if (parsed.model_classes) |value| self.model_classes = value;
+    if (parsed.hooks) |value| self.hooks = try Hooks.parse(arena, value, path);
+    if (parsed.hook_timeout_ms) |value| {
+        try Hooks.validTimeout(value);
+        self.hook_timeout_ms = value;
+    }
 
     if (parsed.web) |web| {
         if (web.search_api_key) |value| self.search_api_key = value;
@@ -562,7 +579,7 @@ test "lifecycle hooks are read from the file" {
     defer testing.allocator.free(path);
 
     const source =
-        \\{"hook_timeout_ms":5000,"hooks":{"PreToolUse":[{"matcher":"bash","command":"./check.sh"}]}}
+        \\{"hook_timeout_ms":5000,"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"command":"./check.sh"}]}]}}
     ;
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = source });
 

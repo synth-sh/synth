@@ -9,6 +9,7 @@ const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
 const log_file = @import("log_file.zig");
 const retry = @import("retry.zig");
+const HttpHooks = @import("http_hooks.zig");
 const window = @import("window.zig");
 
 const OllamaProvider = @This();
@@ -17,6 +18,8 @@ allocator: std.mem.Allocator,
 io: std.Io,
 /// When a refused request is worth sending again.
 retries: retry.Policy = .{},
+last_status: std.http.Status = .ok,
+last_retry_after_ms: ?u64 = null,
 
 /// Base URL of the server, e.g. `http://localhost:11434`. Borrowed.
 host: []const u8,
@@ -55,13 +58,7 @@ auth_header: [1]std.http.Header = undefined,
 auth_value: []const u8 = "",
 
 client: Ollama = undefined,
-/// The socket the turn in flight is reading. Guarded rather than atomic: the
-/// shutdown has to happen while the handle is still owned. See `abort`.
-live_socket: std.posix.fd_t = -1,
-socket_lock: std.Io.Mutex = .init,
-/// Whether a cancel arrived. Kept because one can land before the request has
-/// a socket to shut down, and a no-op then would be a cancel that never took.
-aborted: bool = false,
+socket: @import("socket.zig") = .{},
 started: bool = false,
 /// Set when the model was switched at runtime: `model` then points here rather
 /// than at the config, and this is what has to be freed.
@@ -123,10 +120,11 @@ pub fn startLike(self: *OllamaProvider, other: *const OllamaProvider) !void {
     self.think = other.think;
     self.supports_tools = other.supports_tools;
     self.supports_vision = other.supports_vision;
+    self.retries = other.retries;
 }
 
 /// Read what this model can do and how much it can hold.
-fn probe(self: *OllamaProvider) void {
+pub fn probe(self: *OllamaProvider) void {
     var response = self.client.show(.{ .model = self.model }) catch return self.learnCapabilities(null);
     defer response.deinit();
     self.learnCapabilities(response.body() catch null);
@@ -206,7 +204,8 @@ pub fn listModels(self: *OllamaProvider, allocator: std.mem.Allocator) ![][]cons
 /// Build the client without asking the server about the configured model. The
 /// listing does not need a context limit, and probing a model that is not
 /// pulled yet would fail the command.
-fn startWithoutProbe(self: *OllamaProvider) !void {
+pub fn startWithoutProbe(self: *OllamaProvider) !void {
+    self.think = self.want_think;
     var headers: []const std.http.Header = &.{};
     if (self.api_key) |key| {
         self.auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
@@ -224,6 +223,9 @@ fn startWithoutProbe(self: *OllamaProvider) !void {
 /// Cap on the complaint kept from a rejected request. Ollama's errors are one
 /// sentence; anything longer is a page of HTML from something in between.
 const max_rejection_bytes: usize = 2 * 1024;
+const transfer_buffer_bytes = 1024 * 1024;
+const gzip_buffer_bytes = 1024 * 1024;
+const max_error_body_bytes = 4 * 1024 * 1024;
 
 pub fn deinit(self: *OllamaProvider) void {
     if (self.rejection) |rejection| self.allocator.free(rejection);
@@ -281,6 +283,7 @@ pub fn provider(self: *OllamaProvider) Provider {
         .context_limit = self.effectiveLimit(),
         .vision = self.supports_vision,
         .userdata = self,
+        .observes_attempts = true,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
@@ -291,35 +294,8 @@ pub fn provider(self: *OllamaProvider) Provider {
     };
 }
 
-/// No request in flight.
-const no_socket: std.posix.fd_t = -1;
-
-/// Break off the request in flight. Safe to call when there is none.
-///
-/// Under the lock the worker holds while the handle is live, so the socket
-/// cannot be closed underneath the shutdown and land on a reused descriptor.
 pub fn abort(self: *OllamaProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-
-    self.aborted = true;
-    self.shutdownLocked();
-}
-
-fn shutdownLocked(self: *OllamaProvider) void {
-    if (self.live_socket == no_socket) return;
-    self.io.vtable.netShutdown(self.io.userdata, self.live_socket, .both) catch {};
-    self.live_socket = no_socket;
-}
-
-/// Worker thread. What `abort` shuts down until `forgetSocket` takes it back.
-fn watch(self: *OllamaProvider, request: *std.http.Client.Request) void {
-    const connection = request.connection orelse return;
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-
-    self.live_socket = connection.stream_reader.stream.socket.handle;
-    if (self.aborted) self.shutdownLocked();
+    self.socket.abort(self.io);
 }
 
 /// Subscribes to the request going out, which is the only moment before the
@@ -330,22 +306,7 @@ fn observer(self: *OllamaProvider) Ollama.OnRequest {
 
 fn watchErased(ptr: *anyopaque, request: *std.http.Client.Request) void {
     const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
-    self.watch(request);
-}
-
-/// Worker thread. A new turn is not the cancelled one.
-fn armSocket(self: *OllamaProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.aborted = false;
-    self.live_socket = no_socket;
-}
-
-/// Worker thread. Must run before the request is torn down.
-fn forgetSocket(self: *OllamaProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.live_socket = no_socket;
+    self.socket.watch(self.io, request);
 }
 
 fn abortErased(ptr: *anyopaque) void {
@@ -391,60 +352,15 @@ fn describeErrorErased(ptr: *anyopaque, err: anyerror, allocator: std.mem.Alloca
     return self.describeError(err, allocator);
 }
 
-/// Ask the server to reject the request again, this time reading the body.
-fn captureRejection(self: *OllamaProvider, request: Ollama.ChatRequest) void {
+fn captureRejection(self: *OllamaProvider, body: []const u8) void {
     self.clearRejection();
-    self.rejection = self.readRejection(request) catch null;
+    const message = complaint(self.allocator, body);
+    self.rejection = self.allocator.dupe(u8, message[0..@min(message.len, max_rejection_bytes)]) catch null;
 }
 
-/// Drop the last complaint, so a later failure of a different kind is never
-/// explained with a stale one.
 fn clearRejection(self: *OllamaProvider) void {
     if (self.rejection) |old| self.allocator.free(old);
     self.rejection = null;
-}
-
-fn readRejection(self: *OllamaProvider, request: Ollama.ChatRequest) !?[]u8 {
-    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var payload: std.Io.Writer.Allocating = .init(arena);
-    var json: std.json.Stringify = .{
-        .writer = &payload.writer,
-        .options = .{ .emit_null_optional_fields = false },
-    };
-    try json.write(request);
-
-    const target = try std.fmt.allocPrint(arena, "{s}/api/chat", .{self.host});
-    const uri = try std.Uri.parse(target);
-
-    var client: std.http.Client = .{ .io = self.io, .allocator = arena };
-    defer client.deinit();
-
-    var req = try client.request(.POST, uri, .{
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = if (self.auth_value.len > 0) self.auth_header[0..1] else &.{},
-        .keep_alive = false,
-    });
-    defer req.deinit();
-
-    try req.sendBodyComplete(payload.written());
-
-    var redirect_buf: [0]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-
-    if (response.head.status == .ok) return null;
-
-    var transfer: [1024]u8 = undefined;
-    const body = try response.reader(&transfer).allocRemaining(
-        arena,
-        .limited(max_rejection_bytes),
-    );
-
-    const message = complaint(arena, body);
-    if (message.len == 0) return null;
-    return try self.allocator.dupe(u8, message);
 }
 
 /// The sentence out of an error body. Ollama answers `{"error": "..."}`; a proxy
@@ -487,8 +403,8 @@ pub fn describeError(
         ),
         error.HttpError => if (self.rejection) |why| return std.fmt.allocPrint(
             allocator,
-            "ollama rejected the request for `{s}`: {s}. {s}",
-            .{ self.model, std.mem.trimEnd(u8, why, ". \n"), advice(why) },
+            "{d} {s}: ollama rejected the request for `{s}`: {s}. {s}",
+            .{ @intFromEnum(self.last_status), self.last_status.phrase() orelse "HTTP error", self.model, std.mem.trimEnd(u8, why, ". \n"), advice(why) },
         ),
         else => return std.fmt.allocPrint(
             allocator,
@@ -532,36 +448,6 @@ pub fn describeError(
             "or pick one it does have with ctrl+o.",
         .{ self.model, self.model },
     );
-}
-
-/// Whether a complaint is about the size of the request, which is the one kind
-/// the harness can do something about without being told.
-/// Whether a refused request is worth sending again, waiting if so.
-///
-/// The ollama package hands back an error rather than a status, so the
-/// rejection body is all there is to go on. It is only consulted for what a
-/// rate limit or an outage actually says, so a refusal is never mistaken for
-/// congestion.
-fn waitAndRetry(
-    self: *OllamaProvider,
-    attempt: usize,
-    why: []const u8,
-    sink: ?Provider.Sink,
-) bool {
-    if (attempt >= self.retries.attempts) return false;
-    if (!retry.transientText(why)) return false;
-
-    if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
-    }
-
-    const wait = retry.waitMs(self.retries, attempt, null);
-    std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
-
-    if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
-    }
-    return true;
 }
 
 fn isOverflow(why: []const u8) bool {
@@ -678,6 +564,75 @@ test "a listed tag matches the model it was configured as" {
     try std.testing.expect(!sameModel("llama3:latest", "qwen3"));
 }
 
+const ChatStream = struct {
+    request: *std.http.Client.Request,
+    reader: *std.Io.Reader,
+    http: HttpHooks.Exchange,
+    scratch: std.heap.ArenaAllocator,
+
+    fn deinit(self: *ChatStream) void {
+        self.request.deinit();
+        self.scratch.deinit();
+    }
+
+    fn next(self: *ChatStream) !?Ollama.ChatResponse {
+        while (true) {
+            _ = self.scratch.reset(.retain_capacity);
+            const a = self.scratch.allocator();
+            const raw = try self.reader.takeDelimiter('\n') orelse return null;
+            const line = std.mem.trim(u8, raw, &std.ascii.whitespace);
+            if (line.len == 0) continue;
+            const adapted = (try self.http.payload(a, line, true)) orelse continue;
+            const value = try std.json.parseFromSliceLeaky(Ollama.ChatResponse, a, adapted, .{ .ignore_unknown_fields = true });
+            return value;
+        }
+    }
+};
+
+fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest, turn: Provider.Turn, input: @import("../core/hooks.zig").Invocation) !ChatStream {
+    const url = try std.fmt.allocPrint(a, "{s}/api/chat", .{std.mem.trimEnd(u8, self.host, "/")});
+    var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = input, .url = url, .protocol = "ollama", .stop = turn.stop };
+    var body = try std.json.Stringify.valueAlloc(a, request, .{ .emit_null_optional_fields = false });
+    if (input.request_purpose == .approval_judge) {
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+        try value.object.put(a, "truncate", .{ .bool = false });
+        body = try std.json.Stringify.valueAlloc(a, value, .{});
+    }
+    const prepared = try http.request(a, body, .{ .content_type = .{ .override = Provider.json_content_type }, .accept_encoding = .{ .override = Provider.identity_encoding } }, if (self.auth_value.len > 0) self.auth_header[0..1] else &.{});
+    const req = try a.create(std.http.Client.Request);
+    req.* = try self.client.http_client.client.request(.POST, try std.Uri.parse(url), .{
+        .headers = prepared.headers,
+        .extra_headers = prepared.extra_headers,
+        .keep_alive = false,
+        .redirect_behavior = .not_allowed,
+    });
+    errdefer req.deinit();
+    try req.sendBodyComplete(prepared.body);
+    self.socket.watch(self.io, req);
+    errdefer self.socket.forget(self.io);
+    var redirect: [0]u8 = undefined;
+    var response = try req.receiveHead(&redirect);
+    const head = try http.response(a, response.head);
+    const transfer = try a.alloc(u8, transfer_buffer_bytes);
+    const decompress = try a.create(std.http.Decompress);
+    const compressed: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .deflate, .gzip => try a.alloc(u8, gzip_buffer_bytes),
+        .zstd => try a.alloc(u8, std.compress.zstd.default_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    const reader = response.readerDecompressing(transfer, decompress, compressed);
+    self.last_status = head.status;
+    self.last_retry_after_ms = retry.retryAfterMs(head.get(retry.retry_after_header));
+    if (head.status.class() != .success) {
+        const raw = reader.allocRemaining(a, .limited(max_error_body_bytes)) catch "";
+        const why = (try http.payload(a, raw, false)).?;
+        self.captureRejection(why);
+        return error.HttpError;
+    }
+    return .{ .request = req, .reader = reader, .http = http, .scratch = .init(self.allocator) };
+}
+
 /// Runs on a worker thread; blocking here is expected.
 fn respond(
     ptr: *anyopaque,
@@ -685,7 +640,7 @@ fn respond(
     turn: Provider.Turn,
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
-) !Provider.Reply {
+) anyerror!Provider.Reply {
     const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
 
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
@@ -708,11 +663,21 @@ fn respond(
     };
 
     self.clearRejection();
-    self.armSocket();
+    self.socket.arm(self.io);
 
+    var hook_attempt: ?Provider.Attempt = null;
+    defer if (hook_attempt) |*attempt| attempt.finish();
+    errdefer |err| if (hook_attempt) |*attempt| {
+        attempt.error_message = @errorName(err);
+    };
     var messages: []Ollama.Message = undefined;
     var sends: usize = 1;
     var stream = while (true) {
+        var attempt_turn = turn;
+        attempt_turn.hook_input.model = self.model;
+        attempt_turn.hook_input.provider = self.provider().name;
+        hook_attempt = Provider.Attempt.begin(attempt_turn, allocator, sink);
+        if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
         messages = try self.buildMessages(convo, arena, system, turn.instruction, budget);
         const request: Ollama.ChatRequest = .{
             .model = self.model,
@@ -720,23 +685,30 @@ fn respond(
             .stream = true,
             .think = if (self.think) .{ .bool = true } else null,
             .tools = tools,
-            .options = if (self.requestedContext()) |n| .{ .num_ctx = n } else null,
+            .options = .{ .num_ctx = self.requestedContext(), .temperature = turn.settings.temperature, .num_predict = turn.settings.max_output_tokens, .top_p = turn.settings.top_p, .top_k = turn.settings.top_k, .seed = turn.settings.seed, .frequency_penalty = turn.settings.frequency_penalty, .presence_penalty = turn.settings.presence_penalty, .stop = turn.settings.stop },
         };
 
-        break self.client.chat(request) catch |err| {
-            self.captureRejection(request);
+        break self.chat(arena, request, turn, hook_attempt.?.turn.hook_input) catch |err| {
             const why = self.rejection orelse "";
+            hook_attempt.?.error_message = @errorName(err);
+            hook_attempt.?.finish();
 
-            if (self.waitAndRetry(sends, why, sink)) {
+            if (err == error.HttpError and retry.wait(self.io, self.retries, sink, .{
+                .status = self.last_status,
+                .attempt = sends,
+                .retry_after_ms = self.last_retry_after_ms,
+                .message = why,
+                .retryable = retry.transient(self.last_status) or retry.transientText(why),
+            })) {
                 sends += 1;
                 continue;
             }
             if (isOverflow(why)) return error.ContextTooLarge;
-            return err;
+            return @as(anyerror!Provider.Reply, err);
         };
     };
     defer {
-        self.forgetSocket();
+        self.socket.forget(self.io);
         stream.deinit();
     }
     self.clearRejection();
@@ -788,6 +760,7 @@ fn respond(
         .usage = usage,
     };
     self.log(arena, messages, reply) catch {};
+    hook_attempt.?.complete(reply.usage);
     return reply;
 }
 

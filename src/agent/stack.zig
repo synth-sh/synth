@@ -15,6 +15,8 @@ const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const Hooks = @import("../core/hooks.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
+const HookStore = @import("../core/hook_store.zig");
 const Project = @import("../core/project.zig");
 const skill = @import("../core/skill.zig");
 const mcp_tools = @import("../tools/mcp.zig");
@@ -40,6 +42,13 @@ mcp_host: mcp_tools.Host,
 reads: tool.ReadLog,
 convo: Conversation,
 hooks: Hooks.Runner,
+hook_runtime: Hooks.Runtime,
+// Background hooks can still borrow definitions from an earlier revision.
+hook_revisions: std.ArrayList(std.heap.ArenaAllocator),
+hook_inline: Hooks.Set,
+hook_home: ?[]const u8,
+hook_state_path: ?[]const u8,
+hook_config_path: []const u8,
 runner: subagent.Runner,
 titler: Titler,
 loop: Loop,
@@ -76,6 +85,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.allocator = allocator;
     self.arena = .init(allocator);
     errdefer self.arena.deinit();
+    self.hook_revisions = .empty;
 
     self.project = try Project.detect(allocator, io, options.cwd);
     errdefer self.project.deinit(allocator);
@@ -117,15 +127,32 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         self.runner.deinit();
     }
 
+    self.hook_inline = config.hooks;
+    self.hook_home = options.home;
+    self.hook_state_path = config.hook_state_path;
+    self.hook_config_path = config.path;
+    var hook_store = try HookStore.Store.init(allocator, io, config.hook_state_path);
+    defer hook_store.deinit();
+    const discovered_hooks = try HookStore.discover(self.arena.allocator(), io, config.hooks, self.project.root, options.home, hook_store);
+    self.hook_runtime = .{ .allocator = allocator, .io = io };
+    errdefer self.hook_runtime.deinit();
     self.hooks = .{
         .io = io,
         .root = self.project.root,
-        .set = config.hooks,
+        .set = discovered_hooks,
+        .runtime = &self.hook_runtime,
+        .mcp_executor = .{ .userdata = self, .call = callHookMcp },
         .timeout_ms = config.hook_timeout_ms,
+        .classes = config.model_classes,
     };
     self.loop.hooks = &self.hooks;
+    self.loop.hook_flow.reload = .{ .userdata = self, .call = reloadHooks };
+    self.loop.control_files = if (config.hook_state_path) |path| try self.arena.allocator().dupe([]const u8, &.{ config.path, path }) else try self.arena.allocator().dupe([]const u8, &.{config.path});
+    if (discovered_hooks.hasUntrusted() and self.loop.hook_flow.notice == null) self.loop.hook_flow.notice = try allocator.dupe(u8, HooksCopy.review_notice);
     self.loop.auto_approve_safe = config.auto_approve_safe_commands;
     self.loop.approvals = config.approvals;
+    self.loop.backend = options.backend;
+    self.loop.model_policy = config.model_requests;
     if (config.max_turn_ms) |ms| self.loop.max_turn_ms = ms;
     if (config.max_stall_ms) |ms| self.loop.max_stall_ms = ms;
     if (config.max_turn_tokens) |tokens| self.loop.max_turn_tokens = tokens;
@@ -138,7 +165,109 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     if (options.db) |db| {
         try self.loop.attachDatabase(db, self.project.name(), self.project.cwd, options.provider.model);
     }
+    try self.loop.hook_flow.watch.configure(allocator, io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills, &.{});
+    try self.loop.trackModel(.initial);
     return self;
+}
+
+pub fn manageHooks(self: *Stack, allocator: std.mem.Allocator, action: HookStore.Action, id: []const u8) ![]u8 {
+    const edit = action != .list and action != .review;
+    if (self.loop.isBusy()) {
+        if (edit) return error.Busy;
+    } else {
+        try reloadHooks(self);
+        if (edit) {
+            try HookStore.change(self.arena.allocator(), self.hooks.io, &self.hooks.set, self.hook_state_path, action, id);
+            try self.loop.hook_flow.watch.configure(self.allocator, self.hooks.io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills, &.{});
+        }
+    }
+    return HookStore.report(allocator, self.hooks.set, self.hooks.timeout_ms, action == .review, &self.hook_runtime);
+}
+
+fn reloadHooks(raw: *anyopaque) !void {
+    const self: *Stack = @ptrCast(@alignCast(raw));
+    const allocator = self.allocator;
+    const io = self.hooks.io;
+    var store = try HookStore.Store.init(allocator, io, self.hook_state_path);
+    defer store.deinit();
+    var revision: std.heap.ArenaAllocator = .init(allocator);
+    errdefer revision.deinit();
+    const discovered = try HookStore.discover(revision.allocator(), io, self.hook_inline, self.project.root, self.hook_home, store);
+    if (sameHooks(self.hooks.set, discovered)) {
+        revision.deinit();
+        return;
+    }
+
+    const scratch = store.arena.allocator();
+    const reviewed = try changedHookPaths(scratch, self.hooks.set, discovered, self.hook_config_path);
+    if (reviewed.len > 0) {
+        var runner = self.hooks;
+        const handlers = try scratch.dupe(Hooks.Hook, runner.set.config_change);
+        for (handlers) |*handler| {
+            const state = store.get(handler.id);
+            handler.enabled = handler.enabled and handler.trusted and state.trusted and !state.disabled;
+        }
+        runner.set.config_change = handlers;
+        for (reviewed) |path| {
+            const source: Hooks.ConfigSource = if (@import("../core/paths.zig").inside(self.project.root, path)) .project_settings else .user_settings;
+            var result = try runner.evaluate(allocator, try self.loop.exportHookInput(.{ .event = .config_change, .source = @tagName(source), .file_path = path }));
+            defer result.deinit(allocator);
+            if (result.blocked != null or result.stop) {
+                self.loop.say("Hook configuration change blocked: {s}", .{result.blocked orelse HooksCopy.stopped});
+                return error.HookBlocked;
+            }
+        }
+    }
+    try self.hook_revisions.ensureUnusedCapacity(allocator, 1);
+    try self.loop.hook_flow.watch.configure(allocator, io, self.project.root, self.hook_config_path, self.hook_home, discovered, self.skills.skills, reviewed);
+    self.hook_revisions.appendAssumeCapacity(revision);
+    self.hooks.set = discovered;
+}
+
+fn sameHooks(left: Hooks.Set, right: Hooks.Set) bool {
+    inline for (std.meta.fields(Hooks.Set)) |field| {
+        const old = @field(left, field.name);
+        const new = @field(right, field.name);
+        if (old.len != new.len) return false;
+        for (old, new) |a, b| {
+            if (!std.mem.eql(u8, a.id, b.id) or a.trusted != b.trusted or a.enabled != b.enabled) return false;
+        }
+    }
+    return true;
+}
+
+fn changedHookPaths(arena: std.mem.Allocator, left: Hooks.Set, right: Hooks.Set, config_path: []const u8) ![]const []const u8 {
+    if (left.config_change.len == 0) return &.{};
+    var sources: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var ids: std.StringHashMapUnmanaged(void) = .empty;
+    for ([_]Hooks.Set{ left, right }, [_]Hooks.Set{ right, left }) |before, after| {
+        inline for (std.meta.fields(Hooks.Set)) |field| {
+            ids.clearRetainingCapacity();
+            for (@field(after, field.name)) |hook| try ids.put(arena, hook.id, {});
+            for (@field(before, field.name)) |hook| {
+                if (!ids.contains(hook.id)) try sources.put(arena, if (std.mem.eql(u8, hook.source, Hooks.inline_source)) config_path else hook.source, {});
+            }
+        }
+    }
+    return sources.keys();
+}
+
+fn callHookMcp(raw: *anyopaque, allocator: std.mem.Allocator, hook: Hooks.Hook, arguments: []const u8, timeout_ms: u64, stop: ?*const std.atomic.Value(bool)) ![]const u8 {
+    const self: *Stack = @ptrCast(@alignCast(raw));
+    const deadline = tool.monotonicMilliseconds(self.hooks.io) + @as(i64, @intCast(@min(timeout_ms, tool.default_timeout_ms)));
+    const result = try self.mcp_host.callConnected(.{
+        .allocator = allocator,
+        .io = self.hooks.io,
+        .project_root = self.project.root,
+        .reads = &self.reads,
+        .cancelled = stop,
+        .deadline_ms = deadline,
+    }, hook.server, hook.tool, arguments);
+    if (result.is_error) {
+        allocator.free(result.content);
+        return error.HookMcpCallFailed;
+    }
+    return result.content;
 }
 
 fn mcpServers(arena: std.mem.Allocator, config: *const Config, extra: []const mcp_tools.Server) ![]const mcp_tools.Server {
@@ -163,14 +292,25 @@ fn named(servers: []const mcp_tools.Server, name: []const u8) bool {
 pub fn destroy(self: *Stack) void {
     // Ordered: the loop joins workers writing to the runner; MCP tools point into the host.
     self.titler.deinit(&self.loop);
+    const end_input = (self.loop.exportHookInput(.{ .event = .session_end }) catch self.loop.hookInput(.{ .event = .session_end })).dupe(self.arena.allocator()) catch Hooks.Invocation{ .event = .session_end };
+    self.hook_runtime.retainSnapshot(end_input.transcript_path);
     self.loop.deinit();
     self.runner.deinit();
+    self.hook_runtime.cancelBackground();
+    var end_runner = self.hooks;
+    end_runner.deadline_ms = std.Io.Clock.now(.awake, self.hooks.io).toMilliseconds() + Hooks.cleanup_timeout_ms;
+    var end_result = end_runner.evaluate(self.allocator, end_input) catch null;
+    if (end_result) |*result| result.deinit(self.allocator);
+    self.hook_runtime.releaseSnapshot(end_input.transcript_path);
+    self.hook_runtime.deinit();
     self.convo.deinit();
     self.reads.deinit();
     self.registry.deinit();
     self.mcp_host.deinit();
     self.skills.deinit();
     self.project.deinit(self.allocator);
+    for (self.hook_revisions.items) |revision| revision.deinit();
+    self.hook_revisions.deinit(self.allocator);
     self.arena.deinit();
     self.allocator.destroy(self);
 }
@@ -202,4 +342,47 @@ test "a stack assembles a loop ready for its first turn" {
     try testing.expectEqualStrings(agents.default_id, stack.loop.agent.id);
     try testing.expect(stack.registry.get("read") != null);
     try testing.expect(stack.loop.delegate != null);
+}
+
+test "trusted current config policy blocks replacement definitions before adoption" {
+    var memory: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
+    defer std.debug.assert(memory.deinit() == .ok);
+    const a = memory.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.createDirPath(io, ".synth");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data =
+        \\{"ConfigChange":[{"hooks":[{"type":"command","command":"cat >> changes; echo locked >&2; exit 2"}]}]}
+    });
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const trust_path = try std.fs.path.join(a, &.{ cwd, "trust.json" });
+    defer a.free(trust_path);
+    var config: Config = .{ .arena = .init(a), .hook_state_path = trust_path };
+    defer config.arena.deinit();
+    var backend: Backend = .init(.ollama, .{ .allocator = a, .io = io, .host = "http://127.0.0.1:9", .label = "test" });
+    defer backend.deinit();
+    const stack = try create(a, io, .{ .config = &config, .provider = backend.provider(), .cwd = cwd });
+    defer stack.destroy();
+    const id = try a.dupe(u8, stack.hooks.set.config_change[0].id);
+    defer a.free(id);
+    a.free(try stack.manageHooks(a, .trust, id));
+    a.free(try stack.manageHooks(a, .list, ""));
+    const retained = memory.total_requested_bytes;
+    for (0..16) |_| a.free(try stack.manageHooks(a, .list, ""));
+    try std.testing.expect(memory.total_requested_bytes <= retained);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".synth/hooks.json", .data =
+        \\{"PreToolUse":[{"hooks":[{"command":"touch must-not-run"}]}]}
+    });
+    try std.testing.expectError(error.HookBlocked, stack.manageHooks(a, .list, ""));
+    try std.testing.expectEqualStrings(id, stack.hooks.set.config_change[0].id);
+    try std.testing.expectEqual(@as(usize, 0), stack.hooks.set.pre_tool_use.len);
+    const trace = try tmp.dir.readFileAlloc(io, "changes", a, .limited(16 * 1024));
+    defer a.free(trace);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, trace, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("project_settings", parsed.value.object.get("source").?.string);
+    try std.testing.expect(std.mem.endsWith(u8, parsed.value.object.get("file_path").?.string, "/.synth/hooks.json"));
 }

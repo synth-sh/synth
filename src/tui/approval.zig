@@ -8,6 +8,7 @@ const vxfw = vaxis.vxfw;
 
 const Loop = @import("../agent/loop.zig");
 const permission = @import("../agent/permission.zig");
+const Snapshot = @import("../core/action.zig").Snapshot;
 const diff = @import("diff.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
@@ -106,6 +107,7 @@ pub const DrawArgs = struct {
     description: []const u8,
     /// Raw JSON object of arguments, as the model produced it.
     arguments: []const u8,
+    prepared_action: ?[]const u8 = null,
     /// Project the allowance would be scoped to, for the "allow always" hint.
     project: []const u8 = "",
     /// What an "allow always" could store, narrowest first.
@@ -119,10 +121,11 @@ pub fn draw(self: *Approval, ctx: vxfw.DrawContext, parent: vxfw.Widget, args: D
     const available = width -| (indent + 2);
 
     const change = try diff.change(ctx.arena, args.name, args.arguments);
-    const body: []const Line = if (change) |c|
+    const argument_body: []const Line = if (change) |c|
         try changeSummary(ctx.arena, c)
     else
         try argumentLines(ctx.arena, args.arguments, @min(available, max_summary_width));
+    const body = try withPreparedTargets(ctx.arena, args.prepared_action, argument_body);
     const body_height: u16 = @intCast(body.len);
 
     const height: u16 = pad_top + 3 + body_height + 3 + pad_bottom;
@@ -172,6 +175,21 @@ pub fn draw(self: *Approval, ctx: vxfw.DrawContext, parent: vxfw.Widget, args: D
 
     self.drawButtons(surface, height - 1 - pad_bottom, self.selected == .always and args.proposals.len > 1);
     return surface;
+}
+
+fn withPreparedTargets(arena: std.mem.Allocator, snapshot: ?[]const u8, arguments: []const Line) ![]const Line {
+    const action = Snapshot.parse(arena, snapshot orelse return arguments) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return arguments,
+    };
+    const action_lines = 1 + action.resolved_targets.len;
+    const lines = try arena.alloc(Line, action_lines + arguments.len);
+    lines[0] = .{ .kind = .value, .indent = 0, .text = try std.fmt.allocPrint(arena, "cwd: {s}", .{action.cwd}) };
+    for (action.resolved_targets, lines[1..action_lines]) |target, *line| {
+        line.* = .{ .kind = .value, .indent = 0, .text = try std.fmt.allocPrint(arena, "target: {s}", .{target}) };
+    }
+    @memcpy(lines[action_lines..], arguments);
+    return lines;
 }
 
 /// What the highlighted choice does, and how loudly to say it. "Allow always"

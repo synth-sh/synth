@@ -6,6 +6,7 @@
 //! Requests go straight out, and their replies come back through the queue.
 
 const std = @import("std");
+const Hooks = @import("../core/hooks.zig");
 
 const rpc = @import("rpc.zig");
 const protocol = @import("protocol.zig");
@@ -107,7 +108,7 @@ const Awaited = union(enum) {
     command: []const u8,
     typed_model: []u8,
     /// A prompt, answered once its turn is over.
-    prompt,
+    prompt: []u8,
     tool_result: struct { seq: u64, call: u32 },
     attachment: struct { seq: u64, index: u32 },
     thinking: u64,
@@ -120,16 +121,26 @@ const Awaited = union(enum) {
     files,
     providers,
     approvals,
+    hooks,
     checkpoints,
     /// A rewind from the agent's `seq`, done or only asked about.
     rewind: struct { seq: u64, apply: bool },
     /// The call whose subagent, by the TUI's own numbering.
     subagent: struct { seq: u64, call: u32 },
     detach,
+
+    fn deinit(self: Awaited, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .search => |text| allocator.free(text),
+            .typed_model, .prompt => |text| allocator.free(text),
+            else => {},
+        }
+    }
 };
 
 /// What a request the TUI made came back with, for it to show.
 pub const Answer = union(enum) {
+    hooks: []u8,
     /// The project's stored sessions. Ids are the agent's, so zero here.
     sessions: []Database.SessionInfo,
     search: struct { query: []u8, hits: []Database.Hit },
@@ -155,6 +166,7 @@ pub const Answer = union(enum) {
 
     pub fn deinit(self: Answer, allocator: std.mem.Allocator) void {
         switch (self) {
+            .hooks => |text| allocator.free(text),
             .sessions => |sessions| {
                 for (sessions) |info| info.deinit(allocator);
                 allocator.free(sessions);
@@ -390,11 +402,7 @@ fn forgetConnection(self: *Mirror) void {
         if (inbound != self.lost) inbound.destroy();
     }
     var waited = self.waiting.valueIterator();
-    while (waited.next()) |awaited| switch (awaited.*) {
-        .search => |query| self.allocator.free(query),
-        .typed_model => |draft| self.allocator.free(draft),
-        else => {},
-    };
+    while (waited.next()) |awaited| awaited.deinit(self.allocator);
     self.waiting.clearRetainingCapacity();
     self.forgetAsked();
     self.forgetEarly();
@@ -477,11 +485,7 @@ fn destroy(self: *Mirror) void {
     for (self.answers.items) |unshown| unshown.deinit(self.allocator);
     self.answers.deinit(self.allocator);
     var awaited = self.waiting.valueIterator();
-    while (awaited.next()) |entry| switch (entry.*) {
-        .search => |query| self.allocator.free(query),
-        .typed_model => |draft| self.allocator.free(draft),
-        else => {},
-    };
+    while (awaited.next()) |entry| entry.deinit(self.allocator);
     self.waiting.deinit(self.allocator);
     if (self.failed_draft) |draft| self.allocator.free(draft);
     self.thinking.deinit();
@@ -527,6 +531,7 @@ fn queue(self: *Mirror, inbound: *Inbound) void {
 pub const Changes = struct {
     /// Anything at all, worth drawing again.
     any: bool = false,
+    directory: bool = false,
     /// A message was added, changed or loaded in full.
     transcript: bool = false,
     /// A message was added at the end, or the transcript replaced: the view
@@ -767,6 +772,7 @@ fn resetStreams(self: *Mirror, request: ?u64) void {
 
 /// Copy a status into an arena of its own, so it outlives the message.
 fn keepStatus(self: *Mirror, status: synth.Status) !void {
+    self.changes.directory = self.changes.directory or !std.mem.eql(u8, self.status.cwd, status.cwd);
     _ = self.status_arena.reset(.retain_capacity);
     const arena = self.status_arena.allocator();
 
@@ -782,6 +788,8 @@ fn keepStatus(self: *Mirror, status: synth.Status) !void {
     kept.title = try arena.dupe(u8, status.title);
     kept.handle = try arena.dupe(u8, status.handle);
     kept.root = try arena.dupe(u8, status.root);
+    kept.cwd = try arena.dupe(u8, status.cwd);
+    kept.additional_roots = try dupeAll(arena, status.additional_roots);
     kept.project = try arena.dupe(u8, status.project);
     kept.branch = try arena.dupe(u8, status.branch);
     kept.agent = try arena.dupe(u8, status.agent);
@@ -835,16 +843,14 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
         .string => return,
     };
     const awaited = (self.waiting.fetchRemove(number) orelse return).value;
-    defer switch (awaited) {
-        .search => |query| self.allocator.free(query),
-        .typed_model => |draft| self.allocator.free(draft),
-        else => {},
-    };
+    var keep_draft = false;
+    defer if (!keep_draft) awaited.deinit(self.allocator);
     if (message.err) |err| {
         if (awaited == .models) self.models_failed = true;
         if (awaited == .typed_model) {
             if (self.failed_draft) |draft| self.allocator.free(draft);
-            self.failed_draft = try self.allocator.dupe(u8, awaited.typed_model);
+            self.failed_draft = awaited.typed_model;
+            keep_draft = true;
         }
         if (awaited == .history) self.paging = false;
         // A turn that failed has said so in the transcript already.
@@ -863,6 +869,7 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             .files => "listing the files",
             .providers => "listing the providers",
             .approvals => "changing the allowances",
+            .hooks => "inspecting hooks",
             .checkpoints => "listing the checkpoints",
             .rewind => "putting the files back",
             .subagent => "loading the subagent's transcript",
@@ -957,6 +964,11 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             errdefer kept.deinit();
             const states = try rpc.parse([]const synth.ProviderState, kept.allocator(), result);
             self.answers.appendAssumeCapacity(.{ .providers = .{ .arena = kept, .states = states } });
+        },
+        .hooks => {
+            const text = try rpc.parse([]const u8, arena, result);
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            self.answers.appendAssumeCapacity(.{ .hooks = try self.allocator.dupe(u8, text) });
         },
         .approvals => {
             try self.answers.ensureUnusedCapacity(self.allocator, 1);
@@ -1198,7 +1210,9 @@ pub fn submit(self: *Mirror, prompt: []const u8, extras: Loop.Extras) !void {
         block.* = .{ .resource = .{ .path = attachment.path, .text = attachment.content } };
     }
     for (extras.images, blocks[1 + extras.attachments.len ..]) |image, *block| block.* = .{ .image = image };
-    try self.send(protocol.method.session_prompt, .{ .sessionId = self.status.handle, .prompt = blocks }, .prompt);
+    const draft = try self.allocator.dupe(u8, prompt);
+    errdefer self.allocator.free(draft);
+    try self.send(protocol.method.session_prompt, .{ .sessionId = self.status.handle, .prompt = blocks }, .{ .prompt = draft });
 }
 
 /// Whether the text went in as steering. Only while busy: otherwise it is a
@@ -1209,10 +1223,7 @@ pub fn steer(self: *Mirror, text: []const u8, extras: Loop.Extras) !bool {
     return true;
 }
 
-/// Answer the question out for the call waiting on an answer, or the one
-/// on its way when the status already says a question is waiting. An
-/// answer that is not one the form offers goes in its field for the
-/// person's own.
+/// Composer text uses the free-text field even when it matches an offered option.
 pub fn answer(self: *Mirror, text: []const u8) !void {
     const connection = try self.live();
     const asked = self.asked orelse {
@@ -1225,10 +1236,7 @@ pub fn answer(self: *Mirror, text: []const u8) !void {
         .answer => |choices| choices,
         .decision => return error.NothingToAnswer,
     };
-    const offered = choices.len == 0 or for (choices) |choice| {
-        if (std.mem.eql(u8, choice, text)) break true;
-    } else false;
-    const filled: updates.Question.Filled = if (offered) .{ .answer = text } else .{ .other = text };
+    const filled: updates.Question.Filled = if (choices.len == 0) .{ .answer = text } else .{ .other = text };
     try connection.reply(asked.id, protocol.Elicited(updates.Question.Filled){ .action = "accept", .content = filled });
     self.forgetAsked();
 }
@@ -1263,6 +1271,14 @@ pub fn rename(self: *Mirror, name: []const u8) !void {
 /// Start a turn on one of the agent's skills, as typed: `/id args`.
 pub fn runSkill(self: *Mirror, line: []const u8) !void {
     try self.submit(line, .{});
+}
+
+pub fn changeDirectory(self: *Mirror, path: []const u8) !void {
+    try self.send(synth.method.change_directory, synth.Directory{ .sessionId = self.status.handle, .path = path }, .{ .command = "Changing directory" });
+}
+
+pub fn addDirectory(self: *Mirror, path: []const u8) !void {
+    try self.send(synth.method.add_directory, synth.Directory{ .sessionId = self.status.handle, .path = path, .source = .slash_command }, .{ .command = "Adding directory" });
 }
 
 /// Hand decisions on calls to `mode`. The status says when it took.
@@ -1493,11 +1509,18 @@ test "a question is answered from here, whether or not its request has arrived y
     try mirror.submit("ask me", .{});
     try pollUntil(mirror, awaitingAnswer);
     try testing.expectError(error.NothingToDecide, mirror.decide(.once));
-    try mirror.answer("green");
+    try mirror.answer("blue");
     try pollUntil(mirror, finishedOne);
     try testing.expectEqual(@as(?Loop.Outcome, .done), mirror.status.outcome);
-    try testing.expectEqualStrings("green", convo.messages.items[1].tool_calls[0].result.?);
+    try testing.expectEqualStrings("blue", convo.messages.items[1].tool_calls[0].result.?);
     try testing.expect(mirror.asked == null and mirror.early == null);
+    const session = (try fixture.db.sessionByHandle(mirror.status.handle)).?;
+    const evidence = try fixture.db.humanIntent(testing.allocator, session);
+    defer evidence.deinit(testing.allocator);
+    const typed = for (evidence.messages) |message| {
+        if (message.origin == .human and std.mem.eql(u8, message.text, "blue")) break true;
+    } else false;
+    try testing.expect(typed);
 }
 
 test "device sign-in status retains its code after the incoming buffer is reused" {
@@ -1933,6 +1956,8 @@ test "a mirror offers the agent's skills, and running one sends the agent's inst
         .data = "---\ndescription: Cut a release\n---\nTag it and push.\n",
     });
 
+    fixture.config.hook_state_path = try std.fs.path.join(fixture.arena.allocator(), &.{ fixture.project, "..", "hook-trust.json" });
+    fixture.config.hooks.user_prompt_expansion = &.{.{ .command = "cat > skill-expansion.json" }};
     const mirror = try openFresh(fixture, &convo);
     defer mirror.close();
     try testing.expectEqual(@as(usize, 1), mirror.skills.len);
@@ -1940,11 +1965,25 @@ test "a mirror offers the agent's skills, and running one sends the agent's inst
     try testing.expectEqualStrings("Cut a release", mirror.skills[0].description);
     try testing.expect(mirror.skill_paths.len > 0);
 
+    try mirror.hooks(.review, "");
+    const review = try pollForAnswer(mirror);
+    defer review.deinit(testing.allocator);
+    try mirror.hooks(.trust, review.hooks[0..64]);
+    const trusted = try pollForAnswer(mirror);
+    defer trusted.deinit(testing.allocator);
     try mirror.runSkill("/release 2.1");
     try pollUntil(mirror, awaitingApproval);
     const asked = convo.messages.items[0];
     try testing.expectEqualStrings("/release 2.1", asked.text);
     try testing.expect(std.mem.indexOf(u8, asked.attachments[0].content, "Tag it and push.") != null);
+    const payload = try fixture.tmp.dir.readFileAlloc(testing.io, "project/skill-expansion.json", testing.allocator, .limited(16 * 1024));
+    defer testing.allocator.free(payload);
+    const expanded = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
+    defer expanded.deinit();
+    try testing.expectEqualStrings("UserPromptExpansion", expanded.value.object.get("hook_event_name").?.string);
+    try testing.expectEqualStrings("release", expanded.value.object.get("command_name").?.string);
+    try testing.expectEqualStrings("2.1", expanded.value.object.get("command_args").?.string);
+    try testing.expect(std.mem.indexOf(u8, expanded.value.object.get("expanded_prompt").?.string, "Tag it and push.") != null);
 }
 
 fn planning(mirror: *Mirror) bool {
@@ -2041,4 +2080,8 @@ test "a session another process hosts is attached to on its socket, opening or s
     try switching.attach(handle);
     try testing.expectEqualStrings(handle, switching.status.handle);
     try testing.expect(switching.takeSwitched());
+}
+
+pub fn hooks(self: *Mirror, action: @import("../core/hook_store.zig").Action, id: []const u8) !void {
+    try self.send(synth.method.hooks, synth.Hooks{ .sessionId = self.status.handle, .action = action, .id = id }, .hooks);
 }

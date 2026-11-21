@@ -2,11 +2,19 @@
 //! back, repeat until it answers in prose.
 
 const std = @import("std");
+const HookSchema = @import("../core/hook_schema.zig");
+const HookToolInput = @import("../core/hook_tool_input.zig");
+const Filesystem = @import("../tools/filesystem.zig");
+const HumanIntent = @import("../core/human_intent.zig");
+const paths = @import("../core/paths.zig");
+const action_paths = @import("../core/action.zig");
 const testing = std.testing;
 
 const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
 const Hooks = @import("../core/hooks.zig");
+const HookFlow = @import("hook_flow.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
 const Provider = @import("../provider/provider.zig");
 const recap = @import("recap.zig");
 const redact = @import("../core/redact.zig");
@@ -31,6 +39,9 @@ const Thought = @import("thought.zig");
 const ToolRun = @import("tool_run.zig");
 
 const Loop = @This();
+
+const idle_notification_delay_ms: i64 = std.time.ms_per_min;
+const reviewer_timeout_reason = "reviewer timed out";
 
 /// How many times the same tool call may repeat before the turn is stopped.
 /// Two is a model correcting itself; three is a model stuck.
@@ -126,15 +137,27 @@ const Allowance = struct {
 allocator: std.mem.Allocator,
 io: std.Io,
 provider: Provider,
+backend: ?*@import("../provider/backend.zig") = null,
+model_policy: Config.ModelPolicy.Policy = .{},
+human_intent: @import("../core/human_intent.zig") = .{},
+review_started_ms: i64 = 0,
+effective_model: ?[]const u8 = null,
+effective_provider: ?[]const u8 = null,
 registry: *const Registry,
 conversation: *Conversation,
 reads: *tool.ReadLog,
 hooks: ?*const Hooks.Runner = null,
-hook_dispatch: ?*Hooks.Dispatch = null,
-pending_submit: ?Submission = null,
-hook_notice: ?[]u8 = null,
+hook_flow: HookFlow = .{},
+control_files: []const []const u8 = &.{},
+stream_display: bool = true,
+interrupted: bool = false,
+stop_hook_active: bool = false,
+hook_submission: ?Submission = null,
 /// Root every tool resolves against. Borrowed.
 project_root: []const u8,
+working_directory: ?[]const u8 = null,
+additional_roots: std.ArrayList([]const u8) = .empty,
+workspace_prompt: ?[]const u8 = null,
 
 /// Persistence, when attached. Null in tests and in `synth run`, which are
 /// deliberately stateless. All database calls stay on this (the UI) thread.
@@ -315,6 +338,8 @@ pub fn init(
     reads: *tool.ReadLog,
     project_root: []const u8,
 ) Loop {
+    var identity: [HookFlow.identity_bytes]u8 = undefined;
+    io.random(&identity);
     conversation.preserve_context = true;
     return .{
         .allocator = allocator,
@@ -325,6 +350,7 @@ pub fn init(
         .reads = reads,
         .project_root = project_root,
         .todos = .init(allocator),
+        .hook_flow = .{ .identity = std.fmt.bytesToHex(identity, .lower) },
     };
 }
 
@@ -410,9 +436,21 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     defer self.allocator.free(loaded);
 
     std.mem.reverse(Conversation.Message, loaded);
+    self.discardHookSubmission();
+    self.endHookSession("resume");
+    if (self.hook_flow.context) |context| self.allocator.free(context);
+    self.hook_flow.context = null;
+    self.hook_flow.reset();
+    self.prompt_cache.invalidate(self.allocator);
     try self.conversation.adopt(loaded, total - @min(total, loaded.len));
 
+    const hook_handle = try db.sessionPublicId(session_id, self.allocator);
+    if (self.hook_flow.session_handle) |old| self.allocator.free(old);
+    self.hook_flow.session_handle = hook_handle;
     self.session_id = session_id;
+    self.hook_flow.session_started = false;
+    self.hook_flow.session_source = .@"resume";
+    self.stop_hook_active = false;
     if (self.session_title) |old| self.allocator.free(old);
     self.session_title = null;
     const name = try db.sessionTitle(session_id, self.allocator);
@@ -428,7 +466,19 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
 pub fn resetForNewSession(self: *Loop) bool {
     if (self.isBusy()) return false;
 
+    self.discardHookSubmission();
+    self.endHookSession("clear");
+    self.hook_flow.reset();
+    self.prompt_cache.invalidate(self.allocator);
+    self.human_intent.deinit(self.allocator);
     self.conversation.clear();
+    if (self.hook_flow.session_handle) |old| self.allocator.free(old);
+    self.hook_flow.session_handle = null;
+    self.hook_flow.session_started = false;
+    self.hook_flow.session_source = .clear;
+    self.stop_hook_active = false;
+    if (self.hook_flow.context) |context| self.allocator.free(context);
+    self.hook_flow.context = null;
     self.session_id = null;
     if (self.session_title) |old| self.allocator.free(old);
     self.session_title = null;
@@ -459,6 +509,7 @@ fn restoreTodos(self: *Loop, session_id: i64) !void {
 
 /// Point the provider back at the model the session was last run under.
 fn restoreModel(self: *Loop, session_id: i64) !void {
+    if (self.model_policy.restrict_routes) return;
     const db = self.db orelse return;
     const set = self.provider.set_model orelse return;
 
@@ -471,11 +522,96 @@ fn restoreModel(self: *Loop, session_id: i64) !void {
     try self.adoptModel(now);
 }
 
-/// Point the provider at another of its models and record it on the session.
-pub fn switchModel(self: *Loop, model: []const u8) !void {
-    const set = self.provider.set_model orelse return error.ModelFixed;
-    try self.adoptModel(try set(self.provider.userdata, model));
+pub fn beginModelSwitch(self: *Loop, model: []const u8, source: Hooks.ModelSwitchSource) !bool {
+    if (self.model_policy.restrict_routes) return error.ModelRouteDenied;
+    if (self.isBusy()) return error.Busy;
+    try self.trackModel(.initial);
+    return self.startHook(.{ .event = .pre_model_switch, .from_model = self.provider.model, .to_model = model, .requested_model = model, .source = @tagName(source) }, .model_switch);
 }
+
+pub fn pollModelSwitch(self: *Loop) !bool {
+    if (self.state == .cancelling) return false;
+    const dispatch = self.hook_flow.dispatch orelse return error.Canceled;
+    if (self.hook_flow.pending != .model_switch) return error.Canceled;
+    if (!dispatch.isFinished()) return false;
+    dispatch.join();
+    self.hook_flow.dispatch = null;
+    self.state = .idle;
+    defer dispatch.destroy();
+    if (dispatch.failed) |err| return err;
+    if (dispatch.result.blocked != null or dispatch.result.stop) {
+        self.say("Model switch blocked: {s}", .{dispatch.result.blocked orelse HooksCopy.stopped});
+        return error.HookBlocked;
+    }
+    try self.acceptHookResult(&dispatch.result);
+    return true;
+}
+
+pub fn commitModelSwitch(self: *Loop, model: []const u8, source: Hooks.ModelSwitchSource) !void {
+    const set = self.provider.set_model orelse return error.ModelFixed;
+    const now = try set(self.provider.userdata, model);
+    self.provider.model = now.model;
+    if (now.name.len > 0) self.provider.name = now.name;
+    self.provider.context_limit = now.context_limit;
+    self.provider.vision = now.vision;
+    try self.setModel(now.model);
+    try self.trackModel(source);
+}
+
+pub fn workingDirectory(self: *const Loop) []const u8 {
+    return self.working_directory orelse self.project_root;
+}
+
+fn directoryPath(self: *Loop, path: []const u8) ![]u8 {
+    if (path.len == 0) return error.InvalidParams;
+    const lexical = try std.fs.path.resolve(self.allocator, &.{ self.workingDirectory(), path });
+    defer self.allocator.free(lexical);
+    const reference = try std.Io.Dir.cwd().realPathFileAlloc(self.io, lexical, self.allocator);
+    defer self.allocator.free(reference);
+    var dir = try std.Io.Dir.cwd().openDir(self.io, reference, .{});
+    dir.close(self.io);
+    return self.allocator.dupe(u8, reference);
+}
+
+pub fn changeDirectory(self: *Loop, path: []const u8) !void {
+    if (self.isBusy()) return error.Busy;
+    try self.adoptDirectory(path);
+}
+
+fn adoptDirectory(self: *Loop, path: []const u8) !void {
+    const next = try self.directoryPath(path);
+    if (std.mem.eql(u8, next, self.workingDirectory())) {
+        self.allocator.free(next);
+        return;
+    }
+    const old = self.working_directory;
+    const previous = self.workingDirectory();
+    self.working_directory = next;
+    self.prompt_cache.invalidate(self.allocator);
+    self.observeHook(.{ .event = .cwd_changed, .old_cwd = previous, .new_cwd = next });
+    if (old) |owned| self.allocator.free(owned);
+}
+
+pub fn addDirectory(self: *Loop, path: []const u8, source: []const u8) !void {
+    if (self.isBusy()) return error.Busy;
+    const reference = try self.directoryPath(path);
+    errdefer self.allocator.free(reference);
+    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena.deinit();
+    const primary = self.resolveAgainstProject(arena.allocator(), self.project_root) orelse self.project_root;
+    const covered = paths.inside(primary, reference) or for (self.additional_roots.items) |root| {
+        if (paths.inside(root, reference)) break true;
+    } else false;
+    if (covered) {
+        self.allocator.free(reference);
+        return;
+    }
+    try self.additional_roots.append(self.allocator, reference);
+    self.prompt_cache.invalidate(self.allocator);
+    self.observeHook(.{ .event = .directory_added, .directory = reference, .source = source });
+}
+
+pub const trackModel = HookFlow.trackModel;
 
 fn adoptModel(self: *Loop, now: Provider.Current) !void {
     self.provider.model = now.model;
@@ -483,6 +619,7 @@ fn adoptModel(self: *Loop, now: Provider.Current) !void {
     self.provider.context_limit = now.context_limit;
     self.provider.vision = now.vision;
     try self.setModel(now.model);
+    try self.trackModel(.@"resume");
 }
 
 /// Switch agents: rebuild the tool schema, hand it to the provider with the
@@ -510,8 +647,14 @@ fn turn(self: *Loop, instruction: []const u8) Provider.Turn {
     const last = self.conversation.last();
     const continuing_summary = instruction.len == 0 and last != null and last.?.role == .system;
     return .{
+        .backend = self.backend,
+        .model_policy = self.model_policy,
         .system = self.systemPrompt(),
+        .display_messages = true,
+        .stream_display = self.stream_display,
         .tools_json = self.tools_json orelse "",
+        .hooks = self.hooks,
+        .hook_input = self.hookInput(.{ .event = .pre_model_request }),
         .instruction = if (continuing_summary) "Continue the user's task from the conversation summary." else instruction,
     };
 }
@@ -520,7 +663,7 @@ fn turn(self: *Loop, instruction: []const u8) Provider.Turn {
 /// turn and reused across its tool steps.
 fn systemPrompt(self: *Loop) []const u8 {
     const project = self.project orelse return self.system_prompt;
-    return self.prompt_cache.get(
+    const text = self.prompt_cache.get(
         self.allocator,
         self.io,
         self.system_prompt,
@@ -528,7 +671,29 @@ fn systemPrompt(self: *Loop) []const u8 {
         project,
         self.skills,
         self.commit_trailer,
-    ) catch self.system_prompt;
+    ) catch return self.system_prompt;
+    if (self.prompt_cache.generation != self.hook_flow.instruction_generation) {
+        self.hook_flow.instruction_generation = self.prompt_cache.generation;
+        if (self.prompt_cache.instruction_path) |path| {
+            const load_reason = if (self.hook_flow.session_source == .compact) "compact" else "session_start";
+            self.observeHook(.{
+                .event = .instructions_loaded,
+                .file_path = path,
+                .memory_type = "Project",
+                .load_reason = load_reason,
+            });
+        }
+    }
+    if (self.working_directory == null and self.additional_roots.items.len == 0) return text;
+    var writer: std.Io.Writer.Allocating = .init(self.allocator);
+    defer writer.deinit();
+    writer.writer.print("{s}\n<workspace>\nCurrent working directory: {s}\nAdditional permitted roots: ", .{ text, self.workingDirectory() }) catch return text;
+    std.json.Stringify.value(self.additional_roots.items, .{}, &writer.writer) catch return text;
+    writer.writer.writeAll("\nRelative tool paths resolve from the current working directory.\n</workspace>\n") catch return text;
+    const owned = writer.toOwnedSlice() catch return text;
+    if (self.workspace_prompt) |old| self.allocator.free(old);
+    self.workspace_prompt = owned;
+    return owned;
 }
 
 /// The agent after the current one, applied. What one key cycles through.
@@ -564,7 +729,8 @@ fn ensureSession(self: *Loop) !i64 {
     if (self.session_id) |id| return id;
     const db = self.db orelse return error.NoDatabase;
     const project_id = self.project_id orelse return error.NoProject;
-    const id = if (self.session_public_id) |handle|
+    const public_id = self.session_public_id orelse self.hook_flow.session_handle;
+    const id = if (public_id) |handle|
         try db.createSessionAs(project_id, self.session_cwd, self.session_model, handle)
     else
         try db.createSession(project_id, self.session_cwd, self.session_model);
@@ -580,14 +746,10 @@ pub fn requestStop(self: *Loop) void {
     if (self.request) |request| request.requestStop();
     if (self.judging) |judging| judging.request.requestStop();
     if (self.tools) |tools| tools.requestStop();
-    if (self.hook_dispatch) |dispatch| dispatch.requestStop();
+    if (self.hook_flow.dispatch) |dispatch| dispatch.requestStop();
 }
 
 pub fn deinit(self: *Loop) void {
-    if (self.session_title) |t| self.allocator.free(t);
-    self.session_title = null;
-    if (self.session_model_owned) |m| self.allocator.free(m);
-    self.session_model_owned = null;
     if (self.canceller) |*canceller| {
         canceller.await(self.io);
         self.canceller = null;
@@ -607,17 +769,28 @@ pub fn deinit(self: *Loop) void {
         tools.destroy();
         self.tools = null;
     }
-    if (self.hook_dispatch) |dispatch| {
+    if (self.hook_flow.dispatch) |dispatch| {
         dispatch.cancel();
         dispatch.destroy();
-        self.hook_dispatch = null;
+        self.hook_flow.dispatch = null;
     }
-    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
-    self.pending_submit = null;
+    if (self.effective_model) |value| self.allocator.free(value);
+    if (self.effective_provider) |value| self.allocator.free(value);
+    self.human_intent.deinit(self.allocator);
+    self.hook_flow.watch.deinit(self.allocator);
+    if (self.hook_flow.model) |model| self.allocator.free(model);
+    if (self.session_title) |t| self.allocator.free(t);
+    if (self.hook_flow.context) |context| self.allocator.free(context);
+    if (self.hook_flow.failure) |failure| self.allocator.free(failure);
+    self.session_title = null;
+    if (self.session_model_owned) |m| self.allocator.free(m);
+    self.session_model_owned = null;
+    if (self.hooks) |runner| if (runner.runtime) |runtime| runtime.discardAgent(&self.hook_flow.identity);
+    self.discardHookSubmission();
 
     self.clearNotes();
     self.todos.deinit();
-    if (self.hook_notice) |notice| self.allocator.free(notice);
+    if (self.hook_flow.notice) |notice| self.allocator.free(notice);
     for (self.steering.items) |*pending| pending.deinit(self.allocator);
     self.steering.deinit(self.allocator);
     self.prompt_cache.deinit(self.allocator);
@@ -630,7 +803,18 @@ pub fn deinit(self: *Loop) void {
     self.allowed.deinit(self.allocator);
     for (self.checkpointed.items) |path| self.allocator.free(path);
     self.checkpointed.deinit(self.allocator);
+    if (self.hook_flow.export_path) |path| {
+        if (self.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(path);
+        self.allocator.free(path);
+    }
+    self.hook_flow.export_path = null;
+    if (self.hook_flow.session_handle) |handle| self.allocator.free(handle);
+    self.hook_flow.asks.deinit(self.allocator);
     self.message_ids.deinit(self.allocator);
+    if (self.workspace_prompt) |text| self.allocator.free(text);
+    if (self.working_directory) |path| self.allocator.free(path);
+    for (self.additional_roots.items) |path| self.allocator.free(path);
+    self.additional_roots.deinit(self.allocator);
 }
 
 pub fn isBusy(self: *const Loop) bool {
@@ -647,6 +831,7 @@ pub fn syncProvider(self: *Loop) void {
     self.provider.context_limit = now.context_limit;
     self.provider.vision = now.vision;
     self.provider.effort = now.effort;
+    self.trackModel(.automatic) catch {};
 }
 
 /// Run the current model at `level` from the next turn on. Between turns
@@ -682,6 +867,9 @@ pub fn streamingText(self: *Loop) ?*Thought.Stream {
 /// What the composer held back from the draft: pasted blocks and images, each
 /// standing in the prompt as a token. Borrowed for the length of the call.
 pub const Extras = struct {
+    command_name: []const u8 = "",
+    command_args: []const u8 = "",
+    expanded_prompt: []const u8 = "",
     attachments: []const mention.Attachment = &.{},
     /// Base64-encoded image data.
     images: []const []const u8 = &.{},
@@ -689,55 +877,34 @@ pub const Extras = struct {
 
 /// A prompt and what came with it, owned.
 pub const Submission = struct {
-    prompt: []u8,
-    attachments: []mention.Attachment,
-    images: [][]u8,
+    arena: std.heap.ArenaAllocator.State,
+    prompt: []const u8,
+    extras: Extras,
 
     fn init(allocator: std.mem.Allocator, prompt: []const u8, extras: Extras) !Submission {
-        const owned_prompt = try allocator.dupe(u8, prompt);
-        errdefer allocator.free(owned_prompt);
-
-        const attachments = try allocator.alloc(mention.Attachment, extras.attachments.len);
-        var attachments_built: usize = 0;
-        errdefer {
-            for (attachments[0..attachments_built]) |*attachment| attachment.deinit(allocator);
-            allocator.free(attachments);
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const attachments = try a.dupe(mention.Attachment, extras.attachments);
+        for (attachments) |*attachment| {
+            attachment.path = try a.dupe(u8, attachment.path);
+            attachment.content = try a.dupe(u8, attachment.content);
         }
-        for (extras.attachments, attachments) |source, *dest| {
-            const path = try allocator.dupe(u8, source.path);
-            errdefer allocator.free(path);
-            dest.* = .{
-                .path = path,
-                .content = try allocator.dupe(u8, source.content),
-                .content_bytes = source.content_bytes,
-            };
-            attachments_built += 1;
-        }
-
-        const images = try allocator.alloc([]u8, extras.images.len);
-        var images_built: usize = 0;
-        errdefer {
-            for (images[0..images_built]) |image| allocator.free(image);
-            allocator.free(images);
-        }
-        for (extras.images, images) |source, *dest| {
-            dest.* = try allocator.dupe(u8, source);
-            images_built += 1;
-        }
-
-        return .{ .prompt = owned_prompt, .attachments = attachments, .images = images };
-    }
-
-    pub fn asExtras(self: *const Submission) Extras {
-        return .{ .attachments = self.attachments, .images = self.images };
+        const images = try a.dupe([]const u8, extras.images);
+        for (images) |*image| image.* = try a.dupe(u8, image.*);
+        const owned_prompt = try a.dupe(u8, prompt);
+        const owned: Extras = .{
+            .attachments = attachments,
+            .images = images,
+            .command_name = try a.dupe(u8, extras.command_name),
+            .command_args = try a.dupe(u8, extras.command_args),
+            .expanded_prompt = try a.dupe(u8, extras.expanded_prompt),
+        };
+        return .{ .arena = arena.state, .prompt = owned_prompt, .extras = owned };
     }
 
     pub fn deinit(self: *Submission, allocator: std.mem.Allocator) void {
-        allocator.free(self.prompt);
-        for (self.attachments) |*attachment| attachment.deinit(allocator);
-        allocator.free(self.attachments);
-        for (self.images) |image| allocator.free(image);
-        allocator.free(self.images);
+        self.arena.promote(allocator).deinit();
     }
 };
 
@@ -758,14 +925,24 @@ pub fn compact(self: *Loop) !void {
     if (self.isBusy()) return;
     if (self.conversation.messages.items.len == 0) return;
 
-    try self.startCompaction(false);
+    try self.startCompaction(.manual);
 }
 
-fn startCompaction(self: *Loop, resume_turn: bool) !void {
+fn startCompaction(self: *Loop, source: HookFlow.Compaction) !void {
+    self.hook_flow.compaction = source;
+    if (try self.lifecycle(.pre_compact, .compact)) return;
+    try self.startCompactionRequest();
+}
+
+fn startCompactionRequest(self: *Loop) !void {
     const request_turn: Provider.Turn = .{
+        .backend = self.backend,
+        .model_policy = self.model_policy,
         .system = self.systemPrompt(),
         .instruction = compaction_prompt,
         .compacting = true,
+        .hooks = self.hooks,
+        .hook_input = try self.exportHookInput(.{ .event = .pre_model_request, .request_purpose = .compaction }),
     };
     if (!try self.contextFits(request_turn)) return self.stop("Stopped: history is too large to compact safely with this model. Nothing was discarded. Switch to a model with a larger context window, or use /clear to start a new session.");
     self.request = try Request.start(
@@ -777,15 +954,16 @@ fn startCompaction(self: *Loop, resume_turn: bool) !void {
     );
     self.requests_started += 1;
     self.compacting = true;
-    if (resume_turn) self.compacted_since_reply = true;
-    self.resume_after_compaction = resume_turn;
+    self.resume_after_compaction = self.hook_flow.compaction == .during_turn;
+    if (self.resume_after_compaction) self.compacted_since_reply = true;
     self.state = .compacting;
 }
 
 /// Check the same budget the serializers enforce, even for an unknown model.
 pub fn shouldCompact(self: *Loop) bool {
-    if (self.auto_compact_at <= 0) return false;
+    if (self.auto_compact_at <= 0 or self.hook_flow.compaction_veto_seq == self.conversation.next_seq) return false;
     const request_turn = self.turn("");
+    if (self.hasContextHook(request_turn)) return false;
     const budget = window.requestBudget(self.provider.context_limit, request_turn);
     const estimated = window.contextTokens(self.conversation, self.provider.vision);
     const prompt_overhead = (request_turn.system.len + request_turn.tools_json.len) / 4;
@@ -797,7 +975,19 @@ pub fn shouldCompact(self: *Loop) bool {
 
 const context_full_notice = "Stopped: context is full. History was preserved. Use /compact or switch to a model with a larger context window before continuing.";
 
+fn hasModelRoute(self: *const Loop, invocation: Hooks.Invocation) bool {
+    if (self.model_policy.selected(invocation.request_purpose) != null) return true;
+    const runner = self.hooks orelse return false;
+    var input = invocation;
+    input.event = .model_resolve;
+    input.model = self.provider.model;
+    input.provider = self.provider.name;
+    return runner.hasMatching(self.allocator, input, false);
+}
+
 fn contextFits(self: *Loop, request_turn: Provider.Turn) !bool {
+    if (self.hasModelRoute(request_turn.hook_input)) return true;
+    if (self.hasContextHook(request_turn)) return true;
     const budget = window.requestBudget(self.provider.context_limit, request_turn);
     const kept = window.completeMessages(self.conversation, self.allocator, budget, self.provider.vision) catch |err| switch (err) {
         error.ContextTooLarge => return false,
@@ -805,6 +995,25 @@ fn contextFits(self: *Loop, request_turn: Provider.Turn) !bool {
     };
     self.allocator.free(kept);
     return true;
+}
+
+fn hasContextHook(self: *const Loop, request_turn: Provider.Turn) bool {
+    const runner = self.hooks orelse return false;
+    var input = request_turn.hook_input;
+    input.model = self.provider.model;
+    input.provider = self.provider.name;
+    input = runner.classified(input);
+    const may_route = self.hasModelRoute(input);
+    for (runner.set.model_context) |hook| {
+        if (!hook.enabled) continue;
+        var filter = hook.when orelse return true;
+        if (may_route) {
+            filter.model = null;
+            filter.provider = null;
+        }
+        if (filter.accepts(input)) return true;
+    }
+    return false;
 }
 
 /// Turn a finished summarisation into the system message that replaces the
@@ -819,6 +1028,10 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
     self.usage.context_tokens = 0;
+    self.prompt_cache.invalidate(self.allocator);
+    if (try self.lifecycle(.post_compact, .compact_session)) return;
+    self.hook_flow.session_source = .compact;
+    if (try self.lifecycle(.session_start, .after_compact)) return;
     if (resume_turn) return self.ask();
     self.outcome = .done;
 }
@@ -827,27 +1040,70 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
 /// whatever the composer held back.
 pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.isBusy()) return;
+    self.hook_flow.idle_since = null;
+    self.hook_flow.idle_notified = false;
+    self.hook_flow.permission_notice = null;
+    try self.prepareHookIdentity();
 
-    if (self.hook_notice) |notice| self.allocator.free(notice);
-    self.hook_notice = null;
+    if (self.hook_flow.notice) |notice| self.allocator.free(notice);
+    self.hook_flow.notice = null;
 
-    if (self.hooks) |runner| {
-        if (runner.set.forEvent(.user_prompt_submit).len == 0) return self.finishSubmit(prompt, extras);
-
-        self.pending_submit = try Submission.init(self.allocator, prompt, extras);
-        errdefer {
-            self.pending_submit.?.deinit(self.allocator);
-            self.pending_submit = null;
-        }
-        self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, runner.*, .{
-            .event = .user_prompt_submit,
-            .prompt = self.pending_submit.?.prompt,
-        });
-        self.state = .running_hooks;
-        return;
+    if (self.hook_flow.reload) |reload| try reload.call(reload.userdata);
+    if (!self.hook_flow.session_started) {
+        self.hook_flow.session_started = true;
+        errdefer self.hook_flow.session_started = false;
+        if (try self.gatePrompt(.{
+            .event = if (self.parent == null) .session_start else .subagent_start,
+            .source = @tagName(self.hook_flow.session_source),
+            .trigger = self.hook_flow.compaction.trigger(),
+        }, .{ .lifecycle = .begin_prompt }, prompt, extras)) return;
     }
+    try self.submitPrompt(prompt, extras);
+}
 
+fn submitPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
+    if (try self.gatePrompt(.{ .event = .user_prompt_submit, .prompt = prompt }, .prompt, prompt, extras)) return;
+    try self.expandPrompt(prompt, extras);
+}
+
+fn gatePrompt(self: *Loop, input: Hooks.Invocation, pending: HookFlow.Pending, prompt: []const u8, extras: Extras) !bool {
+    const runner = self.hooks orelse return false;
+    if (runner.set.forEvent(input.event).len == 0) return false;
+    var submission = try Submission.init(self.allocator, prompt, extras);
+    errdefer submission.deinit(self.allocator);
+    try HookFlow.begin(self, runner.*, try self.exportHookInput(input), pending);
+    self.hook_submission = submission;
+    return true;
+}
+
+fn discardHookSubmission(self: *Loop) void {
+    if (self.hook_submission) |*pending| pending.deinit(self.allocator);
+    self.hook_submission = null;
+}
+
+fn rejectPrompt(self: *Loop, err: anyerror) void {
+    self.turn_start_seq = null;
+    self.last_error = err;
+    self.finish(.failed);
+}
+
+fn expandPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
+    if (extras.command_name.len > 0 and try self.gatePrompt(.{
+        .event = .user_prompt_expansion,
+        .prompt = prompt,
+        .command_name = extras.command_name,
+        .command_args = extras.command_args,
+        .expanded_prompt = extras.expanded_prompt,
+    }, .expansion, prompt, extras)) return;
     try self.finishSubmit(prompt, extras);
+}
+
+fn recordHuman(self: *Loop, text: []const u8, authorization: bool) !void {
+    const root = self.parent orelse self;
+    try root.human_intent.record(root.allocator, text, authorization);
+    if (authorization) {
+        if (root.db) |db| if (root.session_id) |id| try db.recordAuthorization(id, root.conversation.next_seq, text);
+    }
 }
 
 fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
@@ -859,6 +1115,9 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     self.turn_start_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
     self.turn_started_ms = tool.monotonicMilliseconds(self.io);
     self.turn_tokens = 0;
+    self.stop_hook_active = false;
+    if (self.hook_flow.failure) |failure| self.allocator.free(failure);
+    self.hook_flow.failure = null;
     if (self.last_calls) |calls| self.allocator.free(calls);
     self.last_calls = null;
     self.last_error = null;
@@ -867,59 +1126,329 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
 
 fn recordUserPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
     var mentioned: mention.Resolved =
-        mention.resolve(self.allocator, self.io, self.project_root, prompt) catch .{};
+        mention.resolve(self.allocator, self.io, self.workingDirectory(), prompt) catch .{};
     defer mentioned.deinit(self.allocator);
 
-    const files = mentioned.attachments;
-    const attachments = try self.allocator.alloc(mention.Attachment, files.len + extras.attachments.len);
+    const attachments = try std.mem.concat(self.allocator, mention.Attachment, &.{ mentioned.attachments, extras.attachments });
     defer self.allocator.free(attachments);
-    @memcpy(attachments[0..files.len], files);
-    @memcpy(attachments[files.len..], extras.attachments);
-
-    const images = try self.allocator.alloc([]const u8, mentioned.images.len + extras.images.len);
+    const images = try std.mem.concat(self.allocator, []const u8, &.{ mentioned.images, extras.images });
     defer self.allocator.free(images);
-    @memcpy(images[0..mentioned.images.len], mentioned.images);
-    @memcpy(images[mentioned.images.len..], extras.images);
 
-    _ = try self.conversation.addUser(prompt, attachments, images);
+    const submitted = try self.conversation.addUser(prompt, attachments, images);
+    if (self.parent != null) submitted.origin = .agent else try self.recordHuman(prompt, false);
     try self.persistMessage(self.conversation.messages.items.len - 1);
 }
 
-fn pollPromptHooks(self: *Loop) !bool {
-    const dispatch = self.hook_dispatch orelse return false;
-    if (!dispatch.isFinished()) return false;
+const pollHookFiles = HookFlow.pollHookFiles;
 
+fn startConfigChange(self: *Loop, continuation: HookFlow.Resume) !bool {
+    const runner = self.hooks orelse return false;
+    if (runner.set.config_change.len == 0) return false;
+    const change = self.hook_flow.watch.take(.config_change) orelse return false;
+    return self.startHook(.{ .event = .config_change, .source = change.source, .file_path = change.path }, .{ .lifecycle = continuation });
+}
+
+const observeHook = HookFlow.observeHook;
+
+fn endHookSession(self: *Loop, reason: []const u8) void {
+    if (self.parent != null) return;
+    const configured = self.hooks orelse return;
+    if (configured.runtime) |runtime| runtime.cancelBackground();
+    if (!self.hook_flow.session_started) return;
+    var runner = configured.*;
+    runner.deadline_ms = tool.monotonicMilliseconds(self.io) + Hooks.cleanup_timeout_ms;
+    var input = self.exportHookInput(.{ .event = .session_end }) catch self.hookInput(.{ .event = .session_end });
+    input.reason = reason;
+    var result = runner.evaluate(self.allocator, input) catch return;
+    result.deinit(self.allocator);
+}
+
+pub const notifyHook = HookFlow.notifyHook;
+
+fn awaitApproval(self: *Loop) void {
+    self.state = .awaiting_approval;
+    const call = self.pendingCall() orelse return;
+    const signature = std.hash.Wyhash.hash(self.pending_seq orelse 0, call.id);
+    if (self.hook_flow.permission_notice == signature) return;
+    self.hook_flow.permission_notice = signature;
+    self.observeHook(.{ .event = .notification, .notification_type = @tagName(Hooks.NotificationType.permission_prompt), .message = call.arguments, .tool_name = call.name, .tool_call_id = call.id });
+}
+
+pub const hookInput = HookFlow.hookInput;
+
+const prepareHookIdentity = HookFlow.prepareHookIdentity;
+
+pub const exportHookInput = HookFlow.exportHookInput;
+
+const startHook = HookFlow.start;
+
+const lifecycle = HookFlow.lifecycle;
+
+fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch, next: HookFlow.Resume) !bool {
+    if (next == .failed_turn) {
+        try self.acceptHookResult(&dispatch.result);
+        if (dispatch.failed) |err| self.say(HooksCopy.named_failure, .{ Hooks.Event.stop_failure.name(), @errorName(err) });
+        self.finish(.failed);
+        return true;
+    }
+    if (dispatch.invocation.event == .subagent_start) {
+        if (dispatch.failed) |err| self.say(HooksCopy.named_failure, .{ dispatch.invocation.event.name(), @errorName(err) });
+    }
+    if (next == .finish_turn) {
+        try self.acceptHookResult(&dispatch.result);
+        if (dispatch.failed) |err| {
+            self.last_error = err;
+            self.say(HooksCopy.named_failure, .{ "Completion", @errorName(err) });
+            self.finish(.failed);
+            return true;
+        }
+        if (dispatch.result.takeBlocked()) |reason| {
+            defer self.allocator.free(reason);
+            if (!dispatch.result.stop) {
+                self.stop_hook_active = true;
+                const continuation = try std.fmt.allocPrint(self.allocator, "[Completion hook continuation] {s}", .{reason});
+                defer self.allocator.free(continuation);
+                _ = try self.conversation.append(.{ .role = .user, .origin = .harness, .text = continuation });
+                try self.persistMessage(self.conversation.messages.items.len - 1);
+                try self.ask();
+                return true;
+            }
+        }
+        self.finish(.done);
+        return true;
+    }
+    if (dispatch.invocation.event != .subagent_start and (dispatch.failed != null or dispatch.result.blocked != null or dispatch.result.stop)) {
+        self.hook_flow.setNotice(self.allocator, if (dispatch.failed) |err|
+            try std.fmt.allocPrint(self.allocator, HooksCopy.named_failure, .{ "Lifecycle", @errorName(err) })
+        else
+            dispatch.result.takeBlocked());
+        self.discardHookSubmission();
+        if (dispatch.invocation.event == .session_start) self.hook_flow.session_started = false;
+        self.state = .idle;
+        if (next == .begin_prompt) {
+            self.rejectPrompt(dispatch.failed orelse error.HookBlocked);
+        } else if ((self.hook_flow.compaction == .during_turn and next != .config_idle) or next == .ask_model) self.finish(.halted);
+        if (dispatch.invocation.event == .pre_compact) self.hook_flow.compaction_veto_seq = self.conversation.next_seq;
+        return true;
+    }
+    try self.acceptHookResult(&dispatch.result);
+    self.state = .idle;
+    switch (next) {
+        .begin_prompt => {
+            var pending = self.hook_submission orelse return false;
+            self.hook_submission = null;
+            defer pending.deinit(self.allocator);
+            try self.submitPrompt(pending.prompt, pending.extras);
+        },
+        .ask_model => try self.ask(),
+        .config_idle => {},
+        .compact => try self.startCompactionRequest(),
+        .compact_session => {
+            self.hook_flow.session_source = .compact;
+            if (try self.lifecycle(.session_start, .after_compact)) return true;
+            if (self.hook_flow.compaction == .during_turn) try self.ask();
+        },
+        .after_compact => if (self.hook_flow.compaction == .during_turn) try self.ask(),
+        .finish_turn, .failed_turn => unreachable,
+    }
+    return true;
+}
+
+fn pollHooks(self: *Loop) !bool {
+    if (self.hook_flow.pending == .model_switch) return false;
+    const dispatch = self.hook_flow.dispatch orelse return false;
+    if (!dispatch.isFinished()) return false;
     dispatch.join();
-    self.hook_dispatch = null;
+    self.hook_flow.dispatch = null;
     defer dispatch.destroy();
 
-    var pending = self.pending_submit orelse return false;
-    self.pending_submit = null;
-    defer pending.deinit(self.allocator);
-
-    if (dispatch.failed) |err| {
-        self.hook_notice = try std.fmt.allocPrint(
-            self.allocator,
-            "UserPromptSubmit hook failed: {s}",
-            .{@errorName(err)},
-        );
-        self.state = .idle;
-        return true;
+    switch (self.hook_flow.pending) {
+        .model_switch => unreachable,
+        .lifecycle => |next| return self.pollLifecycle(dispatch, next),
+        .owner_post => |index| return self.pollOwnerHooks(dispatch, index),
+        .prompt, .expansion => {
+            var pending = self.hook_submission orelse return false;
+            self.hook_submission = null;
+            defer pending.deinit(self.allocator);
+            self.state = .idle;
+            if (dispatch.failed) |err| {
+                self.say(HooksCopy.named_failure, .{ dispatch.invocation.event.name(), @errorName(err) });
+                self.rejectPrompt(err);
+                return true;
+            }
+            if (dispatch.result.takeBlocked()) |reason| {
+                self.hook_flow.setNotice(self.allocator, reason);
+                self.rejectPrompt(error.HookBlocked);
+                return true;
+            }
+            try self.acceptHookResult(&dispatch.result);
+            if (self.hook_flow.pending == .prompt)
+                try self.expandPrompt(pending.prompt, pending.extras)
+            else
+                try self.finishSubmit(pending.prompt, pending.extras);
+        },
+        .auto_denied => |index| {
+            try self.acceptHookResult(&dispatch.result);
+            if (dispatch.result.retry) {
+                const message_index = self.pendingIndex() orelse return false;
+                const call = &self.conversation.messages.items[message_index].tool_calls[index];
+                const text = try std.fmt.allocPrint(self.allocator, "{s}\n[PermissionDenied hook] You may retry this call after addressing the denial.", .{call.result orelse ""});
+                if (call.result) |old| self.allocator.free(old);
+                call.result = text;
+                call.result_bytes = text.len;
+                try self.persistToolCall(message_index, index);
+            }
+            try self.afterAutoBlock();
+        },
+        .task_policy => |index| {
+            const message_index = self.pendingIndex() orelse return false;
+            const call = &self.conversation.messages.items[message_index].tool_calls[index];
+            if (dispatch.failed != null or dispatch.result.blocked != null) {
+                call.status = .rejected;
+                call.result = dispatch.result.takeBlocked() orelse try std.fmt.allocPrint(self.allocator, HooksCopy.named_failure, .{ "Task", @errorName(dispatch.failed.?) });
+                call.result_bytes = call.result.?.len;
+                try self.persistToolCall(message_index, index);
+            } else try self.acceptHookResult(&dispatch.result);
+            self.state = .idle;
+            try self.runApproved();
+        },
+        .steering => {
+            var pending = self.steering.orderedRemove(0);
+            defer pending.deinit(self.allocator);
+            if (dispatch.failed) |err| {
+                self.say(HooksCopy.named_failure, .{ Hooks.Event.user_prompt_submit.name(), @errorName(err) });
+            } else if (dispatch.result.takeBlocked()) |reason| {
+                self.hook_flow.setNotice(self.allocator, reason);
+            } else {
+                try self.acceptHookResult(&dispatch.result);
+                try self.recordUserPrompt(pending.prompt, pending.extras);
+            }
+            try self.ask();
+        },
+        .policy => |index| return self.finishPolicyHook(dispatch, index),
     }
-    if (dispatch.takeBlocked()) |reason| {
-        self.hook_notice = reason;
-        self.state = .idle;
-        return true;
-    }
+    return true;
+}
 
+fn finishPolicyHook(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool {
+    const message_index = self.pendingIndex() orelse return false;
+    const call = &self.conversation.messages.items[message_index].tool_calls[index];
+    const reason = if (dispatch.failed) |err|
+        try std.fmt.allocPrint(self.allocator, HooksCopy.failure, .{@errorName(err)})
+    else
+        dispatch.result.takeBlocked();
+    if (reason) |blocked| {
+        call.status = .rejected;
+        call.result = blocked;
+        call.result_bytes = blocked.len;
+        if (self.parent != null) {
+            const copy = try self.allocator.dupe(u8, blocked);
+            if (self.hook_flow.failure) |old| self.allocator.free(old);
+            self.hook_flow.failure = copy;
+        }
+    } else {
+        const rewritten = if (dispatch.result.replacement) |replacement|
+            self.replaceHookInput(call, replacement, dispatch.runner.rewrite_author == null) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                call.status = .rejected;
+                call.result = try std.fmt.allocPrint(self.allocator, "hook replacement rejected: {s}", .{@errorName(err)});
+                call.result_bytes = call.result.?.len;
+                try self.persistToolCall(message_index, index);
+                try self.autoApprove();
+                return true;
+            }
+        else
+            false;
+        if (dispatch.runner.rewrite_author == null) try self.acceptHookResult(&dispatch.result);
+        if (dispatch.invocation.event == .pre_tool_use and dispatch.result.permission == .ask) try self.hook_flow.asks.append(self.allocator, call.id);
+        if (rewritten) {
+            try self.prepareAction(call);
+            if (call.status == .pending and dispatch.runner.set.pre_tool_use.len > 1) {
+                try self.persistToolCall(message_index, index);
+                try self.startPolicyHook(.pre_tool_use, index, dispatch.result.replacement_author.?);
+                return true;
+            }
+        }
+        if (dispatch.invocation.event == .permission_evaluate and dispatch.result.permission == .ask) {
+            try self.hook_flow.asks.append(self.allocator, call.id);
+        }
+        if (dispatch.invocation.event == .permission_request and dispatch.result.permission == .allow) {
+            const pending = &self.conversation.messages.items[message_index].tool_calls[index];
+            if (!self.hookRequiresApproval(pending)) try self.approve(message_index, index);
+        }
+    }
+    try self.persistToolCall(message_index, index);
+    try self.autoApprove();
+    return true;
+}
+
+fn replaceHookInput(self: *Loop, call: *Conversation.ToolCall, replacement: []const u8, allow_change: bool) !bool {
+    var candidate = call.*;
+    candidate.arguments = try HookToolInput.normalize(self.allocator, call.name, call.arguments, replacement);
+    errdefer self.allocator.free(candidate.arguments);
+    _ = try self.anchorToolPaths(&candidate);
+    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, candidate.arguments, .{});
+    const definition = self.registry.get(call.name) orelse return error.UnknownTool;
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema, .{});
+    try HookSchema.validate(schema, input);
+    const original = try std.json.parseFromSliceLeaky(std.json.Value, a, call.arguments, .{});
+    if (HookSchema.jsonEqual(original, input)) {
+        self.allocator.free(candidate.arguments);
+        return false;
+    }
+    if (!allow_change) return error.ConflictingHookRewrite;
+    if (!try self.actionMatches(call)) return error.ActionChangedDuringPolicy;
+    self.allocator.free(call.arguments);
+    call.arguments = candidate.arguments;
+    return true;
+}
+
+fn startPolicyHook(self: *Loop, event: Hooks.Event, index: usize, rewrite_author: ?usize) !void {
+    const message_index = self.pendingIndex() orelse return;
+    const call = self.conversation.messages.items[message_index].tool_calls[index];
+    const effect: Hooks.Permission = if (self.needsNoDecision(&call)) .allow else .ask;
+    var runner = self.hooks.?.*;
+    runner.rewrite_author = rewrite_author;
+    try HookFlow.begin(self, runner, try self.exportHookInput(.{
+        .event = event,
+        .permission_effect = @tagName(effect),
+        .action = call.prepared_action orelse "",
+        .tool_name = call.name,
+        .tool_input = call.arguments,
+        .tool_call_id = call.id,
+    }), .{ .policy = index });
+}
+
+const acceptHookResult = HookFlow.acceptHookResult;
+
+fn startOwnerPost(self: *Loop, index: usize, call: Conversation.ToolCall) !bool {
+    return self.startHook(.{
+        .event = .post_tool_use,
+        .tool_name = call.name,
+        .tool_call_id = call.id,
+        .tool_input = call.arguments,
+        .tool_response = call.result.?,
+    }, .{ .owner_post = index });
+}
+
+fn pollOwnerHooks(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool {
+    const message_index = self.pendingIndex() orelse return false;
+    try self.acceptHookResult(&dispatch.result);
+    if (dispatch.result.blocked orelse dispatch.result.feedback) |feedback| {
+        try self.applyPostFeedback(message_index, index, feedback);
+    }
+    if (dispatch.failed) |err| self.say(HooksCopy.named_failure, .{ Hooks.Event.post_tool_use.name(), @errorName(err) });
     self.state = .idle;
-    try self.finishSubmit(pending.prompt, pending.asExtras());
+    try self.runApproved();
     return true;
 }
 
 pub fn takeHookNotice(self: *Loop) ?[]u8 {
-    const notice = self.hook_notice;
-    self.hook_notice = null;
+    const notice = self.hook_flow.notice;
+    self.hook_flow.notice = null;
     return notice;
 }
 
@@ -1004,24 +1533,43 @@ pub fn loadToolResult(self: *Loop, msg: *Conversation.Message, call_index: usize
 }
 
 fn ask(self: *Loop) !void {
+    try self.pollHookFiles(true);
+    if (try self.startConfigChange(.ask_model)) return;
+    if (self.steering.items.len > 0 and try self.startHook(.{ .event = .user_prompt_submit, .prompt = self.steering.items[0].prompt }, .steering)) return;
     try self.applySteering();
+    if (self.hooks) |runner| {
+        if (runner.runtime) |runtime| {
+            var background = try runtime.drainFor(self.allocator, &self.hook_flow.identity);
+            defer background.deinit(self.allocator);
+            try self.acceptHookResult(&background);
+        }
+    }
+    if (self.hook_flow.context) |context| {
+        defer self.allocator.free(context);
+        self.hook_flow.context = null;
+        _ = try self.conversation.append(.{ .role = .user, .origin = .hook, .text = context });
+        try self.persistMessage(self.conversation.messages.items.len - 1);
+    }
     if (self.overBudget()) |reason| return self.stop(reason);
     const may_recover = self.auto_compact_at > 0 and !self.compacted_since_reply;
-    if (may_recover and self.shouldCompact()) return self.startCompaction(true);
+    if (may_recover and self.shouldCompact()) return self.startCompaction(.during_turn);
     if (!try self.contextFits(self.turn(""))) {
         if (!may_recover) return self.stop(context_full_notice);
-        return self.startCompaction(true);
+        return self.startCompaction(.during_turn);
     }
     self.steps += 1;
     if (self.steps > self.agent.steps and !self.isRunningWithoutLimit()) {
         return self.stop("Stopped: too many tool calls in one turn.");
     }
+    try self.trackModel(.initial);
+    var request_turn = self.turn("");
+    request_turn.hook_input = try self.exportHookInput(.{ .event = .pre_model_request });
     self.request = try Request.start(
         self.allocator,
         self.io,
         self.provider,
         self.conversation,
-        self.turn(""),
+        request_turn,
     );
     self.requests_started += 1;
     self.state = .thinking;
@@ -1037,7 +1585,7 @@ fn applySteering(self: *Loop) !void {
     while (self.steering.items.len > 0) {
         var pending = self.steering.orderedRemove(0);
         defer pending.deinit(self.allocator);
-        try self.recordUserPrompt(pending.prompt, pending.asExtras());
+        try self.recordUserPrompt(pending.prompt, pending.extras);
     }
 }
 
@@ -1052,6 +1600,17 @@ pub fn steer(self: *Loop, text: []const u8, extras: Extras) !bool {
     errdefer pending.deinit(self.allocator);
     try self.steering.append(self.allocator, pending);
     return true;
+}
+
+fn pendingSteeringEvidence(self: *const Loop, arena: std.mem.Allocator) ![]Conversation.Message {
+    if (self.hooks) |runner| {
+        for (runner.set.user_prompt_submit) |hook| if (hook.enabled) return &.{};
+    }
+    const messages = try arena.alloc(Conversation.Message, self.steering.items.len);
+    for (self.steering.items, messages) |pending, *message| {
+        message.* = .{ .seq = self.conversation.next_seq, .role = .user, .origin = .human, .text = pending.prompt };
+    }
+    return messages;
 }
 
 /// What has been typed mid-turn and not yet handed over, for the UI to show as
@@ -1119,6 +1678,7 @@ pub fn cancel(self: *Loop) !void {
     if (self.state == .cancelling) return;
 
     // `Io.Future.cancel` waits on the calling thread, so `canceller` takes it.
+    self.interrupted = true;
     self.requestStop();
     self.startReaping();
 
@@ -1145,7 +1705,22 @@ fn reap(self: *Loop) void {
     if (self.request) |request| request.cancel();
     if (self.judging) |judging| judging.request.cancel();
     if (self.tools) |tools| tools.cancel();
-    if (self.hook_dispatch) |dispatch| dispatch.cancel();
+    if (self.hook_flow.dispatch) |dispatch| dispatch.cancel();
+    if (self.interrupted and self.parent == null) {
+        self.interrupted = false;
+        if (self.hooks) |configured| {
+            var runner = configured.*;
+            runner.stop = null;
+            runner.deadline_ms = std.Io.Clock.now(.awake, self.io).toMilliseconds() + Hooks.cleanup_timeout_ms;
+            var result = runner.evaluate(self.allocator, self.hookInput(.{ .event = .interrupt })) catch null;
+            if (result) |*value| {
+                defer value.deinit(self.allocator);
+                if (value.message) |message| if (runner.runtime) |runtime| {
+                    runtime.notice(message) catch {};
+                };
+            }
+        }
+    }
     self.reaped.store(true, .release);
 }
 
@@ -1165,10 +1740,11 @@ fn pollCancelled(self: *Loop) !bool {
         return false;
     }
 
-    if (self.hook_dispatch) |dispatch| {
+    if (self.hook_flow.dispatch) |dispatch| {
         dispatch.join();
+        if (dispatch.invocation.event == .session_start) self.hook_flow.session_started = false;
         dispatch.destroy();
-        self.hook_dispatch = null;
+        self.hook_flow.dispatch = null;
     }
 
     if (self.request) |request| {
@@ -1194,8 +1770,7 @@ fn pollCancelled(self: *Loop) !bool {
     self.clearNotes();
 
     try self.abandonPending("cancelled");
-    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
-    self.pending_submit = null;
+    self.discardHookSubmission();
 
     if (self.timed_out) {
         self.last_error = error.Timeout;
@@ -1223,20 +1798,40 @@ fn abandonPending(self: *Loop, reason: []const u8) !void {
         }
         try self.persistToolCall(index, i);
     }
-    try self.appendToolResults();
+    try self.appendToolResults(null);
 }
 
 /// Advance the loop. Called from the UI's tick; returns true if anything
 /// changed and the screen needs redrawing.
 pub fn poll(self: *Loop) !bool {
-    return switch (self.state) {
+    try self.pollHookFiles(false);
+    if (self.state == .idle and try self.startConfigChange(.config_idle)) return true;
+    if (self.state == .idle and !self.hook_flow.idle_notified) {
+        if (self.hook_flow.idle_since) |since| {
+            if (tool.monotonicMilliseconds(self.io) - since >= idle_notification_delay_ms) {
+                self.hook_flow.idle_notified = true;
+                self.notifyHook(.idle_prompt, "The agent is waiting for input");
+            }
+        }
+    }
+    var background_changed = false;
+    if (self.hooks) |runner| {
+        if (runner.runtime) |runtime| {
+            var background = try runtime.drainFor(self.allocator, &self.hook_flow.identity);
+            defer background.deinit(self.allocator);
+            background_changed = background.message != null or background.context != null;
+            try self.acceptHookResult(&background);
+        }
+    }
+    const changed = try switch (self.state) {
         .idle, .awaiting_approval, .awaiting_answer => false,
-        .running_hooks => self.pollPromptHooks(),
+        .running_hooks => self.pollHooks(),
         .thinking, .compacting => self.pollRequest(),
         .running_tools => self.pollTools(),
         .classifying => self.pollJudging(),
         .cancelling => self.pollCancelled(),
     };
+    return changed or background_changed;
 }
 
 fn pollRequest(self: *Loop) !bool {
@@ -1246,6 +1841,16 @@ fn pollRequest(self: *Loop) !bool {
     request.join();
     self.request = null;
     defer request.destroy();
+    if (!self.compacting and request.reply != null) {
+        const current = request.provider.current();
+        const model = try self.allocator.dupe(u8, current.model);
+        errdefer self.allocator.free(model);
+        const provider = try self.allocator.dupe(u8, if (current.name.len > 0) current.name else request.provider.name);
+        if (self.effective_model) |old| self.allocator.free(old);
+        if (self.effective_provider) |old| self.allocator.free(old);
+        self.effective_model = model;
+        self.effective_provider = provider;
+    }
 
     self.syncProvider();
 
@@ -1262,11 +1867,11 @@ fn pollRequest(self: *Loop) !bool {
         const server_refused_the_size = err == error.ContextTooLarge and !self.compacting;
         const may_recover = self.auto_compact_at > 0 and !self.compacted_since_reply;
         if (server_refused_the_size and may_recover) {
-            try self.startCompaction(true);
+            try self.startCompaction(.during_turn);
             return true;
         }
 
-        const detail = self.provider.explain(err, self.allocator) catch
+        const detail = request.provider.explain(err, self.allocator) catch
             try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
         defer self.allocator.free(detail);
 
@@ -1274,6 +1879,20 @@ fn pollRequest(self: *Loop) !bool {
         defer self.allocator.free(text);
         _ = try self.conversation.addAssistant(text, thinking, thinking_ms);
         try self.persistMessage(self.conversation.messages.items.len - 1);
+        if (self.hooks) |runner| {
+            if (runner.set.stop_failure.len > 0) {
+                var input = try self.exportHookInput(.{ .event = .stop_failure, .error_type = Provider.errorType(err, detail), .error_message = detail, .last_assistant_message = text });
+                const failed = request.turn.hook_input;
+                input.request_id = failed.request_id;
+                input.request_purpose = failed.request_purpose;
+                input.route = failed.route;
+                input.model = failed.model;
+                input.provider = failed.provider;
+                input.attempt = request.attempt_number.load(.acquire);
+                try HookFlow.begin(self, runner.*, input, .{ .lifecycle = .failed_turn });
+                return true;
+            }
+        }
         self.finish(.failed);
         return true;
     }
@@ -1304,9 +1923,12 @@ fn pollRequest(self: *Loop) !bool {
     else
         reply.text;
 
+    const display_text = if (request.displaysHooks()) try request.content.snapshot(self.allocator) else null;
+    defer if (display_text) |shown| self.allocator.free(shown);
     _ = try self.conversation.append(.{
         .role = .assistant,
         .text = text,
+        .display_text = display_text,
         .thinking = thinking,
         .thinking_ms = thinking_ms,
         .tool_calls = reply.tool_calls,
@@ -1316,11 +1938,14 @@ fn pollRequest(self: *Loop) !bool {
     self.compacted_since_reply = false;
 
     if (reply.tool_calls.len == 0) {
+        if (try self.lifecycle(if (self.parent == null) .stop else .subagent_stop, .finish_turn)) return true;
         self.finish(.done);
         return true;
     }
 
     self.pending_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
+    self.hook_flow.policy = .{};
+    self.hook_flow.asks.clearRetainingCapacity();
     self.pending_index = 0;
     if (try self.repeating(reply.tool_calls)) {
         try self.stop("Stopped: the same tool call came back three times running.");
@@ -1343,11 +1968,15 @@ pub fn lastTurn(self: *Loop, allocator: std.mem.Allocator) !recap.Recap {
 fn finish(self: *Loop, outcome: Outcome) void {
     self.state = .idle;
     self.finished += 1;
+    self.hook_flow.asks.clearRetainingCapacity();
     self.pending_seq = null;
     self.pending_index = 0;
     self.repeats = 0;
     self.compacting = false;
     self.outcome = outcome;
+    self.notifyHook(.agent_completed, @tagName(outcome));
+    self.hook_flow.idle_since = tool.monotonicMilliseconds(self.io);
+    self.hook_flow.idle_notified = false;
     self.resume_after_compaction = false;
 
     self.timed_out = false;
@@ -1409,8 +2038,66 @@ fn repeating(self: *Loop, calls: []const Conversation.ToolCall) !bool {
     return false;
 }
 
-/// Settle every call that needs no decision, then either run what is approved
-/// or stop for the user.
+fn action(self: *Loop, call: *const Conversation.ToolCall) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, a, call.arguments, .{});
+    if (input != .object) return error.InvalidToolInput;
+    var roots: std.ArrayList([]const u8) = .empty;
+    try roots.append(a, self.resolveAgainstProject(a, self.project_root) orelse return error.UnresolvedActionTarget);
+    for (self.additional_roots.items) |root| try roots.append(a, self.resolveAgainstProject(a, root) orelse return error.UnresolvedActionTarget);
+    return std.json.Stringify.valueAlloc(self.allocator, action_paths.Snapshot{
+        .call_id = call.id,
+        .tool = call.name,
+        .arguments = input,
+        .cwd = try paths.resolve(self.io, a, self.workingDirectory(), "."),
+        .allowed_roots = roots.items,
+        .resolved_targets = try action_paths.resolvedTargets(self.io, a, self.workingDirectory(), input.object),
+        .agent_id = &self.hook_flow.identity,
+        .parent_agent_id = if (self.parent) |parent| &parent.hook_flow.identity else "",
+        .parent_tool_call_id = self.hook_flow.parent_call_id,
+    }, .{});
+}
+
+fn prepareAction(self: *Loop, call: *Conversation.ToolCall) !void {
+    const prepared = self.action(call) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        call.status = .rejected;
+        call.result = try self.allocator.dupe(u8, "could not resolve the action's execution context");
+        call.result_bytes = call.result.?.len;
+        return;
+    };
+    if (call.prepared_action) |old| self.allocator.free(old);
+    call.prepared_action = prepared;
+}
+
+fn actionMatches(self: *Loop, call: *const Conversation.ToolCall) !bool {
+    const prepared = call.prepared_action orelse return false;
+    const current = self.action(call) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    };
+    defer self.allocator.free(current);
+    return std.mem.eql(u8, current, prepared);
+}
+
+fn approve(self: *Loop, message_index: usize, call_index: usize) !void {
+    const call = &self.conversation.messages.items[message_index].tool_calls[call_index];
+    if (call.status != .pending) return;
+    if (!try self.actionMatches(call)) {
+        call.status = .rejected;
+        call.result = try self.allocator.dupe(u8, "action changed while awaiting approval; propose it again");
+        call.result_bytes = call.result.?.len;
+        try self.persistToolCall(message_index, call_index);
+        return;
+    }
+    const approved = try self.allocator.dupe(u8, call.prepared_action.?);
+    if (call.approved_action) |old| self.allocator.free(old);
+    call.approved_action = approved;
+    call.begin(tool.monotonicMilliseconds(self.io));
+}
+
 fn autoApprove(self: *Loop) !void {
     // Each session is its own process, so another may have changed them.
     self.reloadAllowances() catch {};
@@ -1419,16 +2106,34 @@ fn autoApprove(self: *Loop) !void {
 
     for (calls, 0..) |*call, i| {
         if (call.status != .pending) continue;
-        if (!self.agent.allows(call.name)) {
+        if (!self.agent.allows(call.name) or self.registry.get(call.name) == null) {
             try self.refuse(message_index, i);
             continue;
         }
-        if (self.needsNoDecision(call)) call.begin(tool.monotonicMilliseconds(self.io));
+        if (call.prepared_action == null) {
+            if (try self.anchorToolPaths(call)) try self.persistToolCall(message_index, i);
+            try self.prepareAction(call);
+        }
+        if (call.status != .pending) {
+            try self.persistToolCall(message_index, i);
+            continue;
+        }
+        if (self.hooks) |runner| {
+            inline for (.{ Hooks.Event.pre_tool_use, .permission_evaluate, .permission_request }) |event| {
+                const cursor = &@field(self.hook_flow.policy, @tagName(event));
+                if (i >= cursor.* and runner.set.forEvent(event).len > 0 and (event != .permission_request or !self.needsNoDecision(call))) {
+                    cursor.* = i + 1;
+                    try self.startPolicyHook(event, i, null);
+                    return;
+                }
+            }
+        }
+        if (self.needsNoDecision(call)) try self.approve(message_index, i);
     }
 
     if (self.firstPending() != null) {
         if (self.approvals == .auto) return self.judgeNext();
-        self.state = .awaiting_approval;
+        self.awaitApproval();
         return;
     }
     try self.runApproved();
@@ -1468,8 +2173,12 @@ fn judgeNext(self: *Loop) !void {
     const calls = self.conversation.messages.items[message_index].tool_calls;
     for (calls, 0..) |*call, index| {
         if (call.status != .pending) continue;
+        if (self.hookRequiresApproval(call)) {
+            self.awaitApproval();
+            return;
+        }
         if (self.editsInside(call)) {
-            call.begin(tool.monotonicMilliseconds(self.io));
+            try self.approve(message_index, index);
             continue;
         }
         return self.startJudging(index, .quick);
@@ -1483,16 +2192,38 @@ fn editsInside(self: *const Loop, call: *const Conversation.ToolCall) bool {
 }
 
 fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
+    const now = tool.monotonicMilliseconds(self.io);
+    if (stage == .quick) self.review_started_ms = now;
+    if (now - self.review_started_ms >= self.model_policy.reviewer_timeout_ms) {
+        _ = try self.judgeUnavailable(call_index, reviewer_timeout_reason);
+        return;
+    }
     const message_index = self.pendingIndex() orelse return;
     const call = self.conversation.messages.items[message_index].tool_calls[call_index];
     const asker = self.parent orelse self;
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
+    const stored_intent = if (asker.db) |db| if (asker.session_id) |id| db.humanIntent(self.allocator, id) catch |err| {
+        _ = try self.judgeUnavailable(call_index, @errorName(err));
+        return;
+    } else null else null;
+    defer if (stored_intent) |snapshot| snapshot.deinit(self.allocator);
+    const remembered = if (stored_intent == null) try asker.human_intent.view(arena_state.allocator()) else &.{};
+    const recorded_intent = if (stored_intent) |snapshot| snapshot.messages else if (remembered.len > 0) remembered else asker.conversation.messages.items;
+    const steering = try asker.pendingSteeringEvidence(arena_state.allocator());
+    const intent = try std.mem.concat(arena_state.allocator(), Conversation.Message, &.{ recorded_intent, steering });
+    const has_human = steering.len > 0 or if (stored_intent) |snapshot| snapshot.has_human else asker.human_intent.has_human or for (intent) |message| {
+        if (message.role == .user and message.origin == .human and std.mem.trim(u8, message.text, " \t\r\n").len > 0) break true;
+    } else false;
+    if (!has_human) {
+        _ = try self.judgeUnavailable(call_index, "no verified human request is available");
+        return;
+    }
     const material = try classifier.material(
         arena_state.allocator(),
-        self.project_root,
-        asker.conversation.messages.items,
+        call.prepared_action orelse return error.UnpreparedAction,
+        intent,
         self.conversation.messages.items,
         call,
     );
@@ -1501,28 +2232,37 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
     errdefer self.allocator.destroy(convo);
     convo.* = .init(self.allocator);
     errdefer convo.deinit();
-    _ = try convo.addUser(material, &.{}, &.{});
+    _ = try convo.append(.{ .role = .user, .origin = .harness, .text = material });
 
     const request = try Request.start(self.allocator, self.io, self.provider, convo, .{
+        .backend = self.backend,
+        .model_policy = self.model_policy,
         .system = classifier.system_prompt,
+        .hooks = self.hooks,
+        .hook_input = try self.exportHookInput(.{ .event = .pre_model_request, .request_purpose = .approval_judge }),
         .instruction = classifier.instruction(stage),
     });
+    self.requests_started += 1;
     self.judging = .{ .request = request, .convo = convo, .call = call_index, .stage = stage };
     self.state = .classifying;
 }
 
 fn pollJudging(self: *Loop) !bool {
     const judging = self.judging orelse return false;
-    if (!judging.request.isFinished()) return false;
-    judging.request.join();
+    const now = tool.monotonicMilliseconds(self.io);
+    const finished = judging.request.isFinished();
+    const end = if (finished) judging.request.completed_ms else now;
+    const timed_out = end - self.review_started_ms >= self.model_policy.reviewer_timeout_ms;
+    if (!finished and !timed_out) return false;
+    if (finished) judging.request.join() else judging.request.cancel();
     self.judging = null;
     defer judging.destroy(self.allocator);
+    if (timed_out) return self.judgeUnavailable(judging.call, reviewer_timeout_reason);
 
     const message_index = self.pendingIndex() orelse return true;
-    const call = &self.conversation.messages.items[message_index].tool_calls[judging.call];
     const reply = judging.request.reply orelse {
         const why = if (judging.request.failed) |err| @errorName(err) else "no answer";
-        return self.askInstead(call, why);
+        return self.judgeUnavailable(judging.call, why);
     };
     self.usage.calls += 1;
     self.usage.input_tokens += reply.usage.prompt_tokens;
@@ -1532,7 +2272,7 @@ fn pollJudging(self: *Loop) !bool {
     switch (classifier.verdict(judging.stage, reply.text)) {
         .allow => {
             self.blocks_in_row = 0;
-            call.begin(tool.monotonicMilliseconds(self.io));
+            try self.approve(message_index, judging.call);
             try self.judgeNext();
         },
         .block => |reason| switch (judging.stage) {
@@ -1541,16 +2281,24 @@ fn pollJudging(self: *Loop) !bool {
         },
         .unclear => switch (judging.stage) {
             .quick => try self.startJudging(judging.call, .careful),
-            .careful => return self.askInstead(call, "its answer could not be read"),
+            .careful => return self.judgeUnavailable(judging.call, "its answer could not be read"),
         },
     }
     return true;
 }
 
-/// Put a call auto mode could not judge to the person.
+fn judgeUnavailable(self: *Loop, index: usize, why: []const u8) anyerror!bool {
+    const message_index = self.pendingIndex() orelse return true;
+    if (self.model_policy.reviewer_fallback == .deny) {
+        try self.block(message_index, index, why);
+        return true;
+    }
+    return self.askInstead(&self.conversation.messages.items[message_index].tool_calls[index], why);
+}
+
 fn askInstead(self: *Loop, call: *const Conversation.ToolCall, why: []const u8) bool {
     self.say("Auto mode could not judge the {s} call ({s}), so it is asking you", .{ call.name, why });
-    self.state = .awaiting_approval;
+    self.awaitApproval();
     return true;
 }
 
@@ -1568,15 +2316,21 @@ fn block(self: *Loop, message_index: usize, call_index: usize, reason: []const u
     call.result_bytes = text.len;
     try self.persistToolCall(message_index, call_index);
 
+    if (try self.startHook(.{ .event = .permission_denied, .request_purpose = .approval_judge, .tool_name = call.name, .tool_input = call.arguments, .tool_call_id = call.id, .error_message = reason }, .{ .auto_denied = call_index })) return;
+    try self.afterAutoBlock();
+}
+
+fn afterAutoBlock(self: *Loop) !void {
     self.blocks_in_row += 1;
     self.blocks_total += 1;
     if (self.blocks_in_row >= max_blocks_in_row or self.blocks_total >= max_blocks_total) {
+        if (self.model_policy.reviewer_fallback == .deny) return self.stop("Stopped: repeated automatic approval denials; no actions were authorized by fallback.");
         self.approvals = .ask;
         self.blocks_in_row = 0;
         self.blocks_total = 0;
         self.say("Auto mode blocked too many calls, so decisions are back with you", .{});
         if (self.firstPending() != null) {
-            self.state = .awaiting_approval;
+            self.awaitApproval();
             return;
         }
         return self.runApproved();
@@ -1601,11 +2355,21 @@ fn firstAsk(self: *Loop) ?*Conversation.ToolCall {
     return null;
 }
 
+pub const Answer = struct {
+    text: []const u8,
+    typed: ?[]const u8 = null,
+};
+
+pub fn answer(self: *Loop, text: []const u8) !void {
+    return self.answerWithSource(.{ .text = text, .typed = text });
+}
+
 /// Write the user's answer in as the result of the question, then carry on.
 ///
 /// The answer settles one call. Anything else the model asked for in the same
 /// batch runs afterwards, and a second question stops the turn again.
-pub fn answer(self: *Loop, text: []const u8) !void {
+pub fn answerWithSource(self: *Loop, response: Answer) !void {
+    const text = response.text;
     if (self.state != .awaiting_answer) return;
 
     const message_index = self.pendingIndex() orelse return;
@@ -1615,14 +2379,19 @@ pub fn answer(self: *Loop, text: []const u8) !void {
         if (call.status != .running) continue;
         if (!std.mem.eql(u8, call.name, ask_user.name)) continue;
 
+        if (response.typed) |typed| {
+            const receipt = try HumanIntent.answerReceipt(self.allocator, call.arguments, typed);
+            defer self.allocator.free(receipt);
+            try self.recordHuman(receipt, true);
+        }
         call.settle(.ok, tool.monotonicMilliseconds(self.io));
         call.result = try self.allocator.dupe(u8, text);
         call.result_bytes = text.len;
         try self.persistToolCall(message_index, i);
+        if (try self.startOwnerPost(i, call.*)) return;
         break;
     }
 
-    if (self.firstAsk() != null) return;
     try self.runApproved();
 }
 
@@ -1635,31 +2404,74 @@ fn persistTodos(self: *Loop) !void {
     try db.setTodos(session_id, self.todos.items.items);
 }
 
+fn checkTodoTasks(self: *Loop, message_index: usize, call_index: usize) !bool {
+    const runner = self.hooks orelse return false;
+    if (runner.set.task_created.len == 0 and runner.set.task_completed.len == 0) return false;
+    const call = self.conversation.messages.items[message_index].tool_calls[call_index];
+    if (self.hook_flow.task_seq != self.pending_seq or self.hook_flow.task_call != call_index) {
+        self.hook_flow.task_seq = self.pending_seq;
+        self.hook_flow.task_call = call_index;
+        self.hook_flow.task_cursor = 0;
+    }
+    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena.deinit();
+    var next = todo.List.init(arena.allocator());
+    try next.replace(todo_tool.parse(arena.allocator(), call.arguments));
+    const task_events = [_]Hooks.Event{ .task_created, .task_completed };
+    while (self.hook_flow.task_cursor < next.items.items.len * task_events.len) {
+        const cursor = self.hook_flow.task_cursor;
+        self.hook_flow.task_cursor += 1;
+        const item = next.items.items[cursor / task_events.len];
+        const previous: ?todo.Status = for (self.todos.items.items) |old| {
+            if (std.mem.eql(u8, old.text, item.text)) break old.status;
+        } else null;
+        const event = task_events[cursor % task_events.len];
+        if (event == .task_created and previous != null) continue;
+        if (event == .task_completed and (item.status != .done or previous == .done)) continue;
+        if (runner.set.forEvent(event).len == 0) continue;
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(item.text, &digest, .{});
+        const task_id = std.fmt.bytesToHex(digest, .lower);
+        return self.startHook(.{ .event = event, .task_id = &task_id, .task_subject = item.text, .task_description = item.text, .tool_call_id = call.id }, .{ .task_policy = call_index });
+    }
+    return false;
+}
+
+fn anchorToolPaths(self: *Loop, call: *Conversation.ToolCall) !bool {
+    if (self.working_directory == null) return false;
+    if (std.meta.stringToEnum(Filesystem.Name, call.name) == null) return false;
+    var arena: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena.deinit();
+    var parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), call.arguments, .{}) catch return false;
+    if (parsed != .object) return false;
+    const field = parsed.object.get(Filesystem.path_field) orelse return false;
+    if (field != .string or std.fs.path.isAbsolute(field.string)) return false;
+    try parsed.object.put(arena.allocator(), Filesystem.path_field, .{ .string = try std.fs.path.resolve(arena.allocator(), &.{ self.workingDirectory(), field.string }) });
+    const arguments = try std.json.Stringify.valueAlloc(self.allocator, parsed, .{});
+    self.allocator.free(call.arguments);
+    call.arguments = arguments;
+    return true;
+}
+
 /// Settle every `todo` call in the batch, here on the thread that draws.
 ///
 /// The list is what the sidebar reads every frame, so a tool worker writing it
 /// would be a race - and there is nothing in it worth a worker: no file is
 /// touched and no process runs.
-fn applyTodos(self: *Loop, message_index: usize) !void {
-    const calls = self.conversation.messages.items[message_index].tool_calls;
+fn applyTodo(self: *Loop, message_index: usize, i: usize) !void {
+    const call = &self.conversation.messages.items[message_index].tool_calls[i];
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
 
-    for (calls, 0..) |*call, i| {
-        if (call.status != .running) continue;
-        if (!std.mem.eql(u8, call.name, todo_tool.name)) continue;
+    try self.todos.replace(todo_tool.parse(arena_state.allocator(), call.arguments));
+    try self.persistTodos();
 
-        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
-        defer arena_state.deinit();
-
-        try self.todos.replace(todo_tool.parse(arena_state.allocator(), call.arguments));
-        try self.persistTodos();
-
-        const text = try todo_tool.summary(self.allocator, &self.todos);
-        call.settle(.ok, tool.monotonicMilliseconds(self.io));
-        if (call.result) |old| self.allocator.free(old);
-        call.result = text;
-        call.result_bytes = text.len;
-        try self.persistToolCall(message_index, i);
-    }
+    const text = try todo_tool.summary(self.allocator, &self.todos);
+    call.settle(.ok, tool.monotonicMilliseconds(self.io));
+    if (call.result) |old| self.allocator.free(old);
+    call.result = text;
+    call.result_bytes = text.len;
+    try self.persistToolCall(message_index, i);
 }
 
 /// Where the message being decided currently sits, or null when there is no
@@ -1702,25 +2514,49 @@ pub const Proposal = struct {
 
 /// Record the user's answer for the call currently being asked about.
 pub fn decide(self: *Loop, decision: Decision) !void {
+    return self.applyDecision(decision, .human);
+}
+
+pub fn decideHeadless(self: *Loop, allow_mutating: bool) !void {
     const call = self.pendingCall() orelse return;
+    const allow_call = allow_mutating and !self.hookRequiresApproval(call);
+    return self.applyDecision(if (allow_call) .once else .deny, .headless);
+}
+
+fn applyDecision(self: *Loop, decision: Decision, source: enum { human, headless }) !void {
     const message_index = self.pendingIndex() orelse return;
     const call_index = self.firstPending() orelse return;
+    const message = self.conversation.messages.items[message_index];
+    const call = &message.tool_calls[call_index];
 
     switch (decision) {
-        .once => call.begin(tool.monotonicMilliseconds(self.io)),
+        .once => try self.approve(message_index, call_index),
         .always => |breadth| {
-            call.begin(tool.monotonicMilliseconds(self.io));
-            try self.allow(call, breadth);
+            try self.approve(message_index, call_index);
+            if (call.status == .running) try self.allow(call, breadth);
         },
         .deny => {
             call.status = .rejected;
-            call.result = try self.allocator.dupe(u8, "denied by the user");
-            call.result_bytes = "denied by the user".len;
-            try self.persistToolCall(message_index, call_index);
+            call.result = try self.allocator.dupe(u8, if (source == .human) "denied by the user" else "denied by headless policy");
+            call.result_bytes = call.result.?.len;
         },
     }
 
-    if (decision == .always) try self.autoApproveRemaining(message_index);
+    if (decision == .deny or call.status == .running) {
+        const verdict: HumanIntent.Decision = if (decision == .deny) .deny else .approve;
+        switch (source) {
+            .human => {
+                const receipt = try HumanIntent.decisionReceipt(self.allocator, verdict, call.name, call.prepared_action orelse call.arguments);
+                defer self.allocator.free(receipt);
+                try self.recordHuman(receipt, true);
+            },
+            .headless => if (self.db) |db| {
+                if (self.message_ids.get(message.seq)) |id| try db.appendBlob(id, @intCast(call_index), "headless_tool_decision", @tagName(verdict));
+            },
+        }
+    }
+    if (decision == .deny) try self.persistToolCall(message_index, call_index);
+    if (decision == .always and call.status == .running) try self.autoApproveRemaining(message_index);
 
     if (self.firstPending() != null) return;
     try self.runApproved();
@@ -1731,9 +2567,9 @@ pub fn decide(self: *Loop, decision: Decision) !void {
 /// decision that may have changed the answer for calls beyond the first.
 fn autoApproveRemaining(self: *Loop, message_index: usize) !void {
     const calls = self.conversation.messages.items[message_index].tool_calls;
-    for (calls) |*call| {
+    for (calls, 0..) |*call, i| {
         if (call.status != .pending) continue;
-        if (self.needsNoDecision(call)) call.begin(tool.monotonicMilliseconds(self.io));
+        if (self.needsNoDecision(call)) try self.approve(message_index, i);
     }
 }
 
@@ -1759,6 +2595,7 @@ fn refuse(self: *Loop, message_index: usize, call_index: usize) !void {
 /// has already said always to allow.
 fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (!self.agent.allows(call.name)) return false;
+    if (self.hookRequiresApproval(call)) return false;
     if (self.approvals == .all) return true;
 
     if (self.outsidePath(self.allocator, call) catch null) |path| {
@@ -1770,6 +2607,25 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (definition.read_only) return true;
     if (self.isSafe(call)) return true;
     return self.isAllowed(call);
+}
+
+fn hookRequiresApproval(self: *const Loop, call: *const Conversation.ToolCall) bool {
+    if (self.registry.get(call.name)) |definition| if (!definition.read_only) {
+        var scratch: std.heap.ArenaAllocator = .init(self.allocator);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        const input = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{}) catch return true;
+        if (input == .object) {
+            for (action_paths.path_fields) |field| {
+                const target = input.object.get(field) orelse continue;
+                if (target != .string) continue;
+                const path = std.fs.path.resolve(arena, &.{ self.workingDirectory(), target.string }) catch return true;
+                if (permission.protectedPath(arena, self.io, self.project_root, path, self.control_files, if (self.hooks) |runner| runner.set else .{}) catch true) return true;
+            }
+        }
+    };
+    for (self.hook_flow.asks.items) |id| if (std.mem.eql(u8, call.id, id)) return true;
+    return false;
 }
 
 /// Whether a call cleared to run may resolve paths outside the project: one
@@ -1822,7 +2678,7 @@ fn outsidePath(
         else => return null,
     };
 
-    for ([_][]const u8{ "path", "file" }) |name| {
+    for (action_paths.path_fields) |name| {
         const value = fields.get(name) orelse continue;
         if (value != .string) continue;
         if (value.string.len == 0) continue;
@@ -1835,45 +2691,14 @@ fn outsidePath(
 }
 
 fn resolveAgainstProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    const joined = if (std.fs.path.isAbsolute(path))
-        arena.dupe(u8, path) catch return null
-    else
-        std.fs.path.join(arena, &.{ self.project_root, path }) catch return null;
-
-    const lexical = std.fs.path.resolve(arena, &.{joined}) catch return null;
-    return self.followLinks(arena, lexical);
-}
-
-/// `lexical` with the links in the part of it that exists followed, since the
-/// OS follows them when the call runs: `link/x` under a project is outside it
-/// when `link` points out. Null when that cannot be told, a dangling link
-/// included.
-fn followLinks(self: *const Loop, arena: std.mem.Allocator, lexical: []const u8) ?[]const u8 {
-    var existing = lexical;
-    while (true) {
-        if (std.Io.Dir.cwd().realPathFileAlloc(self.io, existing, arena)) |real| {
-            return std.fs.path.join(arena, &.{ real, lexical[existing.len..] }) catch null;
-        } else |err| switch (err) {
-            error.FileNotFound => {
-                var buffer: [std.fs.max_path_bytes]u8 = undefined;
-                if (std.Io.Dir.cwd().readLink(self.io, existing, &buffer)) |_| return null else |_| {}
-            },
-            else => return null,
-        }
-        existing = std.fs.path.dirname(existing) orelse return lexical;
-    }
+    return paths.resolve(self.io, arena, self.workingDirectory(), path) catch null;
 }
 
 fn inside(self: *const Loop, arena: std.mem.Allocator, resolved: []const u8) bool {
-    const root = self.followLinks(arena, self.project_root) orelse self.project_root;
-    if (!std.mem.startsWith(u8, resolved, root)) return false;
-    if (resolved.len == root.len) return true;
-    return resolved[root.len] == std.fs.path.sep;
-}
-
-fn withinProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) bool {
-    const resolved = self.resolveAgainstProject(arena, path) orelse return false;
-    return self.inside(arena, resolved);
+    const primary = self.resolveAgainstProject(arena, self.project_root) orelse return false;
+    if (paths.inside(primary, resolved)) return true;
+    for (self.additional_roots.items) |root| if (paths.inside(root, resolved)) return true;
+    return false;
 }
 
 /// Whether the preset list of read-only commands covers this call. Only `bash`
@@ -2073,6 +2898,7 @@ fn persistMessage(self: *Loop, index: usize) !void {
         thinking_bytes,
         .of(msg.*),
     );
+    try db.setMessageOrigin(message_id, msg.origin);
     try self.message_ids.put(self.allocator, msg.seq, message_id);
 
     if (msg.thinking) |thinking| {
@@ -2114,8 +2940,9 @@ fn persistMessage(self: *Loop, index: usize) !void {
 /// Say something the UI will surface once. Replaces whatever was pending.
 pub fn say(self: *Loop, comptime fmt: []const u8, args: anytype) void {
     const said = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
-    if (self.hook_notice) |old| self.allocator.free(old);
-    self.hook_notice = said;
+    if (self.hook_flow.notice) |old| self.allocator.free(old);
+    self.hook_flow.notice = said;
+    self.notifyHook(.notice, said);
 }
 
 /// Write a subagent's messages into a session of its own, hung off the call
@@ -2159,6 +2986,7 @@ fn persistSubagent(
             thinking_bytes,
             .of(child),
         );
+        try db.setMessageOrigin(message_id, child.origin);
         if (child.thinking) |thinking| {
             try db.appendBlob(message_id, 0, "reasoning", thinking);
         }
@@ -2196,10 +3024,12 @@ fn persistToolCall(self: *Loop, message_index: usize, call_index: usize) !void {
         message_id,
         @intCast(call_index),
         @tagName(call.status),
+        call.arguments,
         call.result,
         @intCast(call.result_bytes),
         if (call.elapsed_ms) |ms| @intCast(ms) else null,
     );
+    if (call.approved_action) |snapshot| try db.appendBlob(message_id, @intCast(call_index), "approved_action", snapshot);
     self.shrinkResult(call);
 }
 
@@ -2357,28 +3187,55 @@ pub fn rewind(self: *Loop, arena: std.mem.Allocator, seq: u64, apply: bool) ![]R
 fn runApproved(self: *Loop) !void {
     const message_index = self.pendingIndex() orelse return;
     const calls = self.conversation.messages.items[message_index].tool_calls;
+    for (calls, 0..) |*call, i| {
+        if (call.status != .running) continue;
+        const current = self.action(call) catch null;
+        defer if (current) |value| self.allocator.free(value);
+        if (current == null or call.approved_action == null or !std.mem.eql(u8, current.?, call.approved_action.?)) {
+            call.settle(.rejected, tool.monotonicMilliseconds(self.io));
+            if (call.result) |old| self.allocator.free(old);
+            call.result = try self.allocator.dupe(u8, "approved action changed before execution; propose it again");
+            call.result_bytes = call.result.?.len;
+        }
+        try self.persistToolCall(message_index, i);
+    }
 
-    try self.applyTodos(message_index);
+    for (calls, 0..) |*call, i| {
+        if (call.status != .running) continue;
+        if (self.hooks != null and std.mem.eql(u8, call.name, ask_user.name)) break;
+        if (!std.mem.eql(u8, call.name, todo_tool.name)) continue;
+        if (try self.checkTodoTasks(message_index, i)) return;
+        try self.applyTodo(message_index, i);
+        if (try self.startOwnerPost(i, call.*)) return;
+    }
+    if (self.firstAsk()) |question| {
+        self.notifyHook(.agent_needs_input, question.arguments);
+        self.state = .awaiting_answer;
+        return;
+    }
 
+    var roots: std.ArrayList([]const u8) = .empty;
+    defer roots.deinit(self.allocator);
+    try roots.append(self.allocator, self.project_root);
+    try roots.appendSlice(self.allocator, self.additional_roots.items);
+    const post_input = try self.exportHookInput(.{ .event = .post_tool_use });
     var batch: std.ArrayList(ToolRun.Call) = .empty;
     defer batch.deinit(self.allocator);
 
     for (calls, 0..) |call, i| {
         if (call.status != .running) continue;
-        if (std.mem.eql(u8, call.name, todo_tool.name)) continue;
+        var input = post_input;
+        input.tool_call_id = call.id;
         try batch.append(self.allocator, .{
+            .hook_input = input,
             .seq = self.conversation.messages.items[message_index].seq,
             .index = i,
             .name = call.name,
             .arguments = call.arguments,
+            .approved_action = call.approved_action,
             .allow_outside = self.mayReachOutside(&call),
+            .additional_roots = roots.items,
         });
-    }
-
-    // A question is answered, not run. The rest of the batch waits its turn.
-    if (self.firstAsk() != null) {
-        self.state = .awaiting_answer;
-        return;
     }
 
     if (batch.items.len == 0) {
@@ -2392,7 +3249,7 @@ fn runApproved(self: *Loop) !void {
         self.allocator,
         self.io,
         self.registry,
-        self.project_root,
+        self.workingDirectory(),
         self.reads,
         self.delegate,
         self.handoff,
@@ -2471,7 +3328,25 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
         call.result = try redact.scrub(self.allocator, result.content);
         call.result_bytes = result.content.len;
         try self.persistToolCall(message_index, result.index);
+        try self.acceptHookResult(&result.hook_result);
+        if (result.hook_error) |err| self.say(HooksCopy.named_failure, .{ Hooks.Event.post_tool_use.name(), @errorName(err) });
+        if (result.hook_result.blocked orelse result.hook_result.feedback) |feedback| try self.applyPostFeedback(message_index, result.index, feedback);
     }
+}
+
+fn applyPostFeedback(self: *Loop, message_index: usize, index: usize, feedback: []const u8) !void {
+    const msg = &self.conversation.messages.items[message_index];
+    const call = &msg.tool_calls[index];
+    if (self.db) |db| {
+        if (self.message_ids.get(msg.seq)) |message_id| {
+            if (call.result) |original| try db.appendBlob(message_id, @intCast(index), "hook_original_tool_result", original);
+        }
+    }
+    const replacement = try std.fmt.allocPrint(self.allocator, "Tool {s} executed. Hook feedback: {s}", .{ call.name, feedback });
+    if (call.result) |old| self.allocator.free(old);
+    call.result = replacement;
+    call.result_bytes = replacement.len;
+    try self.persistToolCall(message_index, index);
 }
 
 fn pollTools(self: *Loop) !bool {
@@ -2499,40 +3374,50 @@ fn pollTools(self: *Loop) !bool {
 /// Append one `.tool` message per settled call, then ask the model again with
 /// the results in hand.
 fn finishToolMessages(self: *Loop) !void {
-    try self.appendToolResults();
+    var payload: std.Io.Writer.Allocating = .init(self.allocator);
+    defer payload.deinit();
+    var json: std.json.Stringify = .{ .writer = &payload.writer };
+    if (self.hooks != null and self.hooks.?.set.post_tool_batch.len > 0) {
+        try json.beginArray();
+        try self.appendToolResults(&json);
+        try json.endArray();
+        if (try self.startHook(.{ .event = .post_tool_batch, .tool_calls = payload.written() }, .{ .lifecycle = .ask_model })) return;
+    } else try self.appendToolResults(null);
     try self.ask();
 }
 
 /// Keep the wire history complete even when a turn ends without another request.
-fn appendToolResults(self: *Loop) !void {
+fn appendToolResults(self: *Loop, batch: ?*std.json.Stringify) !void {
     const message_index = self.pendingIndex() orelse return;
-
     const calls = self.conversation.messages.items[message_index].tool_calls;
-    const settled = try self.allocator.alloc(struct {
-        name: []const u8,
-        id: []const u8,
-        result: []const u8,
-    }, calls.len);
-    defer self.allocator.free(settled);
+    const results = try self.allocator.alloc(Conversation.Message, calls.len);
+    defer self.allocator.free(results);
+    var ready: usize = 0;
+    var adopted: usize = 0;
+    defer for (results[adopted..ready]) |*message| message.deinit(self.allocator);
 
-    var count: usize = 0;
     for (calls) |call| {
+        const original = call.result orelse "";
+        const trimmed = try self.trimForModel(call.name, original);
+        defer if (trimmed.ptr != original.ptr) self.allocator.free(trimmed);
+        if (batch) |json| {
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, call.arguments, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            defer if (parsed) |value| value.deinit();
+            try json.write(.{ .tool_name = call.name, .tool_input = if (parsed) |value| value.value else std.json.Value.null, .tool_use_id = call.id, .tool_response = trimmed, .status = @tagName(call.status) });
+        }
         if (!call.status.isSettled()) continue;
-        settled[count] = .{
-            .name = call.name,
-            .id = call.id,
-            .result = call.result orelse "",
-        };
-        count += 1;
+        const result: Conversation.Message = .{ .seq = self.conversation.next_seq + ready, .role = .tool, .origin = .tool, .tool_name = call.name, .tool_call_id = call.id, .text = trimmed };
+        results[ready] = try result.clone(self.allocator);
+        ready += 1;
     }
-
-    for (settled[0..count]) |entry| {
-        const trimmed = try self.trimForModel(entry.name, entry.result);
-        defer if (trimmed.ptr != entry.result.ptr) self.allocator.free(trimmed);
-        _ = try self.conversation.addToolResult(entry.name, entry.id, trimmed);
+    while (adopted < ready) {
+        try self.conversation.adoptMessage(results[adopted]);
+        adopted += 1;
         try self.persistMessage(self.conversation.messages.items.len - 1);
     }
-
     self.pending_seq = null;
     self.pending_index = 0;
 }
@@ -2663,6 +3548,7 @@ fn settle(self: *Loop) !void {
 
 const Fixture = struct {
     tmp: testing.TmpDir,
+    scratch: std.heap.ArenaAllocator = .init(testing.allocator),
     root: []u8,
     convo: Conversation,
     registry: Registry,
@@ -2691,8 +3577,18 @@ const Fixture = struct {
         self.registry.deinit();
         self.convo.deinit();
         testing.allocator.free(self.root);
+        self.scratch.deinit();
         self.tmp.cleanup();
         testing.allocator.destroy(self);
+    }
+
+    fn readFile(self: *Fixture, path: []const u8) ![]const u8 {
+        return self.tmp.dir.readFileAlloc(testing.io, path, self.scratch.allocator(), .limited(64 * 1024));
+    }
+
+    fn readEvent(self: *Fixture, path: []const u8) !std.json.ObjectMap {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, self.scratch.allocator(), try self.readFile(path), .{});
+        return value.object;
     }
 
     fn loop(self: *Fixture) Loop {
@@ -2731,7 +3627,30 @@ test "a blocked prompt never enters the model transcript" {
     try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
     const notice = loop.takeHookNotice().?;
     defer testing.allocator.free(notice);
-    try testing.expectEqualStrings("prompt rejected", notice);
+    try testing.expectEqualStrings("[Hook config]\nprompt rejected", notice);
+}
+
+test "a rejected steering prompt never enters the transcript" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const hook = Hooks.Hook{ .command = "read payload; case \"$payload\" in *rejected*) echo steering denied >&2; exit 2;; esac" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_submit = &.{hook} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    fixture.fake.latency = .fromMilliseconds(80);
+    try loop.submit("again", .{});
+    try testing.expect(try loop.steer("rejected", .{}));
+    try settle(&loop);
+    for (fixture.convo.messages.items) |msg| {
+        try testing.expect(!std.mem.eql(u8, msg.text, "rejected"));
+    }
+    const notice = loop.takeHookNotice() orelse return error.TestExpectedNotice;
+    defer testing.allocator.free(notice);
+    try testing.expectEqualStrings("[Hook config]\nsteering denied", notice);
 }
 
 test "a read-only tool call runs without asking" {
@@ -3345,24 +4264,34 @@ test "a link inside the project that points out does not make an edit through it
     try testing.expectError(error.FileNotFound, outside.dir.access(testing.io, "notes.md", .{}));
 
     fixture.fake.tool_arguments = "{\"path\":\"dangling.md\",\"content\":\"x\"}";
+    const before = fixture.convo.messages.items.len;
     try loop.submit("write another", .{});
     try settle(&loop);
-    try testing.expectEqual(@as(usize, 4), fixture.fake.judged);
+    var checked = false;
+    for (fixture.convo.messages.items[before..]) |message| {
+        for (message.tool_calls) |call| {
+            try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
+            checked = true;
+        }
+    }
+    try testing.expect(checked);
     try testing.expectError(error.FileNotFound, outside.dir.access(testing.io, "missing.md", .{}));
 }
 
-test "auto mode judges an edit whose arguments cannot be read" {
+test "malformed JSON never reaches approval or execution" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
-    loop.approvals = .auto;
+    loop.approvals = .ask;
 
     fixture.fake.tool_name = "write";
     fixture.fake.tool_arguments = "{\"path\":\"notes.md\",";
     try loop.submit("write a note", .{});
     try settle(&loop);
-    try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
+    try testing.expectEqual(@as(usize, 0), fixture.fake.judged);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "notes.md", .{}));
 }
 
 test "auto mode's block is a considered one, and goes back to the model" {
@@ -3523,7 +4452,7 @@ test "a file too large to checkpoint is still changed, and the person told it ca
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try testing.expectEqualStrings("small", try fixture.tmp.dir.readFileAlloc(testing.io, "big.txt", arena, .unlimited));
-    const notice = loop.hook_notice orelse return error.TestExpectedNotice;
+    const notice = loop.hook_flow.notice orelse return error.TestExpectedNotice;
     try testing.expect(std.mem.indexOf(u8, notice, "big.txt") != null);
     try testing.expect(std.mem.indexOf(u8, notice, "/rewind") != null);
 }
@@ -3842,12 +4771,29 @@ test "a tool turn can compact more than once without another user message" {
             var script: Script = .{ .fail_compaction = fail_compaction };
             var loop = fixture.loop();
             defer loop.deinit();
+            const logger: Hooks.Hook = .{ .command = "cat >> automatic-events" };
+            const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_compact = &.{logger}, .post_compact = &.{logger}, .session_start = &.{logger} } };
+            loop.hooks = &runner;
             loop.system_prompt = "system";
             loop.provider = .{ .name = "script", .userdata = &script, .respond = Script.respond, .context_limit = limit };
             try loop.submit("Implement catalog caching. Keep the original task throughout the tool run.", .{});
             try settle(&loop);
             try testing.expectEqual(State.idle, loop.state);
             try testing.expectEqual(@as(usize, 1), loop.finished);
+            const trace = try fixture.tmp.dir.readFileAlloc(testing.io, "automatic-events", testing.allocator, .limited(16 * 1024));
+            defer testing.allocator.free(trace);
+            var events = std.mem.tokenizeScalar(u8, trace, '\n');
+            const expected: []const []const u8 = if (fail_compaction)
+                &.{ "SessionStart", "PreCompact" }
+            else
+                &.{ "SessionStart", "PreCompact", "PostCompact", "SessionStart", "PreCompact", "PostCompact", "SessionStart" };
+            for (expected) |event| {
+                const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, events.next().?, .{});
+                defer parsed.deinit();
+                try testing.expectEqualStrings(event, parsed.value.object.get("hook_event_name").?.string);
+                if (std.mem.endsWith(u8, event, "Compact")) try testing.expectEqualStrings("auto", parsed.value.object.get("trigger").?.string);
+            }
+            try testing.expect(events.next() == null);
             if (fail_compaction) {
                 try testing.expectEqual(@as(usize, 2), script.calls);
                 try testing.expectEqual(Outcome.failed, loop.outcome.?);
@@ -4929,4 +5875,408 @@ test "a call that runs comes out of the turn with a duration on it" {
     }
     try testing.expect(stored.len > 0);
     try testing.expect(stored[0].elapsed_ms != null);
+}
+
+fn submitAndSettle(loop: *Loop, prompt: []const u8) !void {
+    try loop.submit(prompt, .{});
+    try settle(loop);
+}
+
+test "a hook rewrite is approved using effective arguments and runs once" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"pwd\"}";
+    const hook: Hooks.Hook = .{ .matcher = "bash", .command = "echo rewrite >> rewrites; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"rm -rf dangerous\"}}}'" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{hook} } };
+    loop.hooks = &runner;
+    try submitAndSettle(&loop, "go");
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectEqualStrings("{\"command\":\"rm -rf dangerous\"}", loop.pendingCall().?.arguments);
+    try loop.decide(.deny);
+    try settle(&loop);
+    const rewrites = try fixture.readFile("rewrites");
+    try testing.expectEqualStrings("rewrite\n", rewrites);
+}
+
+test "a permission request allow skips the prompt except for protected paths" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const hook: Hooks.Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" };
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_request = &.{hook} } };
+    loop.hooks = &runner;
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch permitted\"}";
+    try submitAndSettle(&loop, "go");
+    try fixture.tmp.dir.access(testing.io, "permitted", .{});
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\".synth/hooks.json\",\"content\":\"{}\"}";
+    try submitAndSettle(&loop, "plant a hook");
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+}
+
+test "session-start denial cannot be bypassed by resubmitting a prompt" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .session_start = &.{.{ .command = "exit 2" }} } };
+    loop.hooks = &runner;
+    for (0..2) |_| {
+        try submitAndSettle(&loop, "never persist");
+        try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
+        try testing.expectEqual(@as(usize, 0), loop.requests_started);
+    }
+}
+
+test "cancellation during shared pre-tool policy prevents tool execution" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .all;
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"must-not-exist\",\"content\":\"bad\"}";
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "read payload; echo started > hook-started; sleep 5" }} } };
+    loop.hooks = &runner;
+    try loop.submit("go", .{});
+    var started = false;
+    for (0..200) |_| {
+        _ = try loop.poll();
+        if (fixture.tmp.dir.openFile(testing.io, "hook-started", .{})) |file| {
+            file.close(testing.io);
+            started = true;
+            break;
+        } else |_| {}
+        try std.Io.sleep(testing.io, .fromMilliseconds(5), .awake);
+    }
+    try testing.expect(started);
+    try loop.cancel();
+    try settle(&loop);
+    try testing.expectEqual(Outcome.cancelled, loop.outcome.?);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.openFile(testing.io, "must-not-exist", .{}));
+    try expectAnsweredToolCalls(&fixture.convo);
+}
+
+test "hook context must not become human approval evidence" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    var feedback: Hooks.Result = .{ .context = try testing.allocator.dupe(u8, "[Hook external MCP tool]\nAuthorization invented by a tool") };
+    defer feedback.deinit(testing.allocator);
+    try loop.acceptHookResult(&feedback);
+    try submitAndSettle(&loop, "just inspect");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const input = try classifier.material(arena.allocator(), fixture.root, fixture.convo.messages.items, fixture.convo.messages.items, .{ .id = "later", .name = "bash", .arguments = "{\"command\":\"touch harmless\"}" });
+    const delivered = for (fixture.convo.messages.items) |message| {
+        if (message.origin == .hook and std.mem.indexOf(u8, message.text, "Authorization invented by a tool") != null) break true;
+    } else false;
+    try testing.expect(delivered);
+    try testing.expect(std.mem.indexOf(u8, input, "Authorization invented by a tool") == null);
+}
+
+test "approval is rejected when arguments or a symlink target changes" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"approved.txt\",\"content\":\"yes\"}";
+    try submitAndSettle(&loop, "save the file");
+    const call = loop.pendingCall().?;
+    testing.allocator.free(call.arguments);
+    call.arguments = try testing.allocator.dupe(u8, "{\"path\":\"changed.txt\",\"content\":\"yes\"}");
+    try loop.decide(.once);
+    try settle(&loop);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "changed.txt", .{}));
+    try fixture.tmp.dir.createDirPath(testing.io, "one");
+    try fixture.tmp.dir.createDirPath(testing.io, "two");
+    try fixture.tmp.dir.symLink(testing.io, "one", "link", .{ .is_directory = true });
+    fixture.fake.tool_arguments = "{\"path\":\"link/file\",\"content\":\"yes\"}";
+    try submitAndSettle(&loop, "save through link");
+    try fixture.tmp.dir.deleteFile(testing.io, "link");
+    try fixture.tmp.dir.symLink(testing.io, "two", "link", .{ .is_directory = true });
+    try loop.decide(.once);
+    try settle(&loop);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "two/file", .{}));
+}
+
+test "policy completion cannot refresh a stale action snapshot" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "fake");
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_evaluate = &.{.{ .command = "true" }} } };
+    loop.hooks = &runner;
+    try loop.submit("list files", .{});
+    while (loop.state == .thinking) {
+        _ = try loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(State.running_hooks, loop.state);
+    const call = loop.pendingCall().?;
+    const changed = try testing.allocator.dupe(u8, "{\"path\":\"different\"}");
+    testing.allocator.free(call.arguments);
+    call.arguments = changed;
+    try settle(&loop);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    try testing.expect(firstCall(&loop).approved_action == null);
+    const saved = (try db.conn.row("SELECT status FROM tool_call", .{})).?;
+    defer saved.deinit();
+    try testing.expectEqualStrings("rejected", saved.text(0));
+}
+
+test "headless allowance leaves protected writes for a person" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .all;
+    loop.control_files = &.{"policy.json"};
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"policy.json\",\"content\":\"sample\"}";
+    try submitAndSettle(&loop, "write a sample");
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try loop.decideHeadless(true);
+    try settle(&loop);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "policy.json", .{}));
+}
+
+test "unavailable reviewer uses configured denial and a bounded deadline" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+    loop.auto_approve_safe = false;
+    loop.model_policy.reviewer_timeout_ms = 5;
+    loop.model_policy.reviewer_fallback = .deny;
+    fixture.fake.latency = .fromMilliseconds(50);
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch should-not-exist\"}";
+    try loop.submit("inspect only", .{});
+    while (loop.judging == null) {
+        _ = try loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .awake);
+    }
+    loop.review_started_ms -= 100;
+    _ = try loop.pollJudging();
+    try settle(&loop);
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, firstCall(&loop).status);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "should-not-exist", .{}));
+}
+
+test "explicit hook asks require a human across modes stages and later batch calls" {
+    const cases = [_]struct { mode: Config.Approvals, source: Hooks.Event, second: bool = false }{
+        .{ .mode = .all, .source = .pre_tool_use },
+        .{ .mode = .auto, .source = .pre_tool_use },
+        .{ .mode = .all, .source = .permission_evaluate },
+        .{ .mode = .auto, .source = .permission_evaluate },
+        .{ .mode = .auto, .source = .permission_evaluate, .second = true },
+    };
+    for (cases) |case| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        var loop = fixture.loop();
+        defer loop.deinit();
+        loop.approvals = case.mode;
+        loop.auto_approve_safe = false;
+        fixture.fake.tool_name = "bash";
+        fixture.fake.tool_arguments = "{\"command\":\"touch requires-approval\"}";
+        fixture.fake.parallel_calls = if (case.second) 2 else 1;
+        const pre: Hooks.Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"ask\"}}'" };
+        const evaluate: Hooks.Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionEvaluate\",\"effect\":\"ask\"}}'" };
+        const later: Hooks.Hook = .{ .command =
+            \\read payload; case "$payload" in *'"tool_call_id":"fake-2"'*) printf '%s' '{"hookSpecificOutput":{"hookEventName":"PermissionEvaluate","effect":"ask"}}';; esac
+        };
+        var set: Hooks.Set = .{
+            .permission_request = &.{.{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" }},
+        };
+        if (case.source == .pre_tool_use) set.pre_tool_use = &.{pre};
+        if (case.source == .permission_evaluate) set.permission_evaluate = if (case.second) &.{later} else &.{evaluate};
+        const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = set };
+        loop.hooks = &runner;
+        try submitAndSettle(&loop, "inspect only");
+        try testing.expectEqual(State.awaiting_approval, loop.state);
+        try testing.expectEqualStrings(if (case.second) "fake-2" else "fake-1", loop.pendingCall().?.id);
+        try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "requires-approval", .{}));
+    }
+}
+
+test "adding a home root never grants automatic writes to hook control files" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const a = fixture.scratch.allocator();
+    for ([_][]const u8{ "project", "home/.synth", "home/state", "home/.git/hooks", "home/templates" }) |dir| try fixture.tmp.dir.createDirPath(testing.io, dir);
+    try fixture.tmp.dir.symLink(testing.io, "../templates", "home/.synth/templates", .{ .is_directory = true });
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.project_root = try std.fs.path.join(a, &.{ fixture.root, "project" });
+    const home = try std.fs.path.join(a, &.{ fixture.root, "home" });
+    loop.control_files = &.{ try std.fs.path.join(a, &.{ home, "state/hook-trust.json" }), try std.fs.path.join(a, &.{ home, "config.json" }) };
+    try loop.addDirectory(home, "slash_command");
+    fixture.fake.tool_name = "write";
+    for ([_][]const u8{ ".synth/hooks.json", ".synth/templates/draft", "state/hook-trust.json", "config.json", ".git/hooks/pre-commit", ".git/config", ".git/objects/new" }) |name| {
+        const target = try std.fs.path.join(a, &.{ home, name });
+        fixture.fake.tool_arguments = try std.json.Stringify.valueAlloc(a, .{ .path = target, .content = "test" }, .{});
+        for ([_]Config.Approvals{ .ask, .auto, .all }) |mode| {
+            loop.approvals = mode;
+            try submitAndSettle(&loop, "update the file");
+            try testing.expectEqual(State.awaiting_approval, loop.state);
+            try loop.decide(.deny);
+            try settle(&loop);
+            try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, target, .{}));
+        }
+    }
+}
+
+test "an unreviewed prompt hook blocks its prompt without retaining or forwarding the text" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_submit = &.{.{ .command = "true", .trusted = false }}, .notification = &.{.{ .command = "cat > leaked-notice" }} } };
+    loop.hooks = &runner;
+    try loop.submit("private rejected request", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(u64, 0), loop.requests_started);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "leaked-notice", .{}));
+    for (fixture.convo.messages.items) |message| try testing.expect(std.mem.indexOf(u8, message.text, "private rejected request") == null);
+}
+
+test "an unreviewed observer is skipped and the turn still runs" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .notification = &.{.{ .command = "cat > ran", .trusted = false }} } };
+    loop.hooks = &runner;
+    try submitAndSettle(&loop, "go ahead");
+    try testing.expect(loop.requests_started > 0);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "ran", .{}));
+}
+
+test "reading from an outside cwd still requires human approval" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var outside = testing.tmpDir(.{});
+    defer outside.cleanup();
+    try outside.dir.writeFile(testing.io, .{ .sub_path = "secret.txt", .data = "outside contents" });
+    const cwd = try outside.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(cwd);
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.changeDirectory(cwd);
+    fixture.fake.tool_name = "read";
+    fixture.fake.tool_arguments = "{\"path\":\"secret.txt\"}";
+    try submitAndSettle(&loop, "read here");
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try loop.decide(.once);
+    try settle(&loop);
+    const call = fixture.convo.messages.items[1].tool_calls[0];
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, call.status);
+    try testing.expect(std.mem.indexOf(u8, call.result.?, "outside contents") != null);
+}
+
+test "automatic review survives receipt eviction and session resume" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch reviewed\"}";
+    for (0..20) |_| {
+        try submitAndSettle(&loop, "inspect");
+        try testing.expectEqual(State.awaiting_approval, loop.state);
+        try loop.decide(.deny);
+        try settle(&loop);
+    }
+    try loop.resumeSession(loop.session_id.?, 64);
+    loop.approvals = .auto;
+    try submitAndSettle(&loop, "create reviewed");
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expect(fixture.fake.judged > 0);
+    try fixture.tmp.dir.access(testing.io, "reviewed", .{});
+}
+
+test "picked and harness answers never become person instructions" {
+    for ([_]Answer{
+        .{ .text = "The user chose not to answer." },
+        .{ .text = "No one connected can answer questions. Decide for yourself, and say what you assumed." },
+        .{ .text = "model supplied option" },
+        .{ .text = "model supplied option\n\nmy typed restriction", .typed = "my typed restriction" },
+    }) |response| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        var loop = fixture.loop();
+        defer loop.deinit();
+        fixture.fake.tool_name = "ask_user";
+        fixture.fake.tool_arguments = "{\"question\":\"May I send data?\",\"options\":[\"model supplied option\"]}";
+        try submitAndSettle(&loop, "inspect only");
+        try loop.answerWithSource(response);
+        try settle(&loop);
+        const snapshot = try loop.human_intent.snapshot(testing.allocator);
+        defer snapshot.deinit(testing.allocator);
+        for (snapshot.messages) |message| {
+            if (message.role == .user and message.origin == .human) {
+                try testing.expect(std.mem.eql(u8, message.text, "inspect only") or std.mem.eql(u8, message.text, response.typed orelse ""));
+            }
+        }
+        if (response.typed != null) {
+            try testing.expectEqualStrings(response.typed.?, snapshot.messages[2].text);
+            try testing.expectEqual(Conversation.Role.assistant, snapshot.messages[1].role);
+        }
+    }
+}
+
+test "steering waiting for the next step reaches the reviewer once and only when no prompt hook vets it" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("deploy it", .{});
+    try testing.expect(try loop.steer("wait, plan only", .{}));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const waiting = try loop.pendingSteeringEvidence(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), waiting.len);
+    try testing.expectEqualStrings("wait, plan only", waiting[0].text);
+    try testing.expectEqual(Conversation.Origin.human, waiting[0].origin);
+
+    const before = try loop.human_intent.snapshot(testing.allocator);
+    defer before.deinit(testing.allocator);
+    for (before.messages) |message| try testing.expect(!std.mem.eql(u8, message.text, "wait, plan only"));
+
+    const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_submit = &.{.{ .command = "true" }} } };
+    loop.hooks = &runner;
+    try testing.expectEqual(@as(usize, 0), (try loop.pendingSteeringEvidence(arena.allocator())).len);
+    loop.hooks = null;
+
+    try settle(&loop);
+    const after = try loop.human_intent.snapshot(testing.allocator);
+    defer after.deinit(testing.allocator);
+    var occurrences: usize = 0;
+    for (after.messages) |message| {
+        if (std.mem.eql(u8, message.text, "wait, plan only")) occurrences += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), occurrences);
 }

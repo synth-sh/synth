@@ -31,7 +31,7 @@
                 "all"
             ],
             "default": "ask",
-            "description": "Who decides a call that would otherwise ask. 'ask' puts it to you. 'auto' has the session's model judge it, blocking what looks destructive, outside the project or outside the task, and hands decisions back to you after 3 blocks in a row or 20 in a session. 'all' runs everything, paths outside the project included: for a machine set aside for the agent. `PreToolUse` hooks still run under each."
+            "description": "ask requests human approval; auto reviews non-routine actions with a decision model and uses reviewer_fallback when review is unavailable; all permits actions without ordinary approval checks. Hook denials and explicit asks still apply."
         },
         "debug_log": {
             "type": "string",
@@ -109,32 +109,57 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "UserPromptSubmit": {
+                "SessionStart": { "$ref": "#/$defs/hookList" },
+                "SessionEnd": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/$defs/hook"
+                        "$ref": "#/$defs/sessionEndHookGroup"
                     }
                 },
-                "PreToolUse": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/$defs/hook"
-                    }
-                },
-                "PostToolUse": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/$defs/hook"
-                    }
-                }
+                "UserPromptSubmit": { "$ref": "#/$defs/hookList" },
+                "PreToolUse": { "$ref": "#/$defs/hookList" },
+                "PermissionRequest": { "$ref": "#/$defs/hookList" },
+                "PostToolUse": { "$ref": "#/$defs/hookList" },
+                "PreCompact": { "$ref": "#/$defs/hookList" },
+                "PostCompact": { "$ref": "#/$defs/hookList" },
+                "SubagentStart": { "$ref": "#/$defs/hookList" },
+                "SubagentStop": { "$ref": "#/$defs/hookList" },
+                "Stop": { "$ref": "#/$defs/hookList" },
+                "Interrupt": { "$ref": "#/$defs/hookList" },
+                "PreModelRequest": { "$ref": "#/$defs/hookList" },
+                "PostModelRequest": { "$ref": "#/$defs/hookList" },
+                "PostToolUseFailure": { "$ref": "#/$defs/hookList" },
+                "PostToolBatch": { "$ref": "#/$defs/hookList" },
+                "PermissionDenied": { "$ref": "#/$defs/hookList" },
+                "StopFailure": { "$ref": "#/$defs/hookList" },
+                "Notification": { "$ref": "#/$defs/hookList" },
+                "InstructionsLoaded": { "$ref": "#/$defs/hookList" },
+                "ConfigChange": { "$ref": "#/$defs/hookList" },
+                "FileChanged": { "$ref": "#/$defs/hookList" },
+                "PreModelSwitch": { "$ref": "#/$defs/hookList" },
+                "PostModelSwitch": { "$ref": "#/$defs/hookList" },
+                "TaskCreated": { "$ref": "#/$defs/hookList" },
+                "TaskCompleted": { "$ref": "#/$defs/hookList" },
+                "UserPromptExpansion": { "$ref": "#/$defs/hookList" },
+                "MessageDisplay": { "$ref": "#/$defs/hookList" },
+                "CwdChanged": { "$ref": "#/$defs/hookList" },
+                "DirectoryAdded": { "$ref": "#/$defs/hookList" },
+                "ModelResolve": { "$ref": "#/$defs/hookList" },
+                "ModelContext": { "$ref": "#/$defs/hookList" },
+                "ModelSettings": { "$ref": "#/$defs/hookList" },
+                "ModelRetry": { "$ref": "#/$defs/hookList" },
+                "PermissionEvaluate": { "$ref": "#/$defs/hookList" },
+                "HttpRequest": { "$ref": "#/$defs/hookList" },
+                "HttpResponse": { "$ref": "#/$defs/hookList" }
             },
-            "description": "Commands run at selected agent lifecycle events."
+            "description": "Additive lifecycle hooks. Each new or changed declaration requires explicit trust."
         },
         "hook_timeout_ms": {
             "type": "integer",
             "minimum": 1,
             "default": 30000,
-            "description": "How long a hook command may run before it is killed."
+            "description": "How long a hook command may run before it is killed.",
+            "maximum": 86400000
         },
         "mcp": {
             "type": "object",
@@ -192,28 +217,63 @@
             "type": "string",
             "default": "Co-Authored-By: synth <noreply@getsynth.sh>",
             "description": "The trailer the model is asked to end its commit messages with, in a git project. An empty string asks for none."
-        }
-    },
-    "$defs": {
-        "hook": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "command"
-            ],
-            "properties": {
-                "matcher": {
-                    "type": "string",
-                    "default": "",
-                    "description": "Exact tool name to match. Empty or absent matches every tool."
-                },
-                "command": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Shell command run from the project root."
+        },
+        "model_classes": {
+            "type": "array",
+            "description": "What you say about each model: where it runs (trust) and how capable it is (tier). Hooks can filter on both. A model not listed here is hosted and small.",
+            "items": {
+                "type": "object",
+                "required": ["model"],
+                "additionalProperties": false,
+                "properties": {
+                    "model": { "type": "string", "minLength": 1 },
+                    "provider": { "type": "string", "minLength": 1 },
+                    "trust": { "$ref": "#/$defs/modelTrust" },
+                    "tier": { "$ref": "#/$defs/modelTier" }
                 }
             }
         },
+        "model_requests": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Purpose-based model routes and reviewer failure policy. Hooks may choose only named routes permitted for that purpose. Route credentials are explicit and never inherited.",
+            "properties": {
+                "routes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/modelRoute"
+                    }
+                },
+                "agent": {
+                    "type": "string"
+                },
+                "approval_judge": {
+                    "type": "string"
+                },
+                "compaction": {
+                    "type": "string"
+                },
+                "restrict_routes": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "reviewer_timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300000,
+                    "default": 30000
+                },
+                "reviewer_fallback": {
+                    "enum": [
+                        "ask",
+                        "deny"
+                    ],
+                    "default": "ask"
+                }
+            }
+        }
+    },
+    "$defs": {
         "mcpServer": {
             "type": "object",
             "minProperties": 1,
@@ -255,6 +315,326 @@
                     "description": "Extra headers for the remote server."
                 }
             }
+        },
+        "hookHandler": {
+            "oneOf": [
+                {
+                    "$ref": "#/$defs/commandHookHandler"
+                },
+                {
+                    "$ref": "#/$defs/mcpHookHandler"
+                }
+            ]
+        },
+        "hookGroup": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "hooks"
+            ],
+            "properties": {
+                "matcher": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Matches exact names, pipe-separated names, or a regular expression against the event field. FileChanged uses literal project-relative paths."
+                },
+                "hooks": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/hookHandler"
+                    }
+                },
+                "when": { "$ref": "#/$defs/hookWhen" }
+            }
+        },
+        "hookOnFailure": {
+            "enum": [
+                "block",
+                "continue"
+            ],
+            "description": "Whether the action goes ahead when the hook exits with a code other than 0 or 2. Request events block by default; every other event continues."
+        },
+        "commandHookHandler": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "command"
+            ],
+            "properties": {
+                "type": {
+                    "const": "command"
+                },
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Shell command run from the original project root."
+                },
+                "timeout_ms": { "$ref": "#/$defs/hookTimeoutMs" },
+                "async": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "onFailure": { "$ref": "#/$defs/hookOnFailure" },
+                "transcript": { "$ref": "#/$defs/hookTranscript" },
+                "stream": { "$ref": "#/$defs/hookStream" },
+                "timeout": { "$ref": "#/$defs/hookTimeout" }
+            },
+            "not": { "$ref": "#/$defs/hookTimeoutConflict" }
+        },
+        "mcpHookHandler": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "type",
+                "server",
+                "tool",
+                "arguments"
+            ],
+            "properties": {
+                "type": {
+                    "const": "mcp_tool"
+                },
+                "timeout_ms": { "$ref": "#/$defs/hookTimeoutMs" },
+                "async": {
+                    "const": false
+                },
+                "transcript": { "$ref": "#/$defs/hookTranscript" },
+                "server": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "tool": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "arguments": {
+                    "type": [
+                        "object",
+                        "string"
+                    ]
+                },
+                "stream": { "$ref": "#/$defs/hookStream" },
+                "timeout": { "$ref": "#/$defs/hookTimeout" }
+            },
+            "not": { "$ref": "#/$defs/hookTimeoutConflict" }
+        },
+        "sessionEndHookGroup": {
+            "$ref": "#/$defs/hookGroup",
+            "properties": {
+                "hooks": {
+                    "items": {
+                        "properties": {
+                            "type": {
+                                "const": "command"
+                            },
+                            "async": {
+                                "const": false
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "modelRequestPurpose": { "enum": ["agent", "approval_judge", "compaction"] },
+        "modelTrust": { "enum": ["local", "private", "hosted"] },
+        "modelTier": { "enum": ["small", "mid", "frontier"] },
+        "hookWhen": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": false,
+            "properties": {
+                "agent_scope": {
+                    "enum": [
+                        "main",
+                        "subagent"
+                    ]
+                },
+                "request_purpose": {
+                    "$ref": "#/$defs/modelRequestPurpose"
+                },
+                "agent_type": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "model": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "provider": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "trust": {
+                    "oneOf": [
+                        { "$ref": "#/$defs/modelTrust" },
+                        { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/modelTrust" } }
+                    ]
+                },
+                "tier": {
+                    "oneOf": [
+                        { "$ref": "#/$defs/modelTier" },
+                        { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/modelTier" } }
+                    ]
+                }
+            },
+            "description": "All specified fields must match the harness metadata exactly. Omitted fields match every value."
+        },
+        "modelSettings": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "temperature": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 2
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1048576
+                },
+                "reasoning_effort": {
+                    "enum": [
+                        "none",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh"
+                    ]
+                },
+                "attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4
+                },
+                "retry_delay_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 60000
+                },
+                "top_p": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 1
+                },
+                "top_k": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1048576
+                },
+                "seed": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "frequency_penalty": {
+                    "type": "number",
+                    "minimum": -2,
+                    "maximum": 2
+                },
+                "presence_penalty": {
+                    "type": "number",
+                    "minimum": -2,
+                    "maximum": 2
+                },
+                "stop": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4096
+                    }
+                }
+            }
+        },
+        "modelRoute": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "id",
+                "provider",
+                "endpoint",
+                "model"
+            ],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "provider": {
+                    "enum": [
+                        "openai",
+                        "ollama"
+                    ]
+                },
+                "endpoint": {
+                    "type": "string",
+                    "format": "uri"
+                },
+                "model": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "api_key": {
+                    "type": "string"
+                },
+                "purposes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "$ref": "#/$defs/modelRequestPurpose"
+                    }
+                },
+                "settings": {
+                    "$ref": "#/$defs/modelSettings"
+                },
+                "context_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1048576,
+                    "default": 0,
+                    "description": "Known route context window; zero uses the backend default or model table. Ollama receives positive limits as num_ctx."
+                },
+                "protocol": {
+                    "enum": [
+                        "chat",
+                        "responses",
+                        "messages"
+                    ],
+                    "default": "chat",
+                    "description": "OpenAI-compatible wire protocol. Ollama selects its native protocol automatically."
+                }
+            }
+        },
+        "hookList": {
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/hookGroup"
+            }
+        },
+        "hookTimeoutConflict": { "required": ["timeout", "timeout_ms"] },
+        "hookTimeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400000
+        },
+        "hookTimeout": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "description": "Timeout in seconds; use either timeout or timeout_ms."
+        },
+        "hookTranscript": {
+            "type": "boolean",
+            "default": false
+        },
+        "hookStream": {
+            "type": "boolean",
+            "default": false,
+            "description": "Opt in to per-record HttpResponse hooks."
         }
     },
     "allowComments": false,

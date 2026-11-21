@@ -19,13 +19,14 @@ const mcp = @import("mcp");
 const mcp_tools = @import("tools/mcp.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
+const terminal = @import("terminal_output.zig");
 
 /// Sessions listed by `session list`.
 const list_limit: usize = 50;
 
-const dim = "\x1b[2m";
-const bold = "\x1b[1m";
-const reset = "\x1b[0m";
+const dim = terminal.dim;
+const bold = terminal.bold;
+const reset = terminal.reset;
 
 /// Config, project and database, which every command here needs.
 const Context = struct {
@@ -271,7 +272,7 @@ fn showSession(ctx: *Context, out: *std.Io.Writer, handle: []const u8) !void {
             .system => "system",
             .summary => "summary",
         };
-        try out.print("{s}▸ {s}{s} {s}\n", .{ bold, label, reset, msg.text });
+        try terminal.writeTranscriptLine(out, label, msg.text);
         for (msg.tool_calls) |call| {
             try out.print("  {s}{s}{s} {s}\n", .{ dim, call.name, reset, call.arguments });
         }
@@ -821,4 +822,28 @@ fn probeStep(
     try out.flush();
 
     return status.class() == .success;
+}
+
+pub fn hooks(init_process: std.process.Init, action: @import("core/hook_store.zig").Action, id: []const u8) !void {
+    const store_module = @import("core/hook_store.zig");
+    const a = init_process.arena.allocator();
+    var config = try Config.open(init_process.gpa, init_process.io, init_process.environ_map);
+    defer config.deinit();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init_process.io, ".", a);
+    var project = try Project.detect(init_process.gpa, init_process.io, cwd);
+    defer project.deinit(init_process.gpa);
+    var store = try store_module.Store.init(init_process.gpa, init_process.io, config.hook_state_path);
+    defer store.deinit();
+    var set = try store_module.discover(a, init_process.io, config.hooks, project.root, init_process.environ_map.get("HOME"), store);
+    store_module.change(a, init_process.io, &set, config.hook_state_path, action, id) catch |err| switch (err) {
+        error.HookIdTooShort => try cli.reject(init_process.io, .hooks, "hook id prefix is too short", .{}),
+        error.HookNotFound => try cli.reject(init_process.io, .hooks, "no hook matches '{s}'", .{id}),
+        error.AmbiguousHookId => try cli.reject(init_process.io, .hooks, "hook id prefix '{s}' is ambiguous", .{id}),
+        else => return err,
+    };
+    const text = try store_module.report(a, set, config.hook_timeout_ms, action == .review, null);
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(init_process.io, &buffer);
+    try writer.interface.writeAll(text);
+    try writer.interface.flush();
 }

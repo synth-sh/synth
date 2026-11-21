@@ -23,6 +23,8 @@ const Registry = @import("registry.zig");
 /// built-in, two servers offering the same name would collide with each other,
 /// and neither failure would be visible in a transcript.
 pub const prefix = "mcp__";
+const cancelled_before_call = "cancelled before MCP call";
+const timed_out_before_call = "timed out before MCP call";
 
 /// Cap on a tool name. OpenAI rejects a function name over 64 characters, and a
 /// rejected request fails the whole turn rather than the one tool, so the limit
@@ -160,6 +162,7 @@ pub const Host = struct {
     client: mcp.Implementation = .{ .name = "", .version = "" },
 
     pub const Connection = struct {
+        call_mutex: std.Io.Mutex = .init,
         name: []const u8,
         client: *mcp.Client,
         /// How many tools this server contributed.
@@ -364,6 +367,23 @@ pub const Host = struct {
             if (std.mem.eql(u8, connection.name, name)) return connection;
         }
         return null;
+    }
+
+    pub fn callConnected(self: *Host, ctx: tool.Context, server: []const u8, remote: []const u8, arguments: []const u8) !tool.Output {
+        if (self.connecting()) return error.HookMcpServerUnavailable;
+        const connection = self.find(server) orelse return error.HookMcpServerUnavailable;
+        if (!connection.installed) return error.HookMcpToolUnavailable;
+        var offered = false;
+        for (connection.offered) |definition| {
+            if (std.mem.eql(u8, definition.name, remote)) offered = true;
+        }
+        if (!offered) return error.HookMcpToolUnavailable;
+        var binding: Binding = .{ .connection = connection, .remote = remote };
+        var scoped = ctx;
+        scoped.userdata = &binding;
+        const parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, arguments, .{});
+        defer parsed.deinit();
+        return call(scoped, .{ .arguments = parsed.value });
     }
 
     /// Close a server and take its tools back out of the registry. False when
@@ -684,6 +704,7 @@ fn envPairs(arena: std.mem.Allocator, value: ?std.json.Value) ![]const Server.En
 /// How often a waiting call looks up to see whether it has been cancelled or
 /// run out of time.
 const poll_slice_ms: u64 = 25;
+const call_lock_poll_ms = 5;
 
 /// One call in flight on its own worker.
 ///
@@ -716,6 +737,12 @@ fn call(ctx: tool.Context, input: tool.Input) !tool.Output {
         try ctx.allocator.dupe(u8, "this tool is not connected to a server"),
     );
     const binding: *Host.Binding = @ptrCast(@alignCast(raw));
+    while (!binding.connection.call_mutex.tryLock()) {
+        if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) cancelled_before_call else timed_out_before_call));
+        try std.Io.sleep(ctx.io, .fromMilliseconds(call_lock_poll_ms), .awake);
+    }
+    defer binding.connection.call_mutex.unlock(ctx.io);
+    if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) cancelled_before_call else timed_out_before_call));
 
     var arena_state: std.heap.ArenaAllocator = .init(ctx.allocator);
     defer arena_state.deinit();

@@ -76,7 +76,8 @@ provider.
   key, environment overrides, pruning
 - [CLI](docs/cli.md): subcommands and flags, ACP, remote sessions over ssh
 - [MCP](docs/mcp.md): servers in `config.json`, auth, `/mcp`
-- [Hooks](docs/hooks.md): running commands on lifecycle events, with examples
+- [Hooks guide](docs/hooks.md): automate actions with walkthroughs and examples
+- [Hooks reference](docs/hooks-reference.md): events, configuration, and JSON
 - [Skills](docs/skills.md): writing and finding them
 
 Working on the code? Read [the contributing guide](docs/contributing.md)

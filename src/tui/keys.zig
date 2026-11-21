@@ -357,6 +357,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             if (self.mirror.takeSwitched()) try self.showReplacedTranscript();
             try self.followSubagent();
             while (self.mirror.takeAnswer()) |answer| try commands.showAnswer(self, ctx, answer);
+            if (changes.directory) try self.refreshDirectory();
             if (changes.any) try commands.refreshMcpPicker(self);
             if (changes.transcript) {
                 widget_pool.pruneWidgets(self);
@@ -576,16 +577,6 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
-            if (key.matches(vaxis.Key.escape, .{}) and
-                self.mirror.isBusy() and
-                self.mirror.state() != .awaiting_approval)
-            {
-                try self.mirror.cancel();
-                self.thinking.stream = null;
-                try self.scheduleTick(ctx);
-                return ctx.consumeAndRedraw();
-            }
-
             if (self.mirror.state() == .awaiting_approval) {
                 if (key.matches(vaxis.Key.left, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
                     self.approval.move(-1);
@@ -662,6 +653,16 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     try self.acceptMention();
                     return ctx.consumeAndRedraw();
                 }
+            }
+
+            if (key.matches(vaxis.Key.escape, .{}) and
+                self.mirror.isBusy() and
+                self.mirror.state() != .awaiting_approval)
+            {
+                try self.mirror.cancel();
+                self.thinking.stream = null;
+                try self.scheduleTick(ctx);
+                return ctx.consumeAndRedraw();
             }
 
             if (key.matches(vaxis.Key.up, .{})) {

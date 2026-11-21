@@ -6,7 +6,7 @@
 # synth's own check decides approve-versus-ask. This decides never, which is
 # the part a config cannot express.
 #
-#   { "matcher": "bash", "command": "./examples/hooks/deny-command.sh" }
+#   { "matcher": "^bash$", "hooks": [{ "command": "./examples/hooks/deny-command.sh" }] }
 #
 # Needs jq to read the command out of the payload.
 set -euo pipefail

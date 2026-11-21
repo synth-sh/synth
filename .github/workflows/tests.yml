@@ -6,6 +6,9 @@ on:
       - "**.zig"
       - "**.zig.zon"
       - "src/**"
+      - "tests/**"
+      - "examples/hooks/**"
+      - "config.schema.json"
       - ".github/workflows/tests.yml"
   pull_request:
     branches: [master]
