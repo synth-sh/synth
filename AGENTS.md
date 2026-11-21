@@ -86,6 +86,7 @@ sprinkles comments over otherwise readable code will be rejected.
 - Run `zig fmt` on changed files before committing
 - Commit messages follow Conventional Commits with a scope, as in the log:
   `feat(tui): ...`, `fix(tools): ...`
+- Use GitHub's generated release notes. Leave `CHANGELOG.md` unchanged.
 - Do not use shortcuts or workarounds. Always prefer clean and idiomatic
   solutions.
 - Tests must pass (`zig build test`) before a change is done. If a test fails,
