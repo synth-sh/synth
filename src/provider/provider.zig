@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
 const Hooks = @import("../core/hooks.zig");
+const http_status_digits = 3;
 
 /// The seam every model backend plugs into.
 const Provider = @This();
@@ -116,8 +117,8 @@ pub const Attempt = struct {
             _ = runner.io.swapCancelProtection(previous);
         };
         if (cleaning_up) {
-            runner.timeout_ms = @min(runner.timeout_ms, 1000);
-            runner.deadline_ms = std.Io.Clock.now(.awake, runner.io).toMilliseconds() + 3000;
+            runner.timeout_ms = @min(runner.timeout_ms, Hooks.cleanup_handler_timeout_ms);
+            runner.deadline_ms = std.Io.Clock.now(.awake, runner.io).toMilliseconds() + Hooks.cleanup_timeout_ms;
         }
         var invocation = self.turn.hook_input;
         invocation.event = event;
@@ -220,11 +221,14 @@ pub fn errorType(err: anyerror, details: []const u8) []const u8 {
     }
     var words = std.mem.tokenizeAny(u8, details, " \t\r\n:");
     while (words.next()) |word| {
-        if (word.len != 3) continue;
+        if (word.len != http_status_digits) continue;
         const code = std.fmt.parseInt(u16, word, 10) catch continue;
-        if (code < 400 or code >= 600) continue;
         const status: std.http.Status = @enumFromInt(code);
         const phrase = status.phrase() orelse continue;
+        switch (status.class()) {
+            .client_error, .server_error => {},
+            else => continue,
+        }
         const rest = std.mem.trimStart(u8, words.rest(), " \t");
         if (std.ascii.startsWithIgnoreCase(rest, phrase)) return @import("retry.zig").errorType(status);
     }

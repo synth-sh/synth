@@ -2,6 +2,7 @@ const std = @import("std");
 const Hooks = @import("../core/hooks.zig");
 
 const Patch = @import("../core/hook_result.zig").HttpPatch;
+const max_http_status = 599;
 
 pub const Request = struct {
     body: []u8,
@@ -108,9 +109,11 @@ pub const Exchange = struct {
         if (try self.evaluate(a, "headers", null, headers.items)) |patch| {
             if (patch.body != null or patch.drop) return error.InvalidHttpHookOutput;
             if (patch.status) |status| {
-                if (status < 200 or status > 599 or status / 100 == 3) return error.InvalidHttpHookOutput;
+                if (status < @intFromEnum(std.http.Status.ok) or status > max_http_status) return error.InvalidHttpHookOutput;
+                const replacement: std.http.Status = @enumFromInt(status);
+                if (replacement.class() == .redirect) return error.InvalidHttpHookOutput;
                 if (self.input.request_purpose == .approval_judge and status != @intFromEnum(original.status)) return error.ReviewerContextImmutable;
-                self.head.status = @enumFromInt(status);
+                self.head.status = replacement;
             }
             if (patch.headers) |values| try updateHeaders(a, &headers, values);
             self.head.headers = headers.items;
@@ -170,7 +173,7 @@ fn updateHeaders(a: std.mem.Allocator, headers: *std.ArrayList(std.http.Header),
         if (value != .string and value != .null) return error.InvalidHttpHookOutput;
         if (value == .string) {
             if (std.mem.eql(u8, value.string, "<redacted>")) continue;
-            for (value.string) |c| if (c < 32 or c == 127) return error.InvalidHttpHookOutput;
+            for (value.string) |c| if (std.ascii.isControl(c)) return error.InvalidHttpHookOutput;
         }
         var index: usize = 0;
         while (index < headers.items.len) {

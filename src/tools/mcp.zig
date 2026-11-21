@@ -702,6 +702,7 @@ fn envPairs(arena: std.mem.Allocator, value: ?std.json.Value) ![]const Server.En
 /// How often a waiting call looks up to see whether it has been cancelled or
 /// run out of time.
 const poll_slice_ms: u64 = 25;
+const call_lock_poll_ms = 5;
 
 /// One call in flight on its own worker.
 ///
@@ -736,7 +737,7 @@ fn call(ctx: tool.Context, input: tool.Input) !tool.Output {
     const binding: *Host.Binding = @ptrCast(@alignCast(raw));
     while (!binding.connection.call_mutex.tryLock()) {
         if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) "cancelled before MCP call" else "timed out before MCP call"));
-        try std.Io.sleep(ctx.io, .fromMilliseconds(5), .awake);
+        try std.Io.sleep(ctx.io, .fromMilliseconds(call_lock_poll_ms), .awake);
     }
     defer binding.connection.call_mutex.unlock(ctx.io);
     if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) "cancelled before MCP call" else "timed out before MCP call"));

@@ -5,10 +5,13 @@ const HttpHooks = @import("http_hooks.zig");
 const OpenAI = @import("openai.zig");
 const window = @import("window.zig");
 
+pub const default_max_output_tokens: u32 = 4096;
+const data_prefix = "data:";
+
 pub const Options = struct {
     model: []const u8,
     context_limit: u32 = 0,
-    max_output_tokens: u32 = 4096,
+    max_output_tokens: u32 = default_max_output_tokens,
     vision: bool = false,
 };
 
@@ -156,8 +159,8 @@ pub const Stream = struct {
                 break :blk false;
             };
             const value = std.mem.trim(u8, line.written(), "\r ");
-            if (std.mem.startsWith(u8, value, "data:")) {
-                const payload = std.mem.trimStart(u8, value[5..], " ");
+            if (std.mem.startsWith(u8, value, data_prefix)) {
+                const payload = std.mem.trimStart(u8, value[data_prefix.len..], " ");
                 const prepared = if (self.http) |http| (try http.payload(scratch.allocator(), payload, true)) orelse continue else payload;
                 const event = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), prepared, .{});
                 try self.apply(event);

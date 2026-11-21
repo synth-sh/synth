@@ -5,6 +5,9 @@ const Flow = @This();
 const Loop = @import("loop.zig");
 const Database = @import("../core/database.zig");
 
+pub const identity_bytes = 16;
+const transcript_buffer_bytes = 4 * 1024;
+
 pub const Compaction = enum { manual, during_turn };
 pub const Resume = enum { begin_prompt, ask_model, compact, compact_session, after_compact, finish_turn, config_idle, failed_turn };
 pub const Pending = union(enum) {
@@ -41,7 +44,7 @@ session_source: enum { startup, clear, @"resume", compact } = .startup,
 compaction: Compaction = .manual,
 compaction_veto_seq: ?u64 = null,
 parent_call_id: []const u8 = "",
-identity: [32]u8 = @splat(0),
+identity: [identity_bytes * 2]u8 = @splat(0),
 notice: ?[]u8 = null,
 failure: ?[]u8 = null,
 export_path: ?[]u8 = null,
@@ -131,10 +134,10 @@ pub fn exportHookInput(self: *Loop, invocation: Hooks.Invocation) !Hooks.Invocat
     const runtime = runner.runtime orelse return input;
     const path = try runtime.privatePath(self.allocator, "jsonl");
     errdefer self.allocator.free(path);
-    const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true, .permissions = Hooks.private_file_permissions });
     defer file.close(self.io);
     errdefer std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
-    var buffer: [4096]u8 = undefined;
+    var buffer: [transcript_buffer_bytes]u8 = undefined;
     var writer = file.writer(self.io, &buffer);
     for (self.conversation.messages.items) |message| {
         try std.json.Stringify.value(.{ .seq = message.seq, .role = message.role, .text = message.text, .tool_calls = message.tool_calls }, .{}, &writer.interface);

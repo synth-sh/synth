@@ -2,6 +2,13 @@ const std = @import("std");
 const Hooks = @import("hooks.zig");
 const Config = @import("config.zig");
 
+const max_trust_store_bytes = 1024 * 1024;
+const max_hook_file_bytes = 64 * 1024;
+const store_writer_buffer_bytes = 4 * 1024;
+const hash_writer_buffer_bytes = 512;
+const min_trust_id_chars: usize = 32;
+const min_revoke_id_chars: usize = 8;
+
 pub const State = struct { trusted: bool = false, disabled: bool = false };
 pub const Store = struct {
     arena: std.heap.ArenaAllocator,
@@ -12,7 +19,7 @@ pub const Store = struct {
         errdefer self.deinit();
         const filename = path orelse return self;
         const a = self.arena.allocator();
-        const source = std.Io.Dir.cwd().readFileAlloc(io, filename, a, .limited(1024 * 1024)) catch |err| switch (err) {
+        const source = std.Io.Dir.cwd().readFileAlloc(io, filename, a, .limited(max_trust_store_bytes)) catch |err| switch (err) {
             error.FileNotFound => return self,
             else => return err,
         };
@@ -31,9 +38,9 @@ pub const Store = struct {
         try self.entries.map.put(self.arena.allocator(), try self.arena.allocator().dupe(u8, id), state);
     }
     pub fn save(self: *Store, io: std.Io, path: []const u8) !void {
-        var file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true, .make_path = true, .permissions = .fromMode(0o600) });
+        var file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true, .make_path = true, .permissions = Hooks.private_file_permissions });
         defer file.deinit(io);
-        var buffer: [4096]u8 = undefined;
+        var buffer: [store_writer_buffer_bytes]u8 = undefined;
         var out = file.file.writer(io, &buffer);
         try std.json.Stringify.value(self.entries, .{}, &out.interface);
         try out.interface.flush();
@@ -58,7 +65,7 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
             const source_path = try std.fs.path.resolve(arena, &.{ root, hook.source });
             const source_is_user = (if (user_source) |path| std.mem.eql(u8, path, hook.source) else false) or !@import("paths.zig").inside(root, source_path);
             const user_hook = source_is_user and independentCommand(hook.command);
-            var buffer: [512]u8 = undefined;
+            var buffer: [hash_writer_buffer_bytes]u8 = undefined;
             var hash = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&buffer);
             try std.json.Stringify.value(.{ if (user_hook) "" else root, event.name(), count.value_ptr.*, hook.* }, .{}, &hash.writer);
             try hashScripts(arena, io, &hash.writer, root, hook.command);
@@ -103,7 +110,7 @@ fn independentCommand(command: []const u8) bool {
 }
 
 fn loadFile(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: []const u8) !void {
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024)) catch |err| switch (err) {
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_hook_file_bytes)) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -174,7 +181,7 @@ pub const Action = enum { list, review, trust, revoke, enable, disable };
 pub fn change(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: ?[]const u8, action: Action, id: []const u8) !void {
     if (action == .list or action == .review) return;
     const filename = path orelse return error.HookTrustStoreUnavailable;
-    const minimum_id: usize = if (action == .trust or action == .enable) 32 else 8;
+    const minimum_id = if (action == .trust or action == .enable) min_trust_id_chars else min_revoke_id_chars;
     if (id.len < minimum_id) return error.HookIdTooShort;
     var selected: ?[]const u8 = null;
     inline for (std.meta.fields(Hooks.Set)) |field| {
@@ -188,7 +195,7 @@ pub fn change(arena: std.mem.Allocator, io: std.Io, set: *Hooks.Set, path: ?[]co
     try Config.ensureDir(io, filename);
     const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{filename});
     defer arena.free(lock_path);
-    const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive, .permissions = .fromMode(0o600) });
+    const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive, .permissions = Hooks.private_file_permissions });
     defer lock.close(io);
     var store = try Store.init(arena, io, filename);
     defer store.deinit();

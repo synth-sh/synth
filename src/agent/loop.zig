@@ -38,6 +38,8 @@ const ToolRun = @import("tool_run.zig");
 
 const Loop = @This();
 
+const idle_notification_delay_ms: i64 = std.time.ms_per_min;
+
 /// How many times the same tool call may repeat before the turn is stopped.
 /// Two is a model correcting itself; three is a model stuck.
 pub const max_repeats: usize = 3;
@@ -333,7 +335,7 @@ pub fn init(
     reads: *tool.ReadLog,
     project_root: []const u8,
 ) Loop {
-    var identity: [16]u8 = undefined;
+    var identity: [HookFlow.identity_bytes]u8 = undefined;
     io.random(&identity);
     conversation.preserve_context = true;
     return .{
@@ -1801,7 +1803,7 @@ pub fn poll(self: *Loop) !bool {
     if (self.state == .idle and try self.startConfigChange(.config_idle)) return true;
     if (self.state == .idle and !self.hook_flow.idle_notified) {
         if (self.hook_flow.idle_since) |since| {
-            if (tool.monotonicMilliseconds(self.io) - since >= 60_000) {
+            if (tool.monotonicMilliseconds(self.io) - since >= idle_notification_delay_ms) {
                 self.hook_flow.idle_notified = true;
                 self.notifyHook("idle_prompt", "The agent is waiting for input");
             }
@@ -2410,18 +2412,19 @@ fn checkTodoTasks(self: *Loop, message_index: usize, call_index: usize) !bool {
     defer arena.deinit();
     var next = todo.List.init(arena.allocator());
     try next.replace(todo_tool.parse(arena.allocator(), call.arguments));
-    while (self.hook_flow.task_cursor < next.items.items.len * 2) {
+    const task_events = [_]Hooks.Event{ .task_created, .task_completed };
+    while (self.hook_flow.task_cursor < next.items.items.len * task_events.len) {
         const cursor = self.hook_flow.task_cursor;
         self.hook_flow.task_cursor += 1;
-        const item = next.items.items[cursor / 2];
+        const item = next.items.items[cursor / task_events.len];
         const previous: ?todo.Status = for (self.todos.items.items) |old| {
             if (std.mem.eql(u8, old.text, item.text)) break old.status;
         } else null;
-        const event: Hooks.Event = if (cursor % 2 == 0) .task_created else .task_completed;
+        const event = task_events[cursor % task_events.len];
         if (event == .task_created and previous != null) continue;
         if (event == .task_completed and (item.status != .done or previous == .done)) continue;
         if (runner.set.forEvent(event).len == 0) continue;
-        var digest: [32]u8 = undefined;
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(item.text, &digest, .{});
         const task_id = std.fmt.bytesToHex(digest, .lower);
         return self.startHook(.{ .event = event, .task_id = &task_id, .task_subject = item.text, .task_description = item.text, .tool_call_id = call.id }, .{ .task_policy = call_index });

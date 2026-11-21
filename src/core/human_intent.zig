@@ -42,7 +42,7 @@ const Evidence = struct {
 
 const Family = struct {
     records: std.ArrayList(Record) = .empty,
-    bytes: usize = 2,
+    bytes: usize = "[]".len,
     omitted: bool = false,
 
     fn deinit(self: *Family, a: std.mem.Allocator) void {

@@ -10,7 +10,23 @@ const ModelClass = @import("model_class.zig");
 const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
 pub const default_timeout_ms: u64 = 30_000;
-pub const cleanup_timeout_ms: i64 = 3000;
+pub const cleanup_timeout_ms: i64 = 3 * std.time.ms_per_s;
+pub const cleanup_handler_timeout_ms: u64 = std.time.ms_per_s;
+pub const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_directory_permissions = std.Io.Dir.Permissions.fromMode(0o700);
+const display_timeout_ms: u64 = 10 * std.time.ms_per_s;
+const capacity_poll_ms = 5;
+const dispatch_poll_ms = 1;
+const record_capacity = 64;
+const record_id_bytes = 64;
+const pending_dispatch_capacity = 64;
+const temp_nonce_bytes = 16;
+const max_inline_output_bytes = 8 * 1024;
+const output_preview_bytes = 4 * 1024;
+const output_file_buffer_bytes = 4 * 1024;
+const blocking_exit_code = 2;
+const not_executable_exit_code = 126;
+const command_not_found_exit_code = 127;
 const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT" };
 
 const claude_tool_names = std.StaticStringMap([]const u8).initComptime(.{
@@ -274,8 +290,8 @@ pub const Set = struct {
 };
 
 pub fn effectiveTimeout(event: Event, fallback: u64, hook: Hook) u64 {
-    if (event == .session_end or event == .interrupt) return @min(hook.timeout_ms orelse 1000, 3000);
-    if (event == .message_display and fallback == default_timeout_ms) return hook.timeout_ms orelse 10_000;
+    if (event == .session_end or event == .interrupt) return @min(hook.timeout_ms orelse cleanup_handler_timeout_ms, @as(u64, cleanup_timeout_ms));
+    if (event == .message_display and fallback == default_timeout_ms) return hook.timeout_ms orelse display_timeout_ms;
     return hook.timeout_ms orelse fallback;
 }
 
@@ -500,7 +516,7 @@ pub const Invocation = struct {
 };
 
 pub const Record = struct {
-    id: [64]u8 = @splat(0),
+    id: [record_id_bytes]u8 = @splat(0),
     event: Event,
     agent_scope: AgentScope = .main,
     request_purpose: RequestPurpose = .agent,
@@ -510,10 +526,10 @@ pub const Record = struct {
     error_name: []const u8 = "",
     request_id: u64 = 0,
     attempt: u32 = 0,
-    agent_id: [64]u8 = @splat(0),
-    session_id: [64]u8 = @splat(0),
-    turn_id: [64]u8 = @splat(0),
-    call_id: [64]u8 = @splat(0),
+    agent_id: [record_id_bytes]u8 = @splat(0),
+    session_id: [record_id_bytes]u8 = @splat(0),
+    turn_id: [record_id_bytes]u8 = @splat(0),
+    call_id: [record_id_bytes]u8 = @splat(0),
 };
 
 pub const Runtime = struct {
@@ -523,7 +539,7 @@ pub const Runtime = struct {
     stop: std.atomic.Value(bool) = .init(false),
     background: std.ArrayList(*Dispatch) = .empty,
     background_mutex: std.Io.Mutex = .init,
-    records: [64]Record = undefined,
+    records: [record_capacity]Record = undefined,
     records_len: usize = 0,
     records_next: usize = 0,
     records_mutex: std.Io.Mutex = .init,
@@ -541,7 +557,7 @@ pub const Runtime = struct {
             if (stop) |flag| if (flag.load(.acquire)) return error.Cancelled;
             const active = self.active.load(.acquire);
             if (active < concurrent_limit and self.active.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) == null) return;
-            try std.Io.sleep(self.io, .fromMilliseconds(5), .awake);
+            try std.Io.sleep(self.io, .fromMilliseconds(capacity_poll_ms), .awake);
         }
     }
     fn leave(self: *Runtime) void {
@@ -559,11 +575,12 @@ pub const Runtime = struct {
         record_value.error_name = error_name;
         inline for (.{ .{ "session_id", "session_id" }, .{ "turn_id", "turn_id" }, .{ "call_id", "tool_call_id" }, .{ "agent_id", "agent_id" } }) |pair| {
             const value = @field(invocation, pair[1]);
-            const length = @min(64, value.len);
+            const length = @min(record_id_bytes, value.len);
             @memcpy(@field(record_value, pair[0])[0..length], value[0..length]);
         }
         if (invocation.turn_number) |number| _ = std.fmt.bufPrint(&record_value.turn_id, "{d}", .{number}) catch {};
-        @memcpy(record_value.id[0..@min(64, hook.id.len)], hook.id[0..@min(64, hook.id.len)]);
+        const id_len = @min(record_value.id.len, hook.id.len);
+        @memcpy(record_value.id[0..id_len], hook.id[0..id_len]);
         self.records[self.records_next] = record_value;
         self.records_next = (self.records_next + 1) % self.records.len;
         self.records_len = @min(self.records_len + 1, self.records.len);
@@ -692,12 +709,12 @@ pub const Runtime = struct {
     pub fn privatePath(self: *Runtime, allocator: std.mem.Allocator, extension: []const u8) ![]u8 {
         self.temp_mutex.lockUncancelable(self.io);
         defer self.temp_mutex.unlock(self.io);
-        var nonce: [16]u8 = undefined;
+        var nonce: [temp_nonce_bytes]u8 = undefined;
         self.io.random(&nonce);
         if (self.temp_dir == null) {
             const path = try std.fmt.allocPrint(self.allocator, "/tmp/synth-hooks-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
             errdefer self.allocator.free(path);
-            try std.Io.Dir.cwd().createDir(self.io, path, .fromMode(0o700));
+            try std.Io.Dir.cwd().createDir(self.io, path, private_directory_permissions);
             self.temp_dir = path;
             self.io.random(&nonce);
         }
@@ -706,16 +723,16 @@ pub const Runtime = struct {
     pub fn bound(self: *Runtime, allocator: std.mem.Allocator, result: *Result) !void {
         inline for (.{ "context", "message", "blocked", "feedback" }) |field| {
             if (@field(result, field)) |value| {
-                if (value.len > 8192) {
+                if (value.len > max_inline_output_bytes) {
                     const path = try self.privatePath(allocator, "txt");
                     defer allocator.free(path);
-                    const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+                    const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .exclusive = true, .permissions = private_file_permissions });
                     defer file.close(self.io);
-                    var buffer: [4096]u8 = undefined;
+                    var buffer: [output_file_buffer_bytes]u8 = undefined;
                     var writer = file.writer(self.io, &buffer);
                     try writer.interface.writeAll(value);
                     try writer.interface.flush();
-                    var preview_end: usize = 4096;
+                    var preview_end: usize = output_preview_bytes;
                     while (preview_end > 0 and value[preview_end] & 0xc0 == 0x80) preview_end -= 1;
                     const preview = try std.fmt.allocPrint(allocator, "{s}\n[Full hook output: {s}]", .{ value[0..preview_end], path });
                     allocator.free(value);
@@ -848,7 +865,7 @@ pub const Runner = struct {
         var at: usize = 0;
         var failure: FirstFailure = .{};
         const PendingJob = struct { index: usize, job: *Dispatch };
-        var buffer: [64]PendingJob = undefined;
+        var buffer: [pending_dispatch_capacity]PendingJob = undefined;
         var pending: std.Deque(PendingJob) = .initBuffer(&buffer);
         defer while (pending.popFront()) |entry| entry.job.destroy();
         var running: usize = 0;
@@ -887,7 +904,7 @@ pub const Runner = struct {
                 }
                 if (self.runtime) |runtime| try runtime.bound(allocator, &outcome);
             }
-            if (!progressed and running > 0) try std.Io.sleep(self.io, .fromMilliseconds(1), .awake);
+            if (!progressed and running > 0) try std.Io.sleep(self.io, .fromMilliseconds(dispatch_poll_ms), .awake);
         }
         if (failure.err) |err| {
             const strict = !invocation.event.observational() and invocation.event != .post_tool_use;
@@ -950,13 +967,13 @@ pub const Runner = struct {
         if (command.overflow) return error.HookOutputTooLarge;
         var result: Result = .{};
         errdefer result.deinit(allocator);
-        if (command.code == 126 or command.code == 127) return error.HookCommandUnavailable;
-        const exited_abnormally = command.code != 0 and command.code != 2;
+        if (command.code == not_executable_exit_code or command.code == command_not_found_exit_code) return error.HookCommandUnavailable;
+        const exited_abnormally = command.code != 0 and command.code != blocking_exit_code;
         if (exited_abnormally and hook.blocksOnFailure(invocation.event)) return error.HookCommandFailed;
         const advisory = invocation.event.observational();
-        if (command.code == 2 and advisory) {
-            result.message = try allocator.dupe(u8, "Observation hook exited 2; control effect ignored");
-        } else if (command.code == 2) {
+        if (command.code == blocking_exit_code and advisory) {
+            result.message = try allocator.dupe(u8, std.fmt.comptimePrint("Observation hook exited {d}; control effect ignored", .{blocking_exit_code}));
+        } else if (command.code == blocking_exit_code) {
             const reason = std.mem.trim(u8, command.stderr, " \t\r\n");
             result.blocked = try allocator.dupe(u8, if (reason.len > 0) reason else "blocked by hook");
         } else if (command.code == 0) {
@@ -1039,9 +1056,10 @@ pub const Runner = struct {
         var input_future = try self.io.concurrent(InputWrite.run, .{&input});
         defer input_future.cancel(self.io);
 
-        var buffers: std.Io.File.MultiReader.Buffer(2) = undefined;
+        const output_streams = [_]std.Io.File{ child.stderr.?, child.stdout.? };
+        var buffers: std.Io.File.MultiReader.Buffer(output_streams.len) = undefined;
         var readers: std.Io.File.MultiReader = undefined;
-        readers.init(allocator, self.io, buffers.toStreams(), &.{ child.stderr.?, child.stdout.? });
+        readers.init(allocator, self.io, buffers.toStreams(), &output_streams);
         defer readers.deinit();
 
         const stderr_reader = readers.reader(0);

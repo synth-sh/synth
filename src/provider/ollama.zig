@@ -223,6 +223,9 @@ pub fn startWithoutProbe(self: *OllamaProvider) !void {
 /// Cap on the complaint kept from a rejected request. Ollama's errors are one
 /// sentence; anything longer is a page of HTML from something in between.
 const max_rejection_bytes: usize = 2 * 1024;
+const transfer_buffer_bytes = 1024 * 1024;
+const gzip_buffer_bytes = 1024 * 1024;
+const max_error_body_bytes = 4 * 1024 * 1024;
 
 pub fn deinit(self: *OllamaProvider) void {
     if (self.rejection) |rejection| self.allocator.free(rejection);
@@ -610,11 +613,11 @@ fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest
     var redirect: [0]u8 = undefined;
     var response = try req.receiveHead(&redirect);
     const head = try http.response(a, response.head);
-    const transfer = try a.alloc(u8, 1024 * 1024);
+    const transfer = try a.alloc(u8, transfer_buffer_bytes);
     const decompress = try a.create(std.http.Decompress);
     const compressed: []u8 = switch (response.head.content_encoding) {
         .identity => &.{},
-        .deflate, .gzip => try a.alloc(u8, 1024 * 1024),
+        .deflate, .gzip => try a.alloc(u8, gzip_buffer_bytes),
         .zstd => try a.alloc(u8, std.compress.zstd.default_window_len),
         .compress => return error.UnsupportedCompressionMethod,
     };
@@ -622,7 +625,7 @@ fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest
     self.last_status = head.status;
     self.last_retry_after_ms = retry.retryAfterMs(head.get("retry-after"));
     if (head.status.class() != .success) {
-        const raw = reader.allocRemaining(a, .limited(4 * 1024 * 1024)) catch "";
+        const raw = reader.allocRemaining(a, .limited(max_error_body_bytes)) catch "";
         const why = (try http.payload(a, raw, false)).?;
         self.captureRejection(why);
         return error.HttpError;

@@ -18,6 +18,8 @@ const responses = @import("responses.zig");
 const anthropic = @import("messages.zig");
 
 const OpenAIProvider = @This();
+const api_version_path = "/v1";
+const max_messages_temperature: f32 = 1;
 
 pub const Wire = enum {
     chat,
@@ -28,7 +30,7 @@ pub const Wire = enum {
         return switch (self) {
             .chat => "/chat/completions",
             .responses => "/responses",
-            .messages => "/v1/messages",
+            .messages => api_version_path ++ "/messages",
         };
     }
 };
@@ -423,14 +425,14 @@ fn isChatModel(id: []const u8) bool {
 /// the reason a request 404s.
 fn endpoint(self: *const OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     const base = std.mem.trimEnd(u8, self.host, "/");
-    if (self.versioned_paths and std.mem.startsWith(u8, path, "/v1/")) {
-        const root = if (std.mem.endsWith(u8, base, "/v1")) base[0 .. base.len - 3] else base;
+    if (self.versioned_paths and std.mem.startsWith(u8, path, api_version_path ++ "/")) {
+        const root = if (std.mem.endsWith(u8, base, api_version_path)) base[0 .. base.len - api_version_path.len] else base;
         return std.fmt.allocPrint(arena, "{s}{s}", .{ root, path });
     }
-    if (!self.versioned_paths or std.mem.endsWith(u8, base, "/v1")) {
+    if (!self.versioned_paths or std.mem.endsWith(u8, base, api_version_path)) {
         return std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });
     }
-    return std.fmt.allocPrint(arena, "{s}/v1{s}", .{ base, path });
+    return std.fmt.allocPrint(arena, "{s}" ++ api_version_path ++ "{s}", .{ base, path });
 }
 
 /// The headers every request carries. `authorization` is a standard header the
@@ -887,7 +889,7 @@ fn buildRequest(
 ) ![]u8 {
     if (self.wire == .chat and turn.settings.top_k != null) return error.UnsupportedModelSettings;
     if (self.wire == .responses and (turn.settings.top_k != null or turn.settings.seed != null or turn.settings.frequency_penalty != null or turn.settings.presence_penalty != null or turn.settings.stop != null)) return error.UnsupportedModelSettings;
-    if (self.wire == .messages and (turn.settings.reasoning_effort != null or turn.settings.seed != null or turn.settings.frequency_penalty != null or turn.settings.presence_penalty != null or (turn.settings.temperature orelse 0) > 1)) return error.UnsupportedModelSettings;
+    if (self.wire == .messages and (turn.settings.reasoning_effort != null or turn.settings.seed != null or turn.settings.frequency_penalty != null or turn.settings.presence_penalty != null or (turn.settings.temperature orelse 0) > max_messages_temperature)) return error.UnsupportedModelSettings;
     switch (self.wire) {
         .responses => return responses.buildRequest(.{
             .effort = turn.settings.reasoning_effort orelse "",
@@ -901,7 +903,7 @@ fn buildRequest(
             .model = self.model,
             .context_limit = self.context_limit,
             .vision = self.supports_vision,
-            .max_output_tokens = turn.settings.max_output_tokens orelse if (self.max_output_tokens > 0) self.max_output_tokens else 4096,
+            .max_output_tokens = turn.settings.max_output_tokens orelse if (self.max_output_tokens > 0) self.max_output_tokens else anthropic.default_max_output_tokens,
         }, arena, convo, turn),
         .chat => {},
     }

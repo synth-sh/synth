@@ -1,19 +1,27 @@
 const std = @import("std");
 
+const max_interpolation_depth = 64;
+const reference_start = "${";
+const reference_end = '}';
+
 pub fn expand(arena: std.mem.Allocator, value: std.json.Value, input: std.json.Value) !std.json.Value {
     return expandDepth(arena, value, input, 0);
 }
 fn expandDepth(arena: std.mem.Allocator, value: std.json.Value, input: std.json.Value, depth: usize) anyerror!std.json.Value {
-    if (depth > 64) return error.HookInterpolationTooDeep;
+    if (depth > max_interpolation_depth) return error.HookInterpolationTooDeep;
     switch (value) {
         .string => |source| {
-            if (std.mem.startsWith(u8, source, "${") and std.mem.endsWith(u8, source, "}") and std.mem.indexOf(u8, source[2 .. source.len - 1], "}") == null) return lookup(input, source[2 .. source.len - 1]);
+            if (std.mem.startsWith(u8, source, reference_start) and source[source.len - 1] == reference_end) {
+                const field_path = source[reference_start.len .. source.len - 1];
+                if (std.mem.indexOfScalar(u8, field_path, reference_end) == null) return lookup(input, field_path);
+            }
             var writer: std.Io.Writer.Allocating = .init(arena);
             var at: usize = 0;
-            while (std.mem.indexOfPos(u8, source, at, "${")) |start| {
+            while (std.mem.indexOfPos(u8, source, at, reference_start)) |start| {
                 try writer.writer.writeAll(source[at..start]);
-                const end = std.mem.indexOfScalarPos(u8, source, start + 2, '}') orelse return error.InvalidHookInterpolation;
-                const field = try lookup(input, source[start + 2 .. end]);
+                const field_start = start + reference_start.len;
+                const end = std.mem.indexOfScalarPos(u8, source, field_start, reference_end) orelse return error.InvalidHookInterpolation;
+                const field = try lookup(input, source[field_start..end]);
                 if (field == .string) try writer.writer.writeAll(field.string) else try std.json.Stringify.value(field, .{}, &writer.writer);
                 at = end + 1;
             }

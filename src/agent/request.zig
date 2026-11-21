@@ -9,6 +9,7 @@ const tool = @import("../tools/tool.zig");
 
 const Request = @This();
 const Preparation = @import("request_prepare.zig");
+const display_id_bytes = 64;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -31,7 +32,7 @@ display_pending: std.ArrayList(u8) = .empty,
 display_index: usize = 0,
 display_bytes: usize = 0,
 display_failed: bool = false,
-display_id: [64]u8 = @splat(0),
+display_id: [display_id_bytes]u8 = @splat(0),
 display_id_len: usize = 0,
 
 future: std.Io.Future(void) = undefined,

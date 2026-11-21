@@ -4,6 +4,8 @@ const skills = @import("skill.zig");
 
 const Watch = @This();
 
+const poll_interval_ms: i64 = std.time.ms_per_s;
+
 const Stamp = struct { inode: std.Io.File.INode, size: u64, modified: i128 };
 const Entry = struct {
     path: []const u8,
@@ -89,7 +91,7 @@ fn stamp(io: std.Io, path: []const u8) !?Stamp {
 pub fn poll(self: *Watch, io: std.Io, force: bool) !void {
     if (self.entries.items.len == 0) return;
     const now = std.Io.Clock.now(.awake, io).toMilliseconds();
-    if (!force) if (self.last_poll_ms) |previous| if (now - previous < 1000) return;
+    if (!force) if (self.last_poll_ms) |previous| if (now - previous < poll_interval_ms) return;
     self.last_poll_ms = now;
     for (self.entries.items) |*entry| {
         const current = try stamp(io, entry.path);

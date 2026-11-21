@@ -16,6 +16,7 @@ const OpenAIProvider = @import("openai.zig");
 const Provider = @import("provider.zig");
 
 const Backend = @This();
+const stream_options_key_bytes = std.crypto.hash.sha2.Sha256.digest_length;
 
 /// What a client is built from. Kept so a switch to another protocol can build
 /// its replacement with the same settings.
@@ -43,10 +44,10 @@ pub const Options = struct {
 
 options: Options,
 client: Client,
-unsupported_stream_options: std.ArrayList([32]u8) = .empty,
+unsupported_stream_options: std.ArrayList([stream_options_key_bytes]u8) = .empty,
 transport_mutex: std.Io.Mutex = .init,
 
-fn streamOptionsKey(client: *const OpenAIProvider) [32]u8 {
+fn streamOptionsKey(client: *const OpenAIProvider) [stream_options_key_bytes]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(std.mem.asBytes(&client.host.len));
     hash.update(client.host);
@@ -54,7 +55,7 @@ fn streamOptionsKey(client: *const OpenAIProvider) [32]u8 {
     return hash.finalResult();
 }
 
-fn lacksStreamOptions(self: *const Backend, key: [32]u8) bool {
+fn lacksStreamOptions(self: *const Backend, key: [stream_options_key_bytes]u8) bool {
     for (self.unsupported_stream_options.items) |known| {
         if (std.mem.eql(u8, &known, &key)) return true;
     }
