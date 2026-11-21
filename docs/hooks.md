@@ -5,8 +5,9 @@ Hooks run shell commands or MCP tools at session events. See the
 
 ## Set up your first hook
 
-1. Add this macOS notification hook to `.synth/hooks.json` in your project.
-   Keep any existing event groups.
+1. Add this macOS notification hook to `.synth/hooks.json` for the current
+   project or `~/.synth/hooks.json` for all projects. Keep any existing event
+   groups.
 
    ```json
    {

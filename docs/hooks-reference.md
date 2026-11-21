@@ -166,11 +166,11 @@ optional `matcher` and `when` fields. See a
 
 Synth appends definitions in this order.
 
-| Order | Location | Shape |
-| --- | --- | --- |
-| 1 | [Synth's `config.json`](configuration.md#files) | Event map inside the `hooks` setting. |
-| 2 | `~/.synth/hooks.json` | Event map or `{"hooks": {...}, "description": "..."}`. |
-| 3 | `<project>/.synth/hooks.json` | Same standalone formats, relative to the original project root. |
+| Order | Location | Scope | Shape |
+| --- | --- | --- | --- |
+| 1 | [Synth's `config.json`](configuration.md#files) | Wherever Synth loads this config | Event map inside the `hooks` setting. |
+| 2 | `~/.synth/hooks.json` | All projects | Event map or `{"hooks": {...}, "description": "..."}`. |
+| 3 | `<project>/.synth/hooks.json` | One project | Same standalone formats, relative to the original project root. |
 
 Unknown event names and handler fields produce warnings. Wrap a flat handler
 such as `{"command": "..."}` in a group as `{"hooks": [{"command": "..."}]}`.

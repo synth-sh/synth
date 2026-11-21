@@ -148,9 +148,13 @@ something `config.json` has to ask for.
 ## Models by request purpose
 
 Use `model_requests` to choose a model for `agent`, `approval_judge`, or
-`compaction` requests. This example runs automatic approval review against
-a separate local Ollama model. Replace `qwen3` with a model installed on
-your server.
+`compaction` requests. By default, a purpose without a route uses the
+provider and model selected in `/model`.
+
+To use a ChatGPT plan or GitHub Copilot model for agent turns and Ollama
+for approvals, select your hosted model in `/model` and add this to your
+user `config.json`. Replace `qwen3` with a model installed on your Ollama
+server.
 
 ```json
 {
@@ -178,8 +182,25 @@ your server.
 
 Each route needs an `id`, `provider` (`openai` or `ollama`), HTTP(S)
 `endpoint`, and `model`. For `openai`, set `protocol` to `chat` (default),
-`responses`, or `messages`. Supply an explicit `api_key` if required.
-Only the route's configured key is sent to its endpoint.
+`responses`, or `messages`. A named route opens its own connection, so its
+endpoint and credentials come from the route. Supply an explicit `api_key`
+if the route needs one.
+
+To pin agent turns to the OpenAI API, add this entry to `model_requests.routes`
+and set `model_requests.agent` to `"cloud-agent"`. Use a model ID and key
+from your API account.
+
+```json
+{
+  "id": "cloud-agent",
+  "provider": "openai",
+  "protocol": "responses",
+  "endpoint": "https://api.openai.com/v1",
+  "model": "YOUR_OPENAI_MODEL_ID",
+  "api_key": "YOUR_OPENAI_API_KEY",
+  "purposes": ["agent"]
+}
+```
 
 Use `purposes` to restrict which requests can use a route and `settings`
 to set supported generation controls such as `max_output_tokens`. Set
