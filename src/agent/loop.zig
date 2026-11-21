@@ -522,41 +522,40 @@ fn restoreModel(self: *Loop, session_id: i64) !void {
     try self.adoptModel(now);
 }
 
-pub const ModelSwitch = struct {
-    requested_model: []const u8,
-    source: Hooks.ModelSwitchSource,
-};
-
-pub fn beginModelSwitch(self: *Loop, model: []const u8, source: Hooks.ModelSwitchSource) !ModelSwitch {
+pub fn beginModelSwitch(self: *Loop, model: []const u8, source: Hooks.ModelSwitchSource) !bool {
     if (self.model_policy.restrict_routes) return error.ModelRouteDenied;
     if (self.isBusy()) return error.Busy;
     try self.trackModel(.initial);
-    if (self.hooks) |runner| {
-        var result = try runner.evaluate(self.allocator, try self.exportHookInput(.{ .event = .pre_model_switch, .from_model = self.provider.model, .to_model = model, .requested_model = model, .source = @tagName(source) }));
-        defer result.deinit(self.allocator);
-        if (result.blocked != null or result.stop) {
-            self.say("Model switch blocked: {s}", .{result.blocked orelse HooksCopy.stopped});
-            return error.HookBlocked;
-        }
-        try self.acceptHookResult(&result);
-    }
-    return .{ .requested_model = model, .source = source };
+    return self.startHook(.{ .event = .pre_model_switch, .from_model = self.provider.model, .to_model = model, .requested_model = model, .source = @tagName(source) }, .model_switch);
 }
 
-pub fn commitModelSwitch(self: *Loop, change: ModelSwitch) !void {
+pub fn pollModelSwitch(self: *Loop) !bool {
+    if (self.state == .cancelling) return false;
+    const dispatch = self.hook_flow.dispatch orelse return error.Canceled;
+    if (self.hook_flow.pending != .model_switch) return error.Canceled;
+    if (!dispatch.isFinished()) return false;
+    dispatch.join();
+    self.hook_flow.dispatch = null;
+    self.state = .idle;
+    defer dispatch.destroy();
+    if (dispatch.failed) |err| return err;
+    if (dispatch.result.blocked != null or dispatch.result.stop) {
+        self.say("Model switch blocked: {s}", .{dispatch.result.blocked orelse HooksCopy.stopped});
+        return error.HookBlocked;
+    }
+    try self.acceptHookResult(&dispatch.result);
+    return true;
+}
+
+pub fn commitModelSwitch(self: *Loop, model: []const u8, source: Hooks.ModelSwitchSource) !void {
     const set = self.provider.set_model orelse return error.ModelFixed;
-    const now = try set(self.provider.userdata, change.requested_model);
+    const now = try set(self.provider.userdata, model);
     self.provider.model = now.model;
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
     self.provider.vision = now.vision;
     try self.setModel(now.model);
-    try self.trackModel(change.source);
-}
-
-pub fn switchModel(self: *Loop, model: []const u8) !void {
-    const change = try self.beginModelSwitch(model, .command);
-    try self.commitModelSwitch(change);
+    try self.trackModel(source);
 }
 
 pub fn workingDirectory(self: *const Loop) []const u8 {
@@ -1256,6 +1255,7 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch, next: HookFlow.Resume) 
 }
 
 fn pollHooks(self: *Loop) !bool {
+    if (self.hook_flow.pending == .model_switch) return false;
     const dispatch = self.hook_flow.dispatch orelse return false;
     if (!dispatch.isFinished()) return false;
     dispatch.join();
@@ -1263,6 +1263,7 @@ fn pollHooks(self: *Loop) !bool {
     defer dispatch.destroy();
 
     switch (self.hook_flow.pending) {
+        .model_switch => unreachable,
         .lifecycle => |next| return self.pollLifecycle(dispatch, next),
         .owner_post => |index| return self.pollOwnerHooks(dispatch, index),
         .prompt, .expansion => {

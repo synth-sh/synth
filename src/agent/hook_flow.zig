@@ -25,6 +25,7 @@ pub const Pending = union(enum) {
     prompt,
     steering,
     expansion,
+    model_switch,
     owner_post: usize,
     policy: usize,
     lifecycle: Resume,
