@@ -134,7 +134,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     var hook_store = try HookStore.Store.init(allocator, io, config.hook_state_path);
     defer hook_store.deinit();
     const discovered_hooks = try HookStore.discover(self.arena.allocator(), io, config.hooks, self.project.root, options.home, hook_store);
-    self.hook_runtime = .{ .allocator = allocator, .io = io };
+    self.hook_runtime = .{ .allocator = allocator, .io = io, .temp_root = config.temp_root };
     errdefer self.hook_runtime.deinit();
     self.hooks = .{
         .io = io,
@@ -317,6 +317,7 @@ pub fn destroy(self: *Stack) void {
 
 test "a stack assembles a loop ready for its first turn" {
     const testing = std.testing;
+    const a = testing.allocator;
     const io = testing.io;
 
     var tmp = testing.tmpDir(.{});
@@ -324,7 +325,15 @@ test "a stack assembles a loop ready for its first turn" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
 
-    var config: Config = .{ .arena = .init(testing.allocator) };
+    try tmp.dir.createDirPath(io, "temp");
+    const temp_root = try std.fs.path.join(a, &.{ cwd, "temp" });
+    defer a.free(temp_root);
+    const config_path = try std.fs.path.join(a, &.{ cwd, "config.json" });
+    defer a.free(config_path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    try env.put("TMPDIR", temp_root);
+    var config = try Config.load(a, io, &env, config_path, ":memory:");
     defer config.arena.deinit();
     var backend: Backend = .init(.ollama, .{
         .allocator = testing.allocator,
@@ -342,6 +351,9 @@ test "a stack assembles a loop ready for its first turn" {
     try testing.expectEqualStrings(agents.default_id, stack.loop.agent.id);
     try testing.expect(stack.registry.get("read") != null);
     try testing.expect(stack.loop.delegate != null);
+    const snapshot = try stack.hook_runtime.privatePath(a, "jsonl");
+    defer a.free(snapshot);
+    try testing.expectEqualStrings(temp_root, std.fs.path.dirname(std.fs.path.dirname(snapshot).?).?);
 }
 
 test "trusted current config policy blocks replacement definitions before adoption" {

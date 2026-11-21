@@ -11,6 +11,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const bell = @import("bell.zig");
+const paths = @import("../core/paths.zig");
 
 /// Ceiling on what comes back, so a stray `$EDITOR` pointed at something huge
 /// cannot be pasted into a prompt whole.
@@ -34,7 +35,7 @@ pub fn edit(
 ) ![]u8 {
     const command = editorFor(environ) orelse return Error.NoEditor;
 
-    var dir = try std.Io.Dir.openDirAbsolute(io, tempRoot(environ), .{});
+    var dir = try std.Io.Dir.openDirAbsolute(io, paths.tempRoot(environ), .{});
     defer dir.close(io);
 
     var name_buffer: [draft_name_bytes]u8 = undefined;
@@ -93,13 +94,6 @@ fn editorFor(environ: *std.process.Environ.Map) ?[]const u8 {
         if (value.len > 0) return value;
     }
     return null;
-}
-
-fn tempRoot(environ: *std.process.Environ.Map) []const u8 {
-    if (environ.get("TMPDIR")) |value| {
-        if (value.len > 0) return std.mem.trimEnd(u8, value, "/");
-    }
-    return "/tmp";
 }
 
 /// Run the editor through a shell, so `EDITOR="code -w"` and the like work.
@@ -241,8 +235,8 @@ test "a temp root comes from TMPDIR when it is set" {
     var environ: std.process.Environ.Map = .init(testing.allocator);
     defer environ.deinit();
 
-    try testing.expectEqualStrings("/tmp", tempRoot(&environ));
+    try testing.expectEqualStrings("/tmp", paths.tempRoot(&environ));
 
     try environ.put("TMPDIR", "/run/user/1000/");
-    try testing.expectEqualStrings("/run/user/1000", tempRoot(&environ));
+    try testing.expectEqualStrings("/run/user/1000", paths.tempRoot(&environ));
 }

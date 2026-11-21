@@ -7,6 +7,7 @@ const HookCommand = @import("hook_command.zig");
 const regex = @import("regex.zig");
 const ansi = @import("ansi.zig");
 const ModelClass = @import("model_class.zig");
+const paths = @import("paths.zig");
 const mcp = @import("../tools/mcp.zig");
 const shell = @import("../tools/shell.zig");
 const task = @import("../tools/task.zig");
@@ -535,6 +536,7 @@ pub const Record = struct {
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    temp_root: []const u8 = paths.default_temp_root,
     active: std.atomic.Value(usize) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
     background: std.ArrayList(*Dispatch) = .empty,
@@ -714,7 +716,9 @@ pub const Runtime = struct {
         var nonce: [temp_nonce_bytes]u8 = undefined;
         self.io.random(&nonce);
         if (self.temp_dir == null) {
-            const path = try std.fmt.allocPrint(self.allocator, "/tmp/synth-hooks-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+            const name = try std.fmt.allocPrint(self.allocator, "synth-hooks-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+            defer self.allocator.free(name);
+            const path = try std.fs.path.join(self.allocator, &.{ self.temp_root, name });
             errdefer self.allocator.free(path);
             try std.Io.Dir.cwd().createDir(self.io, path, private_directory_permissions);
             self.temp_dir = path;

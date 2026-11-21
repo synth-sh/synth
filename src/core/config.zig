@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const pkg = @import("pkg");
 const Hooks = @import("hooks.zig");
 const Database = @import("database.zig");
+const paths = @import("paths.zig");
 
 pub const ModelPolicy = @import("model_policy.zig");
 const ModelClass = @import("model_class.zig");
@@ -144,6 +145,7 @@ mcp: ?std.json.Value = null,
 hooks: Hooks.Set = .{},
 hook_state_path: ?[]const u8 = null,
 hook_timeout_ms: u64 = Hooks.default_timeout_ms,
+temp_root: []const u8 = paths.default_temp_root,
 /// What a startup prune is allowed to throw away.
 prune: Database.Policy = .{ .shed_after_days = 30 },
 /// When a finished turn rings the terminal bell.
@@ -277,6 +279,7 @@ pub fn load(
     try self.applyFile(io, self.path);
     try self.applyEnv(env);
     self.hook_state_path = privateDataPath(self.arena.allocator(), env, "hook-trust.json") catch null;
+    self.temp_root = try self.arena.allocator().dupe(u8, paths.tempRoot(env));
 
     return self;
 }

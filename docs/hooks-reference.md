@@ -230,6 +230,9 @@ matching examples.
 | `async` | With `true`, run a command in the background where supported. |
 | `stream` | With `true` on `HttpResponse`, also handle decoded stream records. |
 
+Synth stores snapshots and large hook output in a private directory under
+`$TMPDIR` when it is an absolute path. The fallback is `/tmp`.
+
 #### MCP tool hook fields
 
 Set `server` and `tool` to a connected server and its advertised tool name.

@@ -1,6 +1,14 @@
 const std = @import("std");
 
 pub const synth_config_dir = ".synth";
+pub const default_temp_root = "/tmp";
+
+pub fn tempRoot(environ: *const std.process.Environ.Map) []const u8 {
+    const path = environ.get("TMPDIR") orelse return default_temp_root;
+    if (!std.fs.path.isAbsolute(path)) return default_temp_root;
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    return if (trimmed.len == 0) path[0..1] else trimmed;
+}
 
 pub fn resolve(io: std.Io, a: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]const u8 {
     const lexical = try std.fs.path.resolve(a, &.{ cwd, path });
