@@ -5,6 +5,7 @@ pub const Result = @import("hook_result.zig").Result;
 const output = @import("hook_result.zig");
 const regex = @import("regex.zig");
 const ansi = @import("ansi.zig");
+const ModelClass = @import("model_class.zig");
 
 const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
@@ -154,8 +155,12 @@ pub const When = struct {
     agent_type: ?[]const u8 = null,
     model: ?[]const u8 = null,
     provider: ?[]const u8 = null,
+    trust: ?ModelClass.Choice(ModelClass.Trust) = null,
+    tier: ?ModelClass.Choice(ModelClass.Tier) = null,
 
     pub fn accepts(self: When, input: Invocation) bool {
+        if (self.trust) |choice| if (!choice.has(input.model_trust)) return false;
+        if (self.tier) |choice| if (!choice.has(input.model_tier)) return false;
         if (self.agent_scope) |value| if (value != input.agent_scope) return false;
         if (self.request_purpose) |value| if (value != input.request_purpose) return false;
         inline for (.{ "agent_type", "model", "provider" }) |field| {
@@ -169,6 +174,8 @@ fn parseWhen(allocator: std.mem.Allocator, value: std.json.Value) !When {
     if (value != .object or value.object.count() == 0) return error.InvalidHookFilter;
     var fields = value.object.iterator();
     while (fields.next()) |field| {
+        const is_class = std.mem.eql(u8, field.key_ptr.*, "trust") or std.mem.eql(u8, field.key_ptr.*, "tier");
+        if (is_class and field.value_ptr.* == .array) continue;
         if (field.value_ptr.* != .string or field.value_ptr.string.len == 0) return error.InvalidHookFilter;
     }
     return std.json.parseFromValueLeaky(When, allocator, value, .{}) catch |err| switch (err) {
@@ -422,6 +429,8 @@ pub const Invocation = struct {
     agent_scope: AgentScope = .main,
     request_purpose: RequestPurpose = .agent,
     provider: []const u8 = "",
+    model_trust: []const u8 = "",
+    model_tier: []const u8 = "",
     parent_agent_id: []const u8 = "",
     parent_tool_call_id: []const u8 = "",
     cwd: ?[]const u8 = null,
@@ -756,6 +765,7 @@ pub const Runner = struct {
     deadline_ms: ?i64 = null,
     mcp_executor: ?McpExecutor = null,
     rewrite_author: ?usize = null,
+    classes: []const ModelClass.Class = &.{},
 
     /// Raised when the turn is cancelled. Checked between hooks and on every
     /// slice of the wait for one, so a cancel lands without needing the signal
@@ -772,7 +782,16 @@ pub const Runner = struct {
         return flag.load(.acquire);
     }
 
-    pub fn hasMatching(self: Runner, allocator: std.mem.Allocator, invocation: Invocation, require_trust: bool) bool {
+    pub fn classified(self: Runner, invocation: Invocation) Invocation {
+        const class = ModelClass.resolve(self.classes, invocation.provider, invocation.model);
+        var result = invocation;
+        result.model_trust = @tagName(class.trust);
+        result.model_tier = @tagName(class.tier);
+        return result;
+    }
+
+    pub fn hasMatching(self: Runner, allocator: std.mem.Allocator, raw: Invocation, require_trust: bool) bool {
+        const invocation = self.classified(raw);
         for (self.set.forEvent(invocation.event)) |hook| {
             if (!hook.enabled or (require_trust and !hook.trusted)) continue;
             if (hookMatches(allocator, self.root, hook, invocation) catch false) return true;
@@ -780,7 +799,8 @@ pub const Runner = struct {
         return false;
     }
 
-    pub fn observe(self: Runner, invocation: Invocation) !void {
+    pub fn observe(self: Runner, raw: Invocation) !void {
+        const invocation = self.classified(raw);
         if (!invocation.event.observational()) return error.InvalidHookEvent;
         const runtime = self.runtime orelse return;
         for (self.set.forEvent(invocation.event)) |hook| {
@@ -820,7 +840,8 @@ pub const Runner = struct {
         return matched;
     }
 
-    pub fn evaluate(self: Runner, allocator: std.mem.Allocator, invocation: Invocation) !Result {
+    pub fn evaluate(self: Runner, allocator: std.mem.Allocator, raw: Invocation) !Result {
+        const invocation = self.classified(raw);
         var outcome: Result = .{};
         errdefer outcome.deinit(allocator);
         const definitions = self.set.forEvent(invocation.event);
@@ -1272,17 +1293,17 @@ fn writeJson(
     try json.objectField("cwd");
     try json.write(invocation.cwd orelse root);
     inline for (.{
-        "agent_scope",       "request_purpose",        "request_system",      "request_instruction", "request_tools",   "request_routes",
-        "permission_effect", "action",                 "http",                "route",               "request_context", "request_settings",
-        "provider",          "parent_agent_id",        "parent_tool_call_id", "old_cwd",             "new_cwd",         "directory",
-        "session_id",        "tool_call_id",           "agent_id",            "agent_type",          "model",           "permission_mode",
-        "source",            "trigger",                "status",              "error_type",          "error_message",   "parent_session_id",
-        "reason",            "notification_type",      "message",             "title",               "file_path",       "event_type",
-        "load_reason",       "memory_type",            "from_model",          "to_model",            "task_id",         "task_subject",
-        "task_description",  "command_name",           "command_args",        "expanded_prompt",     "message_id",      "delta",
-        "requested_model",   "last_assistant_message", "http_status",         "retry_delay_ms",      "retry_allowed",   "request_id",
-        "attempt",           "transcript_path",        "stop_hook_active",    "input_tokens",        "output_tokens",   "is_interrupt",
-        "duration_ms",       "index",                  "final",
+        "agent_scope",       "request_purpose",   "request_system",      "request_instruction",    "request_tools",    "request_routes",
+        "permission_effect", "action",            "http",                "route",                  "request_context",  "request_settings",
+        "provider",          "parent_agent_id",   "parent_tool_call_id", "old_cwd",                "new_cwd",          "directory",
+        "session_id",        "tool_call_id",      "agent_id",            "agent_type",             "model",            "model_trust",
+        "model_tier",        "permission_mode",   "source",              "trigger",                "status",           "error_type",
+        "error_message",     "parent_session_id", "reason",              "notification_type",      "message",          "title",
+        "file_path",         "event_type",        "load_reason",         "memory_type",            "from_model",       "to_model",
+        "task_id",           "task_subject",      "task_description",    "command_name",           "command_args",     "expanded_prompt",
+        "message_id",        "delta",             "requested_model",     "last_assistant_message", "http_status",      "retry_delay_ms",
+        "retry_allowed",     "request_id",        "attempt",             "transcript_path",        "stop_hook_active", "input_tokens",
+        "output_tokens",     "is_interrupt",      "duration_ms",         "index",                  "final",
     }) |field| {
         try json.objectField(field);
         try json.write(@field(invocation, field));
@@ -1591,4 +1612,30 @@ test "a flat hook definition from the old format says how to group it" {
     try std.testing.expectError(error.FlatHookFormatNeedsGrouping, parse(a, parsed, "hooks.json"));
     const mixed = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"hooks\":{},\"extra\":1}", .{});
     try std.testing.expectError(error.InvalidHooks, parse(a, mixed, "hooks.json"));
+}
+
+test "when filters on the declared class of the model and reaches the hook input" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const source =
+        \\{"PreToolUse":[{"when":{"trust":["local","private"],"tier":"small"},"hooks":[{"command":"cat > payload; printf '{\"decision\":\"block\",\"reason\":\"small local model\"}'"}]}]}
+    ;
+    const set = try parse(a, try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{}), "hooks.json");
+    const classes = [_]ModelClass.Class{
+        .{ .model = "qwen3:27b", .trust = .local, .tier = .small },
+        .{ .model = "astra", .trust = .hosted, .tier = .frontier },
+    };
+    const runner: Runner = .{ .io = std.testing.io, .root = root, .set = set, .classes = &classes };
+    var local = try runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash", .model = "qwen3:27b" });
+    defer local.deinit(a);
+    try std.testing.expect(local.blocked != null);
+    var frontier = try runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "bash", .model = "astra" });
+    defer frontier.deinit(a);
+    try std.testing.expect(frontier.blocked == null);
+    const payload = try tmp.dir.readFileAlloc(std.testing.io, "payload", a, .limited(1 << 16));
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"model_trust\":\"local\"") != null);
 }

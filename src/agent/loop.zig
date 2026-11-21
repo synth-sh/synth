@@ -998,6 +998,7 @@ fn hasContextHook(self: *const Loop, request_turn: Provider.Turn) bool {
     var input = request_turn.hook_input;
     input.model = self.provider.model;
     input.provider = self.provider.name;
+    input = runner.classified(input);
     const may_route = self.hasModelRoute(input);
     for (runner.set.model_context) |hook| {
         if (!hook.enabled) continue;

@@ -73,7 +73,25 @@ preserve the JSON type. Session shutdown supports command handlers only.
 
 Add `when` beside `matcher` to filter by `agent_scope` (`main`, `subagent`),
 `request_purpose` (`agent`, `approval_judge`, `compaction`), `agent_type`,
-`model`, or `provider`. All filters must match.
+`model`, `provider`, `trust` or `tier`. All filters must match.
+
+`trust` and `tier` describe the model, and you declare them in `config.json`
+(a model you don't list is `hosted` and `small`):
+
+```json
+{
+  "model_classes": [
+    { "model": "qwen3:27b", "trust": "local", "tier": "small" },
+    { "model": "astra", "trust": "hosted", "tier": "frontier" }
+  ]
+}
+```
+
+`trust` is `local`, `private` (your own server) or `hosted`. `tier` is
+`small`, `mid` or `frontier`. A filter takes one value or a list, so a hook
+can guard only small or local models: `"when": {"tier": ["small", "mid"]}`.
+Every hook input carries `model_trust` and `model_tier`, and `/hooks list`
+prints each hook's `when`.
 
 ## Events
 

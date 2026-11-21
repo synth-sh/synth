@@ -9,6 +9,7 @@ const Hooks = @import("hooks.zig");
 const Database = @import("database.zig");
 
 pub const ModelPolicy = @import("model_policy.zig");
+const ModelClass = @import("model_class.zig");
 
 const Config = @This();
 
@@ -115,6 +116,7 @@ auto_approve_safe_commands: bool = true,
 /// Who decides a call that would otherwise stop for approval.
 approvals: Approvals = .ask,
 model_requests: ModelPolicy.Policy = .{},
+model_classes: []const ModelClass.Class = &.{},
 /// How long one turn may run, and what it may spend, before the loop gives up
 /// on it. Zero turns either off. Null means the built-in default: what a
 /// runaway turn costs is the loop's business, not this file's.
@@ -172,6 +174,7 @@ const File = struct {
     auto_approve_safe_commands: ?bool = null,
     approvals: ?Approvals = null,
     model_requests: ?std.json.Value = null,
+    model_classes: ?[]const ModelClass.Class = null,
     debug_log: ?[]const u8 = null,
     max_turn_ms: ?i64 = null,
     max_turn_tokens: ?u64 = null,
@@ -305,6 +308,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
         self.model_requests = try std.json.parseFromValueLeaky(ModelPolicy.Policy, arena, value, .{});
         try self.model_requests.validate();
     }
+    if (parsed.model_classes) |value| self.model_classes = value;
     if (parsed.hooks) |value| self.hooks = try Hooks.parse(arena, value, path);
     if (parsed.hook_timeout_ms) |value| {
         try Hooks.validTimeout(value);

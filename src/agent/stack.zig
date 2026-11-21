@@ -138,6 +138,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         .runtime = &self.hook_runtime,
         .mcp_executor = .{ .userdata = self, .call = callHookMcp },
         .timeout_ms = config.hook_timeout_ms,
+        .classes = config.model_classes,
     };
     self.loop.hooks = &self.hooks;
     self.loop.hook_flow.reload = .{ .userdata = self, .call = reloadHooks };

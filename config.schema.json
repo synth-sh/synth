@@ -290,6 +290,21 @@
             "default": "Co-Authored-By: synth <noreply@getsynth.sh>",
             "description": "The trailer the model is asked to end its commit messages with, in a git project. An empty string asks for none."
         },
+        "model_classes": {
+            "type": "array",
+            "description": "What you say about each model: where it runs (trust) and how capable it is (tier). Hooks can filter on both. A model not listed here is hosted and small.",
+            "items": {
+                "type": "object",
+                "required": ["model"],
+                "additionalProperties": false,
+                "properties": {
+                    "model": { "type": "string", "minLength": 1 },
+                    "provider": { "type": "string", "minLength": 1 },
+                    "trust": { "$ref": "#/$defs/modelTrust" },
+                    "tier": { "$ref": "#/$defs/modelTier" }
+                }
+            }
+        },
         "model_requests": {
             "type": "object",
             "additionalProperties": false,
@@ -525,6 +540,8 @@
                 }
             }
         },
+        "modelTrust": { "enum": ["local", "private", "hosted"] },
+        "modelTier": { "enum": ["small", "mid", "frontier"] },
         "hookWhen": {
             "type": "object",
             "minProperties": 1,
@@ -554,6 +571,18 @@
                 "provider": {
                     "type": "string",
                     "minLength": 1
+                },
+                "trust": {
+                    "oneOf": [
+                        { "$ref": "#/$defs/modelTrust" },
+                        { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/modelTrust" } }
+                    ]
+                },
+                "tier": {
+                    "oneOf": [
+                        { "$ref": "#/$defs/modelTier" },
+                        { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/modelTier" } }
+                    ]
                 }
             },
             "description": "All specified fields must match the harness metadata exactly. Omitted fields match every value."
