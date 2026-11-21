@@ -124,12 +124,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     try out.print("{s}▸ you{s} {s}\n", .{ bold, reset, prompt });
     try out.flush();
 
-    loop.submit(prompt, .{}) catch |err| {
-        if (err != error.HooksNeedReview) return err;
-        try out.print("{s}\n", .{Hooks.review_notice});
-        try out.flush();
-        return error.HookRejected;
-    };
+    try loop.submit(prompt, .{});
 
     var printed: usize = 0;
     while (loop.isBusy() or runner.busy()) {

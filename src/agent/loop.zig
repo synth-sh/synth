@@ -1044,7 +1044,6 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     self.hook_flow.notice = null;
 
     if (self.hook_flow.reload) |reload| try reload.call(reload.userdata);
-    try self.checkHookTrust();
     if (!self.hook_flow.session_started) {
         self.hook_flow.session_started = true;
         errdefer self.hook_flow.session_started = false;
@@ -1055,10 +1054,6 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
         }, .{ .lifecycle = .begin_prompt }, prompt, extras)) return;
     }
     try self.submitPrompt(prompt, extras);
-}
-
-fn checkHookTrust(self: *const Loop) !void {
-    if (self.hooks) |runner| if (runner.set.hasUntrusted()) return error.HooksNeedReview;
 }
 
 fn submitPrompt(self: *Loop, prompt: []const u8, extras: Extras) !void {
@@ -1589,7 +1584,6 @@ fn applySteering(self: *Loop) !void {
 pub fn steer(self: *Loop, text: []const u8, extras: Extras) !bool {
     if (!self.isBusy()) return false;
 
-    try self.checkHookTrust();
     var pending: Submission = try .init(self.allocator, text, extras);
     errdefer pending.deinit(self.allocator);
     try self.steering.append(self.allocator, pending);
@@ -6139,23 +6133,30 @@ test "adding a home root never grants automatic writes to hook control files" {
     }
 }
 
-test "unreviewed hooks reject prompts without retaining or forwarding their text" {
+test "an unreviewed prompt hook blocks its prompt without retaining or forwarding the text" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
-    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .pre_tool_use = &.{.{ .command = "true", .trusted = false }}, .notification = &.{.{ .command = "cat > leaked-notice" }} } };
+    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .user_prompt_submit = &.{.{ .command = "true", .trusted = false }}, .notification = &.{.{ .command = "cat > leaked-notice" }} } };
     loop.hooks = &runner;
-    try testing.expectError(error.HooksNeedReview, loop.submit("private rejected request", .{}));
-    try testing.expect(loop.takeHookNotice() == null);
-    try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
-    try testing.expectEqual(@as(u64, 0), loop.requests_started);
-    runner.set.pre_tool_use = &.{.{ .command = "true" }};
+    try loop.submit("private rejected request", .{});
     try settle(&loop);
     try testing.expectEqual(@as(u64, 0), loop.requests_started);
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "leaked-notice", .{}));
-    try submitAndSettle(&loop, "new accepted request");
     for (fixture.convo.messages.items) |message| try testing.expect(std.mem.indexOf(u8, message.text, "private rejected request") == null);
+}
+
+test "an unreviewed observer is skipped and the turn still runs" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    var runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .notification = &.{.{ .command = "cat > ran", .trusted = false }} } };
+    loop.hooks = &runner;
+    try submitAndSettle(&loop, "go ahead");
+    try testing.expect(loop.requests_started > 0);
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "ran", .{}));
 }
 
 test "reading from an outside cwd still requires human approval" {

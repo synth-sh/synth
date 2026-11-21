@@ -847,13 +847,11 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
     defer if (!keep_draft) awaited.deinit(self.allocator);
     if (message.err) |err| {
         if (awaited == .models) self.models_failed = true;
-        const review_prompt = awaited == .prompt and std.mem.eql(u8, err.message, Hooks.review_notice);
-        if (review_prompt or awaited == .typed_model) {
+        if (awaited == .typed_model) {
             if (self.failed_draft) |draft| self.allocator.free(draft);
-            self.failed_draft = if (review_prompt) awaited.prompt else awaited.typed_model;
+            self.failed_draft = awaited.typed_model;
             keep_draft = true;
         }
-        if (review_prompt) return self.say("{s}", .{Hooks.review_notice});
         if (awaited == .history) self.paging = false;
         // A turn that failed has said so in the transcript already.
         if (awaited == .prompt and self.status.outcome == .failed) return;

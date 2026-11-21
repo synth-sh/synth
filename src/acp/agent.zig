@@ -965,7 +965,6 @@ fn describe(err: anyerror) []const u8 {
         error.ModelFixed => "this provider has only the one model",
         error.UnknownModel, error.UnknownCopilotModel => "no such model from this provider",
         error.Busy => "finish the turn first",
-        error.HooksNeedReview => Hooks.review_notice,
         error.HookBlocked => "blocked by a hook",
         error.UnknownSkill => "no such skill",
         error.UnknownConfigOption => "no such setting",
