@@ -1480,9 +1480,9 @@ test "protected-path example rejects equivalent paths and symlink targets" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
     var runner: Runner = .{ .io = std.testing.io, .root = root, .set = .{} };
-    const script_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, "examples/hooks/protect-paths.py", a);
+    const script_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, "examples/hooks/protect-paths.sh", a);
     defer a.free(script_path);
-    const script = try std.fmt.allocPrint(a, "python3 '{s}'", .{script_path});
+    const script = try std.fmt.allocPrint(a, "bash '{s}'", .{script_path});
     defer a.free(script);
     runner.set.pre_tool_use = &.{.{ .command = script }};
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".env", .data = "secret" });
@@ -1503,8 +1503,7 @@ test "protected-path example rejects equivalent paths and symlink targets" {
     defer allowed.deinit(a);
     try std.testing.expect(allowed.blocked == null);
     try tmp.dir.createDir(std.testing.io, "bin", .default_dir);
-    try tmp.dir.symLink(std.testing.io, "/bin/cat", "bin/cat", .{});
-    const without_python = try std.fmt.allocPrint(a, "PATH=\"$(pwd -P)/bin\"\n{s}", .{script});
+    const without_python = try std.fmt.allocPrint(a, "PATH=\"$(pwd -P)/bin\" \"$BASH\" '{s}'", .{script_path});
     defer a.free(without_python);
     runner.set.pre_tool_use = &.{.{ .command = without_python }};
     try std.testing.expectError(error.HookCommandUnavailable, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "write", .tool_input = "{\"path\":\".env\"}" }));

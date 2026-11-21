@@ -773,6 +773,6 @@ should exit 2 and print its reason to stderr.
 
 ```sh
 printf '%s\n' '{"cwd":".","tool_input":{"path":".env"}}' |
-  python3 .synth/protect-paths.py
+  bash .synth/protect-paths.sh
 ```
 

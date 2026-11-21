@@ -73,8 +73,8 @@ edit or write.
 
 ### Block edits to protected files
 
-1. Save the [path protection script](../examples/hooks/protect-paths.py) as
-   `.synth/protect-paths.py`. It requires Python 3.
+1. Save the [path protection script](../examples/hooks/protect-paths.sh) as
+   `.synth/protect-paths.sh`. It requires Python 3.
 2. Add the hook, then review and trust it.
 
    ```json
@@ -83,7 +83,7 @@ edit or write.
        {
          "matcher": "^(write|edit)$",
          "hooks": [
-           { "command": "python3 \"$SYNTH_PROJECT_DIR/.synth/protect-paths.py\"" }
+           { "command": "bash \"$SYNTH_PROJECT_DIR/.synth/protect-paths.sh\"" }
          ]
        }
      ]

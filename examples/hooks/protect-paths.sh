@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+
+exec python3 -c '
 import fnmatch
 import json
 import os
@@ -21,3 +24,4 @@ try:
 except Exception as error:
     print(f"Cannot validate path: {error}", file=sys.stderr)
     sys.exit(2)
+'
