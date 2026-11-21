@@ -106,14 +106,13 @@ fn binary(
     optimize: std.builtin.OptimizeMode,
     options: *std.Build.Step.Options,
 ) *std.Build.Step.Compile {
-    const unicode_module = "uucode";
-    const unicode = b.dependency(unicode_module, .{
+    const unicode = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
         .fields = @as([]const []const u8, &.{ "east_asian_width", "grapheme_break", "general_category", "is_emoji_presentation", "case_folding_full" }),
-    }).module(unicode_module);
+    }).module("uucode");
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize, .external_uucode = true });
-    vaxis.module("vaxis").addImport(unicode_module, unicode);
+    vaxis.module("vaxis").addImport("uucode", unicode);
     const ollama = b.dependency("ollama", .{ .target = target, .optimize = optimize });
     const zqlite = b.dependency("zqlite", .{ .target = target, .optimize = optimize });
     const clap = b.dependency("clap", .{ .target = target, .optimize = optimize });
@@ -127,7 +126,7 @@ fn binary(
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
-                .{ .name = unicode_module, .module = unicode },
+                .{ .name = "uucode", .module = unicode },
                 .{ .name = "ollama", .module = ollama.module("ollama") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
                 .{ .name = "clap", .module = clap.module("clap") },
