@@ -26,16 +26,21 @@ Hooks run commands or MCP tools when Synth events occur.
 ## Configuration and trust
 
 Synth combines `config.json`'s `hooks`, `~/.synth/hooks.json`, and the
-original project's `.synth/hooks.json` in that order. Use an event map at
-the top level of each standalone file.
+original project's `.synth/hooks.json` in that order. A standalone file is an
+event map, or the same map under `hooks` next to an optional `description`, as
+Claude Code and Codex write it. Unknown events and handler keys are ignored
+with a warning. An older flat definition (a `command` with no `hooks` list)
+must be wrapped: `{"matcher": "bash", "hooks": [{"command": "..."}]}`.
 
 Commands run as you from `$SYNTH_PROJECT_DIR`, without Bash profiles.
 Use the payload's `cwd` for relative tool paths. Trust covers the
-declaration. Review the script and its dependencies separately.
-File-tool edits to Synth control files, `.git/`, `.synth/`, and literal
-script paths referenced by trusted commands require human approval.
+declaration and the contents of every file the command names, so rewriting
+a script makes its hook untrusted until you review it again. Files a script
+calls in turn are not covered. File-tool edits to Synth control files,
+`.git/` and `.synth/` require human approval.
 
-After a definition changes, trust or disable it before submitting a prompt.
+An untrusted hook never runs. Observers are skipped with a notice. A policy
+hook that matches blocks the event until you trust or disable it.
 The [CLI](cli.md#hook-review) and `/hooks` take the same subcommands.
 Use at least 32 ID characters for `trust` or `enable`, eight for `revoke` or
 `disable`. Prefixes must be unique. User hooks with absolute commands and

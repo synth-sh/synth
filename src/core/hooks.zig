@@ -10,7 +10,11 @@ const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
 pub const default_timeout_ms: u64 = 30_000;
 pub const cleanup_timeout_ms: i64 = 3000;
-const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR" };
+const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT" };
+
+const claude_tool_names = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "bash", "Bash" }, .{ "read", "Read" }, .{ "write", "Write" }, .{ "edit", "Edit" }, .{ "task", "Agent" },
+});
 
 pub fn expandProjectDir(arena: std.mem.Allocator, word: []const u8, root: []const u8) ![]const u8 {
     var expanded = word;
@@ -274,10 +278,14 @@ pub fn validTimeout(value: u64) !void {
 
 pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []const u8) !Set {
     if (value != .object) return error.InvalidHooks;
+    const events = try unwrapEvents(value);
     var set: Set = .{};
-    var entries = value.object.iterator();
+    var entries = events.object.iterator();
     while (entries.next()) |entry| {
-        const event = Event.fromName(entry.key_ptr.*) orelse return error.InvalidHookEvent;
+        const event = Event.fromName(entry.key_ptr.*) orelse {
+            std.log.warn("{s}: ignoring hooks for unknown event {s}", .{ source, entry.key_ptr.* });
+            continue;
+        };
         if (entry.value_ptr.* != .array) return error.InvalidHooks;
         var hooks: std.ArrayList(Hook) = .empty;
         for (entry.value_ptr.array.items) |definition| {
@@ -289,6 +297,15 @@ pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []cons
         }
     }
     return set;
+}
+
+fn unwrapEvents(value: std.json.Value) !std.json.Value {
+    const wrapped = value.object.get("hooks") orelse return value;
+    if (wrapped != .object) return error.InvalidHooks;
+    for (value.object.keys()) |key| {
+        if (!std.mem.eql(u8, key, "hooks") and !std.mem.eql(u8, key, "description")) return error.InvalidHooks;
+    }
+    return wrapped;
 }
 
 const Declaration = struct { event: Event, source: []const u8, matcher: []const u8, when: ?When };
@@ -310,7 +327,10 @@ fn parseDeclaration(a: std.mem.Allocator, value: std.json.Value, event: Event, s
             }
         }
     }
-    const group = value.object.get("hooks") orelse return error.InvalidHooks;
+    const group = value.object.get("hooks") orelse {
+        if (value.object.contains("command")) return error.FlatHookFormatNeedsGrouping;
+        return error.InvalidHooks;
+    };
     if (group != .array) return error.InvalidHooks;
     var fields = value.object.iterator();
     while (fields.next()) |field| {
@@ -319,8 +339,9 @@ fn parseDeclaration(a: std.mem.Allocator, value: std.json.Value, event: Event, s
     for (group.array.items) |handler| try hooks.append(a, try parseHandler(a, handler, declaration));
 }
 
-fn parseHandler(a: std.mem.Allocator, value: std.json.Value, declaration: Declaration) !Hook {
-    try validateDefinition(value);
+fn parseHandler(a: std.mem.Allocator, definition: std.json.Value, declaration: Declaration) !Hook {
+    const value = try withArgumentsKey(a, definition);
+    try validateDefinition(value, declaration.source);
     const timeout_ms: ?u64 = if (value.object.get("timeout")) |seconds| blk: {
         if (seconds != .integer or seconds.integer <= 0 or seconds.integer > max_timeout_ms / std.time.ms_per_s or value.object.contains("timeout_ms")) return error.InvalidHookTimeout;
         break :blk @intCast(seconds.integer * std.time.ms_per_s);
@@ -352,7 +373,17 @@ fn parseHandler(a: std.mem.Allocator, value: std.json.Value, declaration: Declar
     return hook;
 }
 
-fn validateDefinition(value: std.json.Value) !void {
+fn withArgumentsKey(a: std.mem.Allocator, definition: std.json.Value) !std.json.Value {
+    if (definition != .object) return definition;
+    const input = definition.object.get("input") orelse return definition;
+    if (definition.object.contains("arguments")) return error.InvalidHookDefinition;
+    var object = try definition.object.clone(a);
+    _ = object.orderedRemove("input");
+    try object.put(a, "arguments", input);
+    return .{ .object = object };
+}
+
+fn validateDefinition(value: std.json.Value, source: []const u8) !void {
     if (value != .object) return error.InvalidHooks;
     const kind: Hook.Kind = if (value.object.get("type")) |field| blk: {
         if (field != .string) return error.InvalidHookDefinition;
@@ -360,7 +391,10 @@ fn validateDefinition(value: std.json.Value) !void {
     } else .command;
     const Field = enum { type, command, timeout_ms, timeout, async, stream, server, tool, arguments, transcript, onFailure };
     for (value.object.keys()) |key| {
-        const field = std.meta.stringToEnum(Field, key) orelse return error.InvalidHookDefinition;
+        const field = std.meta.stringToEnum(Field, key) orelse {
+            std.log.warn("{s}: ignoring unknown hook handler key {s}", .{ source, key });
+            continue;
+        };
         const allowed = switch (field) {
             .type, .timeout_ms, .timeout, .async, .stream, .transcript, .onFailure => true,
             .command => kind == .command,
@@ -961,8 +995,16 @@ pub const Runner = struct {
         defer allocator.free(project_env);
         const compatibility_env = try std.fmt.allocPrint(allocator, "CLAUDE_PROJECT_DIR={s}", .{self.root});
         defer allocator.free(compatibility_env);
+        const claude_plugin_root_env = try std.fmt.allocPrint(allocator, "CLAUDE_PLUGIN_ROOT={s}", .{self.root});
+        defer allocator.free(claude_plugin_root_env);
+        const plugin_root_env = try std.fmt.allocPrint(allocator, "PLUGIN_ROOT={s}", .{self.root});
+        defer allocator.free(plugin_root_env);
+        const claude_plugin_data_env = try std.fmt.allocPrint(allocator, "CLAUDE_PLUGIN_DATA={s}/.synth/plugin-data", .{self.root});
+        defer allocator.free(claude_plugin_data_env);
+        const plugin_data_env = try std.fmt.allocPrint(allocator, "PLUGIN_DATA={s}/.synth/plugin-data", .{self.root});
+        defer allocator.free(plugin_data_env);
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{ "env", "-u", "BASH_ENV", project_env, compatibility_env, "bash", "-c", command },
+            .argv = &.{ "env", "-u", "BASH_ENV", project_env, compatibility_env, claude_plugin_root_env, plugin_root_env, claude_plugin_data_env, plugin_data_env, "bash", "-c", command },
             .cwd = .{ .dir = dir },
             .stdin = .pipe,
             .stdout = .pipe,
@@ -1213,10 +1255,7 @@ fn hookMatches(allocator: std.mem.Allocator, root: []const u8, hook: Hook, invoc
     defer compiled.deinit();
     if (try compiled.checkedMatches(value)) return true;
     if (!invocation.event.toolMatcher()) return false;
-    const aliases = std.StaticStringMap([]const u8).initComptime(.{
-        .{ "bash", "Bash" }, .{ "read", "Read" }, .{ "write", "Write" }, .{ "edit", "Edit" }, .{ "task", "Agent" },
-    });
-    const alias = aliases.get(value) orelse return false;
+    const alias = claude_tool_names.get(value) orelse return false;
     return compiled.checkedMatches(alias);
 }
 
@@ -1266,7 +1305,7 @@ fn writeJson(
     }
     if (invocation.event.toolMatcher()) {
         try json.objectField("tool_name");
-        try json.write(invocation.tool_name);
+        try json.write(claude_tool_names.get(invocation.tool_name) orelse invocation.tool_name);
         var scratch: std.heap.ArenaAllocator = .init(allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -1525,4 +1564,31 @@ test "a failing hook blocks request events and lets other events continue unless
     tolerated_tool.deinit(a);
     runner.set.pre_tool_use = &.{failing_and_blocking};
     try std.testing.expectError(error.HookCommandFailed, runner.evaluate(a, .{ .event = .pre_tool_use, .tool_name = "write", .tool_input = "{}" }));
+}
+
+test "upstream hook files load: wrapper, unknown events and keys, input on MCP handlers" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source =
+        \\{"description":"lint","hooks":{
+        \\  "PreToolUse":[{"matcher":"Bash","hooks":[
+        \\    {"type":"command","command":"true","statusMessage":"checking","commandWindows":"x"},
+        \\    {"type":"mcp_tool","server":"s","tool":"t","input":{"q":"${tool_name}"}}]}],
+        \\  "SomethingNew":[{"hooks":[{"command":"true"}]}]}}
+    ;
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{});
+    const set = try parse(a, parsed, "hooks.json");
+    try std.testing.expectEqual(@as(usize, 2), set.pre_tool_use.len);
+    try std.testing.expect(set.pre_tool_use[1].arguments == .object);
+}
+
+test "a flat hook definition from the old format says how to group it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"PreToolUse\":[{\"matcher\":\"bash\",\"command\":\"true\"}]}", .{});
+    try std.testing.expectError(error.FlatHookFormatNeedsGrouping, parse(a, parsed, "hooks.json"));
+    const mixed = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"hooks\":{},\"extra\":1}", .{});
+    try std.testing.expectError(error.InvalidHooks, parse(a, mixed, "hooks.json"));
 }

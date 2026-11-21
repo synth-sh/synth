@@ -1365,6 +1365,10 @@ fn finishPolicyHook(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool 
         if (dispatch.invocation.event == .permission_evaluate and dispatch.result.permission == .ask) {
             try self.hook_flow.asks.append(self.allocator, call.id);
         }
+        if (dispatch.invocation.event == .permission_request and dispatch.result.permission == .allow) {
+            const pending = &self.conversation.messages.items[message_index].tool_calls[index];
+            if (!self.hookRequiresApproval(pending)) try self.approve(message_index, index);
+        }
     }
     try self.persistToolCall(message_index, index);
     try self.autoApprove();
@@ -5892,22 +5896,23 @@ test "a hook rewrite is approved using effective arguments and runs once" {
     try testing.expectEqualStrings("rewrite\n", rewrites);
 }
 
-test "hook allowances cannot bypass ordinary approval" {
+test "a permission request allow skips the prompt except for protected paths" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
     var loop = fixture.loop();
     defer loop.deinit();
-    fixture.fake.tool_name = "bash";
-    fixture.fake.tool_arguments = "{\"command\":\"touch permitted\"}";
     const hook: Hooks.Hook = .{ .command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" };
     const runner: Hooks.Runner = .{ .io = testing.io, .root = fixture.root, .set = .{ .permission_request = &.{hook} } };
     loop.hooks = &runner;
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"touch permitted\"}";
     try submitAndSettle(&loop, "go");
+    try fixture.tmp.dir.access(testing.io, "permitted", .{});
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\".synth/hooks.json\",\"content\":\"{}\"}";
+    try submitAndSettle(&loop, "plant a hook");
     try testing.expectEqual(State.awaiting_approval, loop.state);
-    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "permitted", .{}));
-    try loop.decide(.once);
-    try settle(&loop);
-    try testing.expectEqual(Conversation.ToolCall.Status.ok, fixture.convo.messages.items[1].tool_calls[0].status);
 }
 
 test "session-start denial cannot be bypassed by resubmitting a prompt" {
