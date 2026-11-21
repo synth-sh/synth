@@ -1,5 +1,6 @@
 const std = @import("std");
 const Hooks = @import("hooks.zig");
+const HookStore = @import("hook_store.zig");
 const skills = @import("skill.zig");
 
 const Watch = @This();
@@ -30,19 +31,19 @@ pub fn configure(self: *Watch, allocator: std.mem.Allocator, io: std.Io, root: [
     var next: Watch = .{};
     errdefer next.deinit(allocator);
     if (set.config_change.len > 0) {
-        if (config_path.len > 0) try next.add(allocator, io, config_path, .config_change, "user_settings");
-        const project_hooks = try std.fs.path.join(allocator, &.{ root, ".synth", "hooks.json" });
+        if (config_path.len > 0) try next.add(allocator, io, config_path, .config_change, @tagName(Hooks.ConfigSource.user_settings));
+        const project_hooks = try HookStore.configPath(allocator, root);
         defer allocator.free(project_hooks);
-        try next.add(allocator, io, project_hooks, .config_change, "project_settings");
+        try next.add(allocator, io, project_hooks, .config_change, @tagName(Hooks.ConfigSource.project_settings));
         if (home) |dir| {
-            const user_hooks = try std.fs.path.join(allocator, &.{ dir, ".synth", "hooks.json" });
+            const user_hooks = try HookStore.configPath(allocator, dir);
             defer allocator.free(user_hooks);
-            try next.add(allocator, io, user_hooks, .config_change, "user_settings");
+            try next.add(allocator, io, user_hooks, .config_change, @tagName(Hooks.ConfigSource.user_settings));
         }
         for (available) |skill| {
             const path = try std.fs.path.join(allocator, &.{ skill.dir, skills.file_name });
             defer allocator.free(path);
-            try next.add(allocator, io, path, .config_change, "skills");
+            try next.add(allocator, io, path, .config_change, @tagName(Hooks.ConfigSource.skills));
         }
     }
     for (set.file_changed) |hook| {

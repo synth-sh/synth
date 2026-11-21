@@ -445,8 +445,8 @@ fn requestHeaders(self: *const OpenAIProvider, json_body: bool) std.http.Client.
             .{ .override = self.auth_value }
         else
             .default,
-        .accept_encoding = .{ .override = "identity" },
-        .content_type = if (json_body) .{ .override = "application/json" } else .default,
+        .accept_encoding = .{ .override = Provider.identity_encoding },
+        .content_type = if (json_body) .{ .override = Provider.json_content_type } else .default,
     };
 }
 
@@ -537,7 +537,7 @@ fn respond(
         // Read before the body reader is built, which invalidates the head.
         const head = try http.response(arena, response.head);
         const sse = streamed(head.get("content-type"));
-        const asked_for = retry.retryAfterMs(head.get("retry-after"));
+        const asked_for = retry.retryAfterMs(head.get(retry.retry_after_header));
 
         const transfer = try arena.alloc(u8, transfer_buffer_bytes);
         const reader = response.reader(transfer);
@@ -549,7 +549,7 @@ fn respond(
             hook_attempt.error_message = if (Provider.mentionsOverflow(why)) "ContextTooLarge" else "HttpError";
             hook_attempt.finish();
             if (self.retryWithout(why)) {
-                if (retry.pause(self.io, self.retries, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = retry.errorType(head.status), .error_message = why })) {
+                if (retry.pause(self.io, self.retries, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = @tagName(retry.errorType(head.status)), .error_message = why })) {
                     self.clearRejection();
                     attempt += 1;
                     continue;
@@ -700,9 +700,9 @@ const Collector = struct {
 
             const line = std.mem.trimEnd(u8, raw, "\r");
             if (line.len == 0) continue;
-            if (!std.mem.startsWith(u8, line, "data:")) continue;
+            if (!std.mem.startsWith(u8, line, Provider.sse_data_prefix)) continue;
 
-            const payload = std.mem.trimStart(u8, line["data:".len..], " ");
+            const payload = std.mem.trimStart(u8, line[Provider.sse_data_prefix.len..], " ");
             if (std.mem.eql(u8, payload, "[DONE]")) return;
 
             _ = scratch.reset(.retain_capacity);
@@ -917,9 +917,9 @@ fn buildRequest(
         try w.writeAll(",\"reasoning_effort\":");
         try std.json.Stringify.value(v, .{}, w);
     }
-    if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
+    try Provider.writeNumericSetting(w, turn.settings, .temperature);
     if (turn.settings.max_output_tokens) |v| try w.print(",\"max_completion_tokens\":{d}", .{v});
-    inline for (.{ "top_p", "seed", "frequency_penalty", "presence_penalty" }) |field| if (@field(turn.settings, field)) |v| try w.print(",\"" ++ field ++ "\":{d}", .{v});
+    inline for (.{ .top_p, .seed, .frequency_penalty, .presence_penalty }) |field| try Provider.writeNumericSetting(w, turn.settings, field);
     if (turn.settings.stop) |v| {
         try w.writeAll(",\"stop\":");
         try std.json.Stringify.value(v, .{}, w);

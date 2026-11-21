@@ -6,7 +6,6 @@ const OpenAI = @import("openai.zig");
 const window = @import("window.zig");
 
 pub const default_max_output_tokens: u32 = 4096;
-const data_prefix = "data:";
 
 pub const Options = struct {
     model: []const u8,
@@ -79,9 +78,9 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     const w = &out.writer;
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(options.model, .{}, w);
-    if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
-    if (turn.settings.top_p) |v| try w.print(",\"top_p\":{d}", .{v});
-    if (turn.settings.top_k) |v| try w.print(",\"top_k\":{d}", .{v});
+    try Provider.writeNumericSetting(w, turn.settings, .temperature);
+    try Provider.writeNumericSetting(w, turn.settings, .top_p);
+    try Provider.writeNumericSetting(w, turn.settings, .top_k);
     if (turn.settings.stop) |v| {
         try w.writeAll(",\"stop_sequences\":");
         try std.json.Stringify.value(v, .{}, w);
@@ -159,8 +158,8 @@ pub const Stream = struct {
                 break :blk false;
             };
             const value = std.mem.trim(u8, line.written(), "\r ");
-            if (std.mem.startsWith(u8, value, data_prefix)) {
-                const payload = std.mem.trimStart(u8, value[data_prefix.len..], " ");
+            if (std.mem.startsWith(u8, value, Provider.sse_data_prefix)) {
+                const payload = std.mem.trimStart(u8, value[Provider.sse_data_prefix.len..], " ");
                 const prepared = if (self.http) |http| (try http.payload(scratch.allocator(), payload, true)) orelse continue else payload;
                 const event = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), prepared, .{});
                 try self.apply(event);

@@ -15,6 +15,7 @@ const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const Hooks = @import("../core/hooks.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
 const HookStore = @import("../core/hook_store.zig");
 const Project = @import("../core/project.zig");
 const skill = @import("../core/skill.zig");
@@ -147,7 +148,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.loop.hooks = &self.hooks;
     self.loop.hook_flow.reload = .{ .userdata = self, .call = reloadHooks };
     self.loop.control_files = if (config.hook_state_path) |path| try self.arena.allocator().dupe([]const u8, &.{ config.path, path }) else try self.arena.allocator().dupe([]const u8, &.{config.path});
-    if (discovered_hooks.hasUntrusted() and self.loop.hook_flow.notice == null) self.loop.hook_flow.notice = try allocator.dupe(u8, Hooks.review_notice);
+    if (discovered_hooks.hasUntrusted() and self.loop.hook_flow.notice == null) self.loop.hook_flow.notice = try allocator.dupe(u8, HooksCopy.review_notice);
     self.loop.auto_approve_safe = config.auto_approve_safe_commands;
     self.loop.approvals = config.approvals;
     self.loop.backend = options.backend;
@@ -165,7 +166,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         try self.loop.attachDatabase(db, self.project.name(), self.project.cwd, options.provider.model);
     }
     try self.loop.hook_flow.watch.configure(allocator, io, self.project.root, self.hook_config_path, self.hook_home, self.hooks.set, self.skills.skills, &.{});
-    try self.loop.trackModel("initial");
+    try self.loop.trackModel(.initial);
     return self;
 }
 
@@ -208,11 +209,11 @@ fn reloadHooks(raw: *anyopaque) !void {
         }
         runner.set.config_change = handlers;
         for (reviewed) |path| {
-            const source = if (@import("../core/paths.zig").inside(self.project.root, path)) "project_settings" else "user_settings";
-            var result = try runner.evaluate(allocator, try self.loop.exportHookInput(.{ .event = .config_change, .source = source, .file_path = path }));
+            const source: Hooks.ConfigSource = if (@import("../core/paths.zig").inside(self.project.root, path)) .project_settings else .user_settings;
+            var result = try runner.evaluate(allocator, try self.loop.exportHookInput(.{ .event = .config_change, .source = @tagName(source), .file_path = path }));
             defer result.deinit(allocator);
             if (result.blocked != null or result.stop) {
-                self.loop.say("Hook configuration change blocked: {s}", .{result.blocked orelse "stopped by hook"});
+                self.loop.say("Hook configuration change blocked: {s}", .{result.blocked orelse HooksCopy.stopped});
                 return error.HookBlocked;
             }
         }
@@ -244,7 +245,7 @@ fn changedHookPaths(arena: std.mem.Allocator, left: Hooks.Set, right: Hooks.Set,
             ids.clearRetainingCapacity();
             for (@field(after, field.name)) |hook| try ids.put(arena, hook.id, {});
             for (@field(before, field.name)) |hook| {
-                if (!ids.contains(hook.id)) try sources.put(arena, if (std.mem.eql(u8, hook.source, "config")) config_path else hook.source, {});
+                if (!ids.contains(hook.id)) try sources.put(arena, if (std.mem.eql(u8, hook.source, Hooks.inline_source)) config_path else hook.source, {});
             }
         }
     }

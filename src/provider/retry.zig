@@ -11,14 +11,17 @@
 const std = @import("std");
 
 pub const max_delay_ms: u64 = 60_000;
+pub const retry_after_header = "retry-after";
 
-pub fn errorType(status: std.http.Status) []const u8 {
+pub const ErrorType = enum { authentication_failed, rate_limit, invalid_request, not_found, server_error, http_error, unknown };
+
+pub fn errorType(status: std.http.Status) ErrorType {
     return switch (status) {
-        .unauthorized, .forbidden => "authentication_failed",
-        .too_many_requests => "rate_limit",
-        .bad_request, .unprocessable_entity => "invalid_request",
-        .not_found => "not_found",
-        else => if (status.class() == .server_error) "server_error" else "http_error",
+        .unauthorized, .forbidden => .authentication_failed,
+        .too_many_requests => .rate_limit,
+        .bad_request, .unprocessable_entity => .invalid_request,
+        .not_found => .not_found,
+        else => if (status.class() == .server_error) .server_error else .http_error,
     };
 }
 
@@ -61,7 +64,7 @@ pub fn wait(io: std.Io, policy: Policy, sink: ?@import("provider.zig").Sink, fai
         .allowed = (failure.retryable orelse transient(failure.status)) and !tooLong(policy, failure.retry_after_ms),
         .delay_ms = waitMs(policy, failure.attempt, failure.retry_after_ms),
         .status = @intFromEnum(failure.status),
-        .error_type = errorType(failure.status),
+        .error_type = @tagName(errorType(failure.status)),
         .error_message = failure.message,
     });
 }
@@ -82,9 +85,9 @@ pub fn transient(status: std.http.Status) bool {
 /// outage actually says.
 pub fn transientText(why: []const u8) bool {
     const needles: []const []const u8 = &.{
-        "429",              "rate limit", "rate_limit",
+        "429",              "rate limit", @tagName(ErrorType.rate_limit),
         "too many request", "503",        "502",
-        "504",              "overloaded", "server_error",
+        "504",              "overloaded", @tagName(ErrorType.server_error),
         "unavailable",      "try again",  "temporarily",
     };
     for (needles) |needle| {

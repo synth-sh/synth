@@ -1,8 +1,9 @@
 const std = @import("std");
 
 const paths = @import("paths.zig");
+const filesystem = @import("../tools/filesystem.zig");
 
-pub const path_fields = [_][]const u8{ "path", "file" };
+pub const path_fields = [_][]const u8{ filesystem.path_field, "file" };
 
 pub fn resolvedTargets(io: std.Io, arena: std.mem.Allocator, cwd: []const u8, input: std.json.ObjectMap) ![]const []const u8 {
     var targets: std.ArrayList([]const u8) = .empty;

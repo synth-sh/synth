@@ -253,7 +253,7 @@ pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, tar
     for ([_][]const u8{ lexical, resolved }) |path| {
         var parts = std.mem.tokenizeScalar(u8, path, '/');
         while (parts.next()) |part| {
-            if (sameName(part, ".synth") or sameName(part, ".git")) return true;
+            if (sameName(part, Paths.synth_config_dir) or sameName(part, ".git")) return true;
         }
     }
     for (control_files) |file| {

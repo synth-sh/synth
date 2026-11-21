@@ -4,6 +4,7 @@
 const std = @import("std");
 const HookSchema = @import("../core/hook_schema.zig");
 const HookToolInput = @import("../core/hook_tool_input.zig");
+const Filesystem = @import("../tools/filesystem.zig");
 const HumanIntent = @import("../core/human_intent.zig");
 const paths = @import("../core/paths.zig");
 const action_paths = @import("../core/action.zig");
@@ -13,6 +14,7 @@ const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
 const Hooks = @import("../core/hooks.zig");
 const HookFlow = @import("hook_flow.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
 const Provider = @import("../provider/provider.zig");
 const recap = @import("recap.zig");
 const redact = @import("../core/redact.zig");
@@ -39,6 +41,7 @@ const ToolRun = @import("tool_run.zig");
 const Loop = @This();
 
 const idle_notification_delay_ms: i64 = std.time.ms_per_min;
+const reviewer_timeout_reason = "reviewer timed out";
 
 /// How many times the same tool call may repeat before the turn is stopped.
 /// Two is a model correcting itself; three is a model stuck.
@@ -521,18 +524,18 @@ fn restoreModel(self: *Loop, session_id: i64) !void {
 
 pub const ModelSwitch = struct {
     requested_model: []const u8,
-    source: []const u8,
+    source: Hooks.ModelSwitchSource,
 };
 
-pub fn beginModelSwitch(self: *Loop, model: []const u8, source: []const u8) !ModelSwitch {
+pub fn beginModelSwitch(self: *Loop, model: []const u8, source: Hooks.ModelSwitchSource) !ModelSwitch {
     if (self.model_policy.restrict_routes) return error.ModelRouteDenied;
     if (self.isBusy()) return error.Busy;
-    try self.trackModel("initial");
+    try self.trackModel(.initial);
     if (self.hooks) |runner| {
-        var result = try runner.evaluate(self.allocator, try self.exportHookInput(.{ .event = .pre_model_switch, .from_model = self.provider.model, .to_model = model, .requested_model = model, .source = source }));
+        var result = try runner.evaluate(self.allocator, try self.exportHookInput(.{ .event = .pre_model_switch, .from_model = self.provider.model, .to_model = model, .requested_model = model, .source = @tagName(source) }));
         defer result.deinit(self.allocator);
         if (result.blocked != null or result.stop) {
-            self.say("Model switch blocked: {s}", .{result.blocked orelse "stopped by hook"});
+            self.say("Model switch blocked: {s}", .{result.blocked orelse HooksCopy.stopped});
             return error.HookBlocked;
         }
         try self.acceptHookResult(&result);
@@ -552,7 +555,7 @@ pub fn commitModelSwitch(self: *Loop, change: ModelSwitch) !void {
 }
 
 pub fn switchModel(self: *Loop, model: []const u8) !void {
-    const change = try self.beginModelSwitch(model, "command");
+    const change = try self.beginModelSwitch(model, .command);
     try self.commitModelSwitch(change);
 }
 
@@ -617,7 +620,7 @@ fn adoptModel(self: *Loop, now: Provider.Current) !void {
     self.provider.context_limit = now.context_limit;
     self.provider.vision = now.vision;
     try self.setModel(now.model);
-    try self.trackModel("resume");
+    try self.trackModel(.@"resume");
 }
 
 /// Switch agents: rebuild the tool schema, hand it to the provider with the
@@ -829,7 +832,7 @@ pub fn syncProvider(self: *Loop) void {
     self.provider.context_limit = now.context_limit;
     self.provider.vision = now.vision;
     self.provider.effort = now.effort;
-    self.trackModel("automatic") catch {};
+    self.trackModel(.automatic) catch {};
 }
 
 /// Run the current model at `level` from the next turn on. Between turns
@@ -1053,7 +1056,7 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
         if (try self.gatePrompt(.{
             .event = if (self.parent == null) .session_start else .subagent_start,
             .source = @tagName(self.hook_flow.session_source),
-            .trigger = if (self.hook_flow.compaction == .manual) "manual" else "auto",
+            .trigger = self.hook_flow.compaction.trigger(),
         }, .{ .lifecycle = .begin_prompt }, prompt, extras)) return;
     }
     try self.submitPrompt(prompt, extras);
@@ -1169,7 +1172,7 @@ fn awaitApproval(self: *Loop) void {
     const signature = std.hash.Wyhash.hash(self.pending_seq orelse 0, call.id);
     if (self.hook_flow.permission_notice == signature) return;
     self.hook_flow.permission_notice = signature;
-    self.observeHook(.{ .event = .notification, .notification_type = "permission_prompt", .message = call.arguments, .tool_name = call.name, .tool_call_id = call.id });
+    self.observeHook(.{ .event = .notification, .notification_type = @tagName(Hooks.NotificationType.permission_prompt), .message = call.arguments, .tool_name = call.name, .tool_call_id = call.id });
 }
 
 pub const hookInput = HookFlow.hookInput;
@@ -1185,18 +1188,18 @@ const lifecycle = HookFlow.lifecycle;
 fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch, next: HookFlow.Resume) !bool {
     if (next == .failed_turn) {
         try self.acceptHookResult(&dispatch.result);
-        if (dispatch.failed) |err| self.say("StopFailure hook failed: {s}", .{@errorName(err)});
+        if (dispatch.failed) |err| self.say(HooksCopy.named_failure, .{ Hooks.Event.stop_failure.name(), @errorName(err) });
         self.finish(.failed);
         return true;
     }
     if (dispatch.invocation.event == .subagent_start) {
-        if (dispatch.failed) |err| self.say("SubagentStart hook failed: {s}", .{@errorName(err)});
+        if (dispatch.failed) |err| self.say(HooksCopy.named_failure, .{ dispatch.invocation.event.name(), @errorName(err) });
     }
     if (next == .finish_turn) {
         try self.acceptHookResult(&dispatch.result);
         if (dispatch.failed) |err| {
             self.last_error = err;
-            self.say("Completion hook failed: {s}", .{@errorName(err)});
+            self.say(HooksCopy.named_failure, .{ "Completion", @errorName(err) });
             self.finish(.failed);
             return true;
         }
@@ -1217,7 +1220,7 @@ fn pollLifecycle(self: *Loop, dispatch: *Hooks.Dispatch, next: HookFlow.Resume) 
     }
     if (dispatch.invocation.event != .subagent_start and (dispatch.failed != null or dispatch.result.blocked != null or dispatch.result.stop)) {
         self.hook_flow.setNotice(self.allocator, if (dispatch.failed) |err|
-            try std.fmt.allocPrint(self.allocator, "Lifecycle hook failed: {s}", .{@errorName(err)})
+            try std.fmt.allocPrint(self.allocator, HooksCopy.named_failure, .{ "Lifecycle", @errorName(err) })
         else
             dispatch.result.takeBlocked());
         self.discardHookSubmission();
@@ -1268,7 +1271,7 @@ fn pollHooks(self: *Loop) !bool {
             defer pending.deinit(self.allocator);
             self.state = .idle;
             if (dispatch.failed) |err| {
-                self.say("{s} hook failed: {s}", .{ dispatch.invocation.event.name(), @errorName(err) });
+                self.say(HooksCopy.named_failure, .{ dispatch.invocation.event.name(), @errorName(err) });
                 self.rejectPrompt(err);
                 return true;
             }
@@ -1301,7 +1304,7 @@ fn pollHooks(self: *Loop) !bool {
             const call = &self.conversation.messages.items[message_index].tool_calls[index];
             if (dispatch.failed != null or dispatch.result.blocked != null) {
                 call.status = .rejected;
-                call.result = dispatch.result.takeBlocked() orelse try std.fmt.allocPrint(self.allocator, "Task hook failed: {s}", .{@errorName(dispatch.failed.?)});
+                call.result = dispatch.result.takeBlocked() orelse try std.fmt.allocPrint(self.allocator, HooksCopy.named_failure, .{ "Task", @errorName(dispatch.failed.?) });
                 call.result_bytes = call.result.?.len;
                 try self.persistToolCall(message_index, index);
             } else try self.acceptHookResult(&dispatch.result);
@@ -1312,7 +1315,7 @@ fn pollHooks(self: *Loop) !bool {
             var pending = self.steering.orderedRemove(0);
             defer pending.deinit(self.allocator);
             if (dispatch.failed) |err| {
-                self.say("UserPromptSubmit hook failed: {s}", .{@errorName(err)});
+                self.say(HooksCopy.named_failure, .{ Hooks.Event.user_prompt_submit.name(), @errorName(err) });
             } else if (dispatch.result.takeBlocked()) |reason| {
                 self.hook_flow.setNotice(self.allocator, reason);
             } else {
@@ -1330,7 +1333,7 @@ fn finishPolicyHook(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool 
     const message_index = self.pendingIndex() orelse return false;
     const call = &self.conversation.messages.items[message_index].tool_calls[index];
     const reason = if (dispatch.failed) |err|
-        try std.fmt.allocPrint(self.allocator, "hook failed: {s}", .{@errorName(err)})
+        try std.fmt.allocPrint(self.allocator, HooksCopy.failure, .{@errorName(err)})
     else
         dispatch.result.takeBlocked();
     if (reason) |blocked| {
@@ -1405,11 +1408,12 @@ fn replaceHookInput(self: *Loop, call: *Conversation.ToolCall, replacement: []co
 fn startPolicyHook(self: *Loop, event: Hooks.Event, index: usize, rewrite_author: ?usize) !void {
     const message_index = self.pendingIndex() orelse return;
     const call = self.conversation.messages.items[message_index].tool_calls[index];
+    const effect: Hooks.Permission = if (self.needsNoDecision(&call)) .allow else .ask;
     var runner = self.hooks.?.*;
     runner.rewrite_author = rewrite_author;
     try HookFlow.begin(self, runner, try self.exportHookInput(.{
         .event = event,
-        .permission_effect = if (self.needsNoDecision(&call)) "allow" else "ask",
+        .permission_effect = @tagName(effect),
         .action = call.prepared_action orelse "",
         .tool_name = call.name,
         .tool_input = call.arguments,
@@ -1435,7 +1439,7 @@ fn pollOwnerHooks(self: *Loop, dispatch: *Hooks.Dispatch, index: usize) !bool {
     if (dispatch.result.blocked orelse dispatch.result.feedback) |feedback| {
         try self.applyPostFeedback(message_index, index, feedback);
     }
-    if (dispatch.failed) |err| self.say("PostToolUse hook failed: {s}", .{@errorName(err)});
+    if (dispatch.failed) |err| self.say(HooksCopy.named_failure, .{ Hooks.Event.post_tool_use.name(), @errorName(err) });
     self.state = .idle;
     try self.runApproved();
     return true;
@@ -1556,7 +1560,7 @@ fn ask(self: *Loop) !void {
     if (self.steps > self.agent.steps and !self.isRunningWithoutLimit()) {
         return self.stop("Stopped: too many tool calls in one turn.");
     }
-    try self.trackModel("initial");
+    try self.trackModel(.initial);
     var request_turn = self.turn("");
     request_turn.hook_input = try self.exportHookInput(.{ .event = .pre_model_request });
     self.request = try Request.start(
@@ -1805,7 +1809,7 @@ pub fn poll(self: *Loop) !bool {
         if (self.hook_flow.idle_since) |since| {
             if (tool.monotonicMilliseconds(self.io) - since >= idle_notification_delay_ms) {
                 self.hook_flow.idle_notified = true;
-                self.notifyHook("idle_prompt", "The agent is waiting for input");
+                self.notifyHook(.idle_prompt, "The agent is waiting for input");
             }
         }
     }
@@ -1969,7 +1973,7 @@ fn finish(self: *Loop, outcome: Outcome) void {
     self.repeats = 0;
     self.compacting = false;
     self.outcome = outcome;
-    self.notifyHook("agent_completed", @tagName(outcome));
+    self.notifyHook(.agent_completed, @tagName(outcome));
     self.hook_flow.idle_since = tool.monotonicMilliseconds(self.io);
     self.hook_flow.idle_notified = false;
     self.resume_after_compaction = false;
@@ -2190,7 +2194,7 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
     const now = tool.monotonicMilliseconds(self.io);
     if (stage == .quick) self.review_started_ms = now;
     if (now - self.review_started_ms >= self.model_policy.reviewer_timeout_ms) {
-        _ = try self.judgeUnavailable(call_index, "reviewer timed out");
+        _ = try self.judgeUnavailable(call_index, reviewer_timeout_reason);
         return;
     }
     const message_index = self.pendingIndex() orelse return;
@@ -2252,7 +2256,7 @@ fn pollJudging(self: *Loop) !bool {
     if (finished) judging.request.join() else judging.request.cancel();
     self.judging = null;
     defer judging.destroy(self.allocator);
-    if (timed_out) return self.judgeUnavailable(judging.call, "reviewer timed out");
+    if (timed_out) return self.judgeUnavailable(judging.call, reviewer_timeout_reason);
 
     const message_index = self.pendingIndex() orelse return true;
     const reply = judging.request.reply orelse {
@@ -2434,18 +2438,14 @@ fn checkTodoTasks(self: *Loop, message_index: usize, call_index: usize) !bool {
 
 fn anchorToolPaths(self: *Loop, call: *Conversation.ToolCall) !bool {
     if (self.working_directory == null) return false;
-    const names = [_][]const u8{ "read", "write", "edit", "list", "glob", "grep" };
-    const filesystem = for (names) |name| {
-        if (std.mem.eql(u8, call.name, name)) break true;
-    } else false;
-    if (!filesystem) return false;
+    if (std.meta.stringToEnum(Filesystem.Name, call.name) == null) return false;
     var arena: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena.deinit();
     var parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), call.arguments, .{}) catch return false;
     if (parsed != .object) return false;
-    const field = parsed.object.get("path") orelse return false;
+    const field = parsed.object.get(Filesystem.path_field) orelse return false;
     if (field != .string or std.fs.path.isAbsolute(field.string)) return false;
-    try parsed.object.put(arena.allocator(), "path", .{ .string = try std.fs.path.resolve(arena.allocator(), &.{ self.workingDirectory(), field.string }) });
+    try parsed.object.put(arena.allocator(), Filesystem.path_field, .{ .string = try std.fs.path.resolve(arena.allocator(), &.{ self.workingDirectory(), field.string }) });
     const arguments = try std.json.Stringify.valueAlloc(self.allocator, parsed, .{});
     self.allocator.free(call.arguments);
     call.arguments = arguments;
@@ -2542,7 +2542,7 @@ fn applyDecision(self: *Loop, decision: Decision, source: enum { human, headless
     }
 
     if (decision == .deny or call.status == .running) {
-        const verdict = if (decision == .deny) "deny" else "approve";
+        const verdict: HumanIntent.Decision = if (decision == .deny) .deny else .approve;
         switch (source) {
             .human => {
                 const receipt = try HumanIntent.decisionReceipt(self.allocator, verdict, call.name, call.prepared_action orelse call.arguments);
@@ -2550,7 +2550,7 @@ fn applyDecision(self: *Loop, decision: Decision, source: enum { human, headless
                 try self.recordHuman(receipt, true);
             },
             .headless => if (self.db) |db| {
-                if (self.message_ids.get(message.seq)) |id| try db.appendBlob(id, @intCast(call_index), "headless_tool_decision", verdict);
+                if (self.message_ids.get(message.seq)) |id| try db.appendBlob(id, @intCast(call_index), "headless_tool_decision", @tagName(verdict));
             },
         }
     }
@@ -2941,7 +2941,7 @@ pub fn say(self: *Loop, comptime fmt: []const u8, args: anytype) void {
     const said = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
     if (self.hook_flow.notice) |old| self.allocator.free(old);
     self.hook_flow.notice = said;
-    self.notifyHook("notice", said);
+    self.notifyHook(.notice, said);
 }
 
 /// Write a subagent's messages into a session of its own, hung off the call
@@ -3208,7 +3208,7 @@ fn runApproved(self: *Loop) !void {
         if (try self.startOwnerPost(i, call.*)) return;
     }
     if (self.firstAsk()) |question| {
-        self.notifyHook("agent_needs_input", question.arguments);
+        self.notifyHook(.agent_needs_input, question.arguments);
         self.state = .awaiting_answer;
         return;
     }
@@ -3328,7 +3328,7 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
         call.result_bytes = result.content.len;
         try self.persistToolCall(message_index, result.index);
         try self.acceptHookResult(&result.hook_result);
-        if (result.hook_error) |err| self.say("PostToolUse hook failed: {s}", .{@errorName(err)});
+        if (result.hook_error) |err| self.say(HooksCopy.named_failure, .{ Hooks.Event.post_tool_use.name(), @errorName(err) });
         if (result.hook_result.blocked orelse result.hook_result.feedback) |feedback| try self.applyPostFeedback(message_index, result.index, feedback);
     }
 }

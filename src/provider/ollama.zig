@@ -598,7 +598,7 @@ fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest
         try value.object.put(a, "truncate", .{ .bool = false });
         body = try std.json.Stringify.valueAlloc(a, value, .{});
     }
-    const prepared = try http.request(a, body, .{ .content_type = .{ .override = "application/json" }, .accept_encoding = .{ .override = "identity" } }, if (self.auth_value.len > 0) self.auth_header[0..1] else &.{});
+    const prepared = try http.request(a, body, .{ .content_type = .{ .override = Provider.json_content_type }, .accept_encoding = .{ .override = Provider.identity_encoding } }, if (self.auth_value.len > 0) self.auth_header[0..1] else &.{});
     const req = try a.create(std.http.Client.Request);
     req.* = try self.client.http_client.client.request(.POST, try std.Uri.parse(url), .{
         .headers = prepared.headers,
@@ -623,7 +623,7 @@ fn chat(self: *OllamaProvider, a: std.mem.Allocator, request: Ollama.ChatRequest
     };
     const reader = response.readerDecompressing(transfer, decompress, compressed);
     self.last_status = head.status;
-    self.last_retry_after_ms = retry.retryAfterMs(head.get("retry-after"));
+    self.last_retry_after_ms = retry.retryAfterMs(head.get(retry.retry_after_header));
     if (head.status.class() != .success) {
         const raw = reader.allocRemaining(a, .limited(max_error_body_bytes)) catch "";
         const why = (try http.payload(a, raw, false)).?;

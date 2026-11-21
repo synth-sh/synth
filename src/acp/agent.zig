@@ -10,8 +10,10 @@
 
 const std = @import("std");
 const Hooks = @import("../core/hooks.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
 const ask_user = @import("../tools/ask.zig");
 const HookStore = @import("../core/hook_store.zig");
+const SlashCommand = @import("../core/slash_command.zig");
 const paths = @import("../core/paths.zig");
 
 const pkg = @import("pkg");
@@ -965,7 +967,7 @@ fn describe(err: anyerror) []const u8 {
         error.ModelFixed => "this provider has only the one model",
         error.UnknownModel, error.UnknownCopilotModel => "no such model from this provider",
         error.Busy => "finish the turn first",
-        error.HookBlocked => "blocked by a hook",
+        error.HookBlocked => HooksCopy.blocked,
         error.UnknownSkill => "no such skill",
         error.UnknownConfigOption => "no such setting",
         error.ProviderFixed => "this agent's provider is fixed",
@@ -1647,7 +1649,7 @@ const Session = struct {
         const text = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
         defer self.allocator.free(text);
         self.agent.notice(severity, text);
-        self.stack.loop.notifyHook("notice", text);
+        self.stack.loop.notifyHook(.notice, text);
     }
 
     /// Advance the session, and do what a TUI's tick does for a local one:
@@ -1728,24 +1730,24 @@ const Session = struct {
             const text = std.fmt.allocPrint(self.allocator, "Cannot {s} {s}: {s}", .{ verb, path, paths.directoryError(err) }) catch return err;
             defer self.allocator.free(text);
             self.agent.notice(.warning, text);
-            if (from_slash) loop.notifyHook("notice", text);
+            if (from_slash) loop.notifyHook(.notice, text);
             return err;
         };
     }
 
     fn slashCommand(self: *Session, arena: std.mem.Allocator, line: []const u8, attachments: *std.ArrayList(mention.Attachment), images: []const []const u8) !bool {
-        const split = std.mem.indexOfAny(u8, line, " \t\r\n") orelse line.len;
+        const split = std.mem.indexOfAny(u8, line, SlashCommand.whitespace) orelse line.len;
         const name = line[0..split];
-        const arguments = std.mem.trim(u8, line[split..], " \t\r\n");
+        const arguments = std.mem.trim(u8, line[split..], SlashCommand.whitespace);
         const loop = &self.stack.loop;
-        if (std.mem.eql(u8, name, "/cd")) {
+        if (std.mem.eql(u8, name, "/" ++ SlashCommand.cd)) {
             if (arguments.len == 0) {
                 self.notice(.info, "{s}", .{loop.workingDirectory()});
                 return true;
             }
             self.applyDirectory(.change, arguments, .slash_command, true) catch return true;
             self.notice(.info, "Working directory: {s}", .{loop.workingDirectory()});
-        } else if (std.mem.eql(u8, name, "/add-dir")) {
+        } else if (std.mem.eql(u8, name, "/" ++ SlashCommand.add_dir)) {
             self.applyDirectory(.add, arguments, .slash_command, true) catch return true;
             self.notice(.info, "Directory added to this session", .{});
         } else if (skill.findIn(self.stack.skills.skills, skill.idOf(name))) |found| {
@@ -1753,11 +1755,11 @@ const Session = struct {
             const expanded = try skill_tool.render(arena, found);
             try attachments.append(arena, .{ .path = try std.fs.path.join(arena, &.{ found.dir, skill.file_name }), .content = expanded });
             try loop.submit(line, .{ .attachments = attachments.items, .images = images, .command_name = found.id, .command_args = arguments, .expanded_prompt = expanded });
-        } else if (std.mem.eql(u8, name, "/hooks")) {
+        } else if (std.mem.eql(u8, name, "/" ++ SlashCommand.hooks)) {
             const command = try HookStore.parseCommand(line);
             const report = try self.stack.manageHooks(arena, command.action, command.id);
             self.agent.notice(.info, report);
-        } else if (std.mem.eql(u8, name, "/compact") and arguments.len == 0) {
+        } else if (std.mem.eql(u8, name, "/" ++ SlashCommand.compact) and arguments.len == 0) {
             if (loop.isBusy()) return error.Busy;
             try loop.compact();
         } else return false;
@@ -1881,7 +1883,7 @@ const Session = struct {
         const chosen: Chosen = if (by_editor) chosenModel(request.value) else .{ .provider = extra.provider, .model = request.value };
         const provider_id = self.providerId();
         const switching = if (chosen.provider) |wanted| !std.mem.eql(u8, wanted, provider_id) else false;
-        const change = try loop.beginModelSwitch(chosen.model, if (by_editor) "sdk" else "picker");
+        const change = try loop.beginModelSwitch(chosen.model, if (by_editor) .sdk else .picker);
         if (switching) {
             const entry = catalog.find(chosen.provider.?) orelse return error.UnknownProvider;
             try self.useProvider(entry, null, null, .{ .select = chosen.model });
@@ -2028,10 +2030,10 @@ const Session = struct {
     fn tellCommands(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
         const skills = self.stack.skills.skills;
         const commands = try arena.alloc(protocol.Command, skills.len + 4);
-        commands[0] = .{ .name = "compact", .description = "Summarise the conversation so far to free up context" };
-        commands[1] = .{ .name = "hooks", .description = "Review, trust and control lifecycle hooks", .input = .{ .hint = "[list|review|trust|revoke|enable|disable] [id]" } };
-        commands[2] = .{ .name = "cd", .description = "Change the session working directory", .input = .{ .hint = "[path]" } };
-        commands[3] = .{ .name = "add-dir", .description = "Add a permitted directory to this session", .input = .{ .hint = "path" } };
+        commands[0] = .{ .name = SlashCommand.compact, .description = "Summarise the conversation so far to free up context" };
+        commands[1] = .{ .name = SlashCommand.hooks, .description = "Review, trust and control lifecycle hooks", .input = .{ .hint = "[list|review|trust|revoke|enable|disable] [id]" } };
+        commands[2] = .{ .name = SlashCommand.cd, .description = "Change the session working directory", .input = .{ .hint = "[path]" } };
+        commands[3] = .{ .name = SlashCommand.add_dir, .description = "Add a permitted directory to this session", .input = .{ .hint = "path" } };
         for (skills, commands[4..]) |found, *command| command.* = .{
             .name = found.id,
             .description = if (found.description.len > 0) found.description else found.name,
@@ -2395,7 +2397,7 @@ const Session = struct {
         self.configureProvider(entry, null, token, self.activate_after_sign_in, .automatic) catch |err| {
             return self.notice(.warning, "Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
         };
-        self.stack.loop.notifyHook("auth_success", entry.label);
+        self.stack.loop.notifyHook(.auth_success, entry.label);
         if (std.mem.eql(u8, entry.id, catalog.chatgpt_id)) self.welcomeToPlanUsage();
     }
 

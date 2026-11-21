@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const synth_config_dir = ".synth";
+
 pub fn resolve(io: std.Io, a: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]const u8 {
     const lexical = try std.fs.path.resolve(a, &.{ cwd, path });
     var existing: []const u8 = lexical;

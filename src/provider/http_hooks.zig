@@ -3,6 +3,9 @@ const Hooks = @import("../core/hooks.zig");
 
 const Patch = @import("../core/hook_result.zig").HttpPatch;
 const max_http_status = 599;
+const redacted_header = "<redacted>";
+const proxy_authorization_header = "proxy-authorization";
+const Phase = enum { request, headers, body, event };
 
 pub const Request = struct {
     body: []u8,
@@ -37,23 +40,27 @@ pub const Exchange = struct {
         return runner.hasMatching(a, input, false);
     }
 
-    fn evaluate(self: *Exchange, a: std.mem.Allocator, phase: []const u8, body: ?std.json.Value, headers: []const std.http.Header) !?Patch {
+    fn evaluate(self: *Exchange, a: std.mem.Allocator, phase: Phase, body: ?std.json.Value, headers: []const std.http.Header) !?Patch {
         var runner = (self.runner orelse return null).*;
         runner.stop = self.stop;
         var input = self.input;
-        if (std.mem.eql(u8, phase, "event")) {
+        if (phase == .event) {
             var handlers: std.ArrayList(Hooks.Hook) = .empty;
             for (runner.set.http_response) |hook| if (hook.stream) try handlers.append(a, hook);
             runner.set.http_response = handlers.items;
         }
-        input.event = if (std.mem.eql(u8, phase, "request")) .http_request else .http_response;
-        inline for (.{ "request_context", "request_system", "request_instruction", "request_tools", "request_routes" }) |field| @field(input, field) = "";
+        input.event = if (phase == .request) .http_request else .http_response;
+        input.request_context = "";
+        input.request_system = "";
+        input.request_instruction = "";
+        input.request_tools = "";
+        input.request_routes = "";
         if (!runner.hasMatching(a, input, false)) return null;
         var visible: std.json.ObjectMap = .empty;
-        for (headers) |header| try visible.put(a, header.name, .{ .string = if (sensitive(header.name)) "<redacted>" else header.value });
+        for (headers) |header| try visible.put(a, header.name, .{ .string = if (sensitive(header.name)) redacted_header else header.value });
         input.http = try std.json.Stringify.valueAlloc(a, .{
-            .phase = phase,
-            .method = "POST",
+            .phase = @tagName(phase),
+            .method = @tagName(std.http.Method.POST),
             .url = self.url,
             .protocol = self.protocol,
             .status = @intFromEnum(self.head.status),
@@ -76,7 +83,7 @@ pub const Exchange = struct {
         }
         try all.appendSlice(a, extra);
         const original = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
-        const patch = try self.evaluate(a, "request", original, all.items) orelse return .{ .body = body, .headers = headers, .extra_headers = extra };
+        const patch = try self.evaluate(a, .request, original, all.items) orelse return .{ .body = body, .headers = headers, .extra_headers = extra };
         if (patch.status != null or patch.drop) return error.InvalidHttpHookOutput;
         var prepared = body;
         if (patch.body) |replacement| {
@@ -93,7 +100,7 @@ pub const Exchange = struct {
                 if (@field(adjusted, field.name) == .override) @field(adjusted, field.name) = .omit;
                 var entries = overrides.object.iterator();
                 while (entries.next()) |entry| {
-                    if (entry.value_ptr.* == .string and std.mem.eql(u8, entry.value_ptr.string, "<redacted>")) continue;
+                    if (entry.value_ptr.* == .string and std.mem.eql(u8, entry.value_ptr.string, redacted_header)) continue;
                     if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, try headerName(a, field.name))) @field(adjusted, field.name) = .omit;
                 }
             }
@@ -106,7 +113,7 @@ pub const Exchange = struct {
         var it = original.iterateHeaders();
         while (it.next()) |header| try headers.append(a, .{ .name = try a.dupe(u8, header.name), .value = try a.dupe(u8, header.value) });
         self.head = .{ .status = original.status, .headers = headers.items };
-        if (try self.evaluate(a, "headers", null, headers.items)) |patch| {
+        if (try self.evaluate(a, .headers, null, headers.items)) |patch| {
             if (patch.body != null or patch.drop) return error.InvalidHttpHookOutput;
             if (patch.status) |status| {
                 if (status < @intFromEnum(std.http.Status.ok) or status > max_http_status) return error.InvalidHttpHookOutput;
@@ -136,7 +143,7 @@ pub const Exchange = struct {
             if (!selected) return body;
         }
         const input = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch std.json.Value{ .string = body };
-        const patch = try self.evaluate(a, if (streaming) "event" else "body", input, self.head.headers) orelse return body;
+        const patch = try self.evaluate(a, if (streaming) .event else .body, input, self.head.headers) orelse return body;
         if (patch.headers != null or patch.status != null) return error.InvalidHttpHookOutput;
         if (patch.drop) {
             if (!streaming or self.input.request_purpose == .approval_judge) return error.InvalidHttpHookOutput;
@@ -151,7 +158,7 @@ pub const Exchange = struct {
 };
 
 fn sensitive(name: []const u8) bool {
-    for ([_][]const u8{ "authorization", "proxy-authorization", "x-api-key", "api-key", "cookie", "set-cookie" }) |key| if (std.ascii.eqlIgnoreCase(name, key)) return true;
+    for ([_][]const u8{ "authorization", proxy_authorization_header, "x-api-key", "api-key", "cookie", "set-cookie" }) |key| if (std.ascii.eqlIgnoreCase(name, key)) return true;
     return false;
 }
 
@@ -168,11 +175,11 @@ fn updateHeaders(a: std.mem.Allocator, headers: *std.ArrayList(std.http.Header),
         const name = entry.key_ptr.*;
         if (name.len == 0) return error.InvalidHttpHookOutput;
         for (name) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) == null) return error.InvalidHttpHookOutput;
-        for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "upgrade", "proxy-authorization", "accept-encoding" }) |reserved| if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ProtectedHttpHeader;
+        for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "upgrade", proxy_authorization_header, "accept-encoding" }) |reserved| if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ProtectedHttpHeader;
         const value = entry.value_ptr.*;
         if (value != .string and value != .null) return error.InvalidHttpHookOutput;
         if (value == .string) {
-            if (std.mem.eql(u8, value.string, "<redacted>")) continue;
+            if (std.mem.eql(u8, value.string, redacted_header)) continue;
             for (value.string) |c| if (std.ascii.isControl(c)) return error.InvalidHttpHookOutput;
         }
         var index: usize = 0;

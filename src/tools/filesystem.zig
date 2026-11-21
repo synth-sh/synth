@@ -30,9 +30,15 @@ const max_line_bytes: usize = 4096;
 /// Bytes examined when deciding whether a file is binary.
 const binary_sniff_bytes: usize = 8192;
 
+pub const Name = enum { read, list, glob, grep, write, edit };
+pub const path_field = "path";
+pub const edits_field = "edits";
+pub const old_text_field = "old";
+pub const new_text_field = "new";
+
 pub const all: []const tool.Tool = &.{
     .{
-        .name = "read",
+        .name = @tagName(Name.read),
         .description = "Read a file from the project. Returns its contents with line numbers. Use offset and limit to page through a large file.",
         .schema =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Path relative to the project root"},"offset":{"type":"integer","description":"First line to return, 1-based; defaults to 1"},"limit":{"type":"integer","description":"How many lines to return; defaults to 2000"}},"required":["path"]}
@@ -42,7 +48,7 @@ pub const all: []const tool.Tool = &.{
         .parallel = true,
     },
     .{
-        .name = "list",
+        .name = @tagName(Name.list),
         .description = "List files and directories at a path in the project.",
         .schema =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Directory relative to the project root; defaults to the root"}}}
@@ -52,7 +58,7 @@ pub const all: []const tool.Tool = &.{
         .parallel = true,
     },
     .{
-        .name = "glob",
+        .name = @tagName(Name.glob),
         .description = "Find files by path pattern. Supports *, **, ?, [abc] and {a,b}. Ignored files are never returned.",
         .schema =
         \\{"type":"object","properties":{"pattern":{"type":"string","description":"e.g. src/**/*.zig or *.{json,zon}"},"path":{"type":"string","description":"Directory to search under; defaults to the project root"}},"required":["pattern"]}
@@ -62,7 +68,7 @@ pub const all: []const tool.Tool = &.{
         .parallel = true,
     },
     .{
-        .name = "grep",
+        .name = @tagName(Name.grep),
         .description = "Search file contents with a regular expression. Returns matching file:line pairs. Ignored files are never searched.",
         .schema =
         \\{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression: . [] () | * + ? {n,m} ^ $ \\b \\d \\w \\s"},"path":{"type":"string","description":"File or directory to search; defaults to the project root"},"glob":{"type":"string","description":"Only search paths matching this glob, e.g. **/*.zig"},"ignore_case":{"type":"boolean"},"literal":{"type":"boolean","description":"Match the pattern as plain text rather than a regular expression"},"context":{"type":"integer","description":"Lines of context on both sides of each match"},"before":{"type":"integer","description":"Lines of context before each match; overrides context"},"after":{"type":"integer","description":"Lines of context after each match; overrides context"}},"required":["pattern"]}
@@ -72,7 +78,7 @@ pub const all: []const tool.Tool = &.{
         .parallel = true,
     },
     .{
-        .name = "write",
+        .name = @tagName(Name.write),
         .description = "Create or overwrite a file with the given contents.",
         .schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
@@ -80,7 +86,7 @@ pub const all: []const tool.Tool = &.{
         .handler = write,
     },
     .{
-        .name = "edit",
+        .name = @tagName(Name.edit),
         .description = "Replace an exact string in a file. The file must have been read first.",
         .schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string","description":"Exact text to replace; must appear exactly once"},"new":{"type":"string"},"edits":{"type":"array","description":"Several replacements in one file, applied in order. Use instead of old/new.","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"]}}},"required":["path"]}
@@ -90,7 +96,7 @@ pub const all: []const tool.Tool = &.{
 };
 
 fn read(ctx: Context, input: Input) !Output {
-    const path = input.string("path") orelse
+    const path = input.string(path_field) orelse
         return Output.err(try ctx.allocator.dupe(u8, "read: 'path' is required"));
 
     const offset: usize = @max(1, input.integer("offset") orelse 1);
@@ -155,7 +161,7 @@ const Replacement = struct { old: []const u8, new: []const u8 };
 /// `old`/`new` pair. Both shapes exist because one edit is the common case and
 /// spelling it as a one-element array reads badly.
 fn collectEdits(arena: std.mem.Allocator, input: Input) ![]const Replacement {
-    if (input.get("edits")) |value| {
+    if (input.get(edits_field)) |value| {
         const items = switch (value) {
             .array => |array| array.items,
             else => return error.EditsMustBeAnArray,
@@ -167,16 +173,16 @@ fn collectEdits(arena: std.mem.Allocator, input: Input) ![]const Replacement {
                 .object => |object| object,
                 else => return error.EditNeedsOldAndNew,
             };
-            const from = fields.get("old") orelse return error.EditNeedsOldAndNew;
-            const to = fields.get("new") orelse return error.EditNeedsOldAndNew;
+            const from = fields.get(old_text_field) orelse return error.EditNeedsOldAndNew;
+            const to = fields.get(new_text_field) orelse return error.EditNeedsOldAndNew;
             if (from != .string or to != .string) return error.EditNeedsOldAndNew;
             slot.* = .{ .old = from.string, .new = to.string };
         }
         return out;
     }
 
-    const from = input.string("old") orelse return &.{};
-    const to = input.string("new") orelse return &.{};
+    const from = input.string(old_text_field) orelse return &.{};
+    const to = input.string(new_text_field) orelse return &.{};
     const out = try arena.alloc(Replacement, 1);
     out[0] = .{ .old = from, .new = to };
     return out;
@@ -195,7 +201,7 @@ fn clip(line: []const u8) []const u8 {
 }
 
 fn list(ctx: Context, input: Input) !Output {
-    const path = input.string("path") orelse ".";
+    const path = input.string(path_field) orelse ".";
 
     const resolved = resolve(ctx, path) catch |err| return pathError(ctx, path, err);
     defer ctx.allocator.free(resolved);
@@ -265,7 +271,7 @@ fn globTool(context: Context, input: Input) !Output {
     var ctx = context;
     const pattern = input.string("pattern") orelse
         return Output.err(try ctx.allocator.dupe(u8, "glob: 'pattern' is required"));
-    const path = input.string("path") orelse ".";
+    const path = input.string(path_field) orelse ".";
 
     const scope_path = resolve(ctx, path) catch |err| return pathError(ctx, path, err);
     defer ctx.allocator.free(scope_path);
@@ -376,7 +382,7 @@ fn grep(context: Context, input: Input) !Output {
     var ctx = context;
     const pattern = input.string("pattern") orelse
         return Output.err(try ctx.allocator.dupe(u8, "grep: 'pattern' is required"));
-    const path = input.string("path") orelse ".";
+    const path = input.string(path_field) orelse ".";
     const ignore_case = input.boolean("ignore_case") orelse false;
     const literal = input.boolean("literal") orelse false;
 
@@ -484,7 +490,7 @@ fn grep(context: Context, input: Input) !Output {
 }
 
 fn write(ctx: Context, input: Input) !Output {
-    const path = input.string("path") orelse
+    const path = input.string(path_field) orelse
         return Output.err(try ctx.allocator.dupe(u8, "write: 'path' is required"));
     const content = input.string("content") orelse
         return Output.err(try ctx.allocator.dupe(u8, "write: 'content' is required"));
@@ -504,7 +510,7 @@ fn write(ctx: Context, input: Input) !Output {
 }
 
 fn edit(ctx: Context, input: Input) !Output {
-    const path = input.string("path") orelse
+    const path = input.string(path_field) orelse
         return Output.err(try ctx.allocator.dupe(u8, "edit: 'path' is required"));
     var arena_state: std.heap.ArenaAllocator = .init(ctx.allocator);
     defer arena_state.deinit();

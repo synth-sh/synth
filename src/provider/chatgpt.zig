@@ -373,7 +373,7 @@ fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, url: []const u8, track_
         var request = try self.client.request(.GET, uri, .{
             .redirect_behavior = .not_allowed,
             .keep_alive = false,
-            .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" } },
+            .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = Provider.identity_encoding } },
         });
         defer {
             if (track_turn) self.socket.forget(self.io);
@@ -434,7 +434,7 @@ fn respond(
         var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = hook_attempt.turn.hook_input, .url = responses_url, .protocol = "responses", .stop = turn.stop };
         const request_body = try self.buildRequest(arena, convo, turn);
         const extra_headers = self.requestHeaders();
-        const prepared = try http.request(arena, request_body, .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" }, .content_type = .{ .override = "application/json" } }, &extra_headers);
+        const prepared = try http.request(arena, request_body, .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = Provider.identity_encoding }, .content_type = .{ .override = Provider.json_content_type } }, &extra_headers);
         const body = prepared.body;
         // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
@@ -456,7 +456,7 @@ fn respond(
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
         const head = try http.response(arena, response.head);
-        const retry_after = retry.retryAfterMs(head.get("retry-after"));
+        const retry_after = retry.retryAfterMs(head.get(retry.retry_after_header));
         const transfer = try arena.alloc(u8, transfer_buffer_bytes);
         const reader = response.reader(transfer);
 
@@ -469,7 +469,7 @@ fn respond(
             hook_attempt.finish();
 
             if (head.status == .unauthorized and !refreshed) {
-                if (retry.pause(self.io, self.retries, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = retry.errorType(head.status), .error_message = why })) {
+                if (retry.pause(self.io, self.retries, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = @tagName(retry.errorType(head.status)), .error_message = why })) {
                     try store.forceRefresh();
                     refreshed = true;
                     attempt += 1;

@@ -17,13 +17,13 @@ const McpStore = @import("core/mcp_store.zig");
 const humanize = @import("core/humanize.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
+const terminal = @import("terminal_output.zig");
 
-const dim = "\x1b[2m";
-const bold = "\x1b[1m";
+const dim = terminal.dim;
 const green = "\x1b[32m";
 const yellow = "\x1b[33m";
 const red = "\x1b[31m";
-const reset = "\x1b[0m";
+const reset = terminal.reset;
 
 /// One headless turn: same loop and provider as the TUI, printing to stdout.
 pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !void {
@@ -121,7 +121,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         reset,
         if (config.auto_approve_safe_commands) "run without asking" else "off",
     });
-    try out.print("{s}▸ you{s} {s}\n", .{ bold, reset, prompt });
+    try terminal.writeTranscriptLine(out, "you", prompt);
     try out.flush();
 
     try loop.submit(prompt, .{});
@@ -142,7 +142,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         if (loop.state == .awaiting_approval) {
             const call = loop.pendingCall().?;
             try out.print("{s}  ? approve {s}{s}{s} {s}\n", .{
-                yellow, bold, call.name, reset, call.arguments,
+                yellow, terminal.bold, call.name, reset, call.arguments,
             });
             try out.flush();
             switch (answer(allow_mutating, started, loop.approvals)) {
@@ -207,7 +207,7 @@ fn report(out: *std.Io.Writer, convo: *Conversation, from: usize) !usize {
                     try out.print("{s}  · thought {s}{s}\n", .{ dim, humanize.duration(&buffer, ms), reset });
                 }
                 if (msg.displayedText().len > 0) {
-                    try out.print("{s}▸ {s}{s} {s}\n", .{ bold, pkg.name, reset, msg.displayedText() });
+                    try terminal.writeTranscriptLine(out, pkg.name, msg.displayedText());
                 }
                 for (msg.tool_calls) |call| {
                     const colour = switch (call.status) {

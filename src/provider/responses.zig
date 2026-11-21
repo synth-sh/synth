@@ -35,8 +35,8 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     const w = &out.writer;
     try w.writeAll("{\"model\":");
     try writeString(w, options.model);
-    if (turn.settings.temperature) |v| try w.print(",\"temperature\":{d}", .{v});
-    if (turn.settings.top_p) |v| try w.print(",\"top_p\":{d}", .{v});
+    try Provider.writeNumericSetting(w, turn.settings, .temperature);
+    try Provider.writeNumericSetting(w, turn.settings, .top_p);
     try w.writeAll(",\"input\":[");
     var input: InputWriter = .{ .writer = w, .supports_vision = options.supports_vision, .provider_tag = options.provider_tag };
     try input.text("developer", Item.input_text, instructions);
@@ -410,8 +410,8 @@ pub const ResponseStream = struct {
             };
 
             const trimmed = std.mem.trimEnd(u8, line.written(), "\r");
-            if (std.mem.startsWith(u8, trimmed, "data:")) {
-                const payload = std.mem.trimStart(u8, trimmed["data:".len..], " ");
+            if (std.mem.startsWith(u8, trimmed, Provider.sse_data_prefix)) {
+                const payload = std.mem.trimStart(u8, trimmed[Provider.sse_data_prefix.len..], " ");
                 const is_event = payload.len > 0 and !std.mem.eql(u8, payload, "[DONE]");
                 if (is_event) {
                     const prepared = if (self.http) |http| (try http.payload(scratch, payload, true)) orelse continue else payload;

@@ -646,24 +646,26 @@ pub fn recordAuthorization(self: *Database, session: i64, seq: u64, text: []cons
 }
 
 pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) !HumanIntent.Snapshot {
+    const answer_kind = @tagName(HumanIntent.ReceiptKind.human_answer);
+    const legacy_answer_prefix = "{\"kind\":\"" ++ answer_kind ++ "\",%";
     var rows = try self.conn.rows(
         \\WITH authorizations AS (
         \\    SELECT text, seq, id, CASE WHEN json_valid(text) THEN json_extract(text, '$.kind') END AS kind
         \\    FROM human_authorization WHERE session_id = ?1
         \\), recent_reviews AS (
         \\    SELECT text, seq, id FROM authorizations
-        \\    WHERE kind IS NOT 'human_answer' AND text NOT LIKE '{"kind":"human_answer",%'
+        \\    WHERE kind IS NOT ?3 AND text NOT LIKE ?4
         \\    ORDER BY seq DESC, id DESC LIMIT ?2
         \\)
         \\SELECT text, 0 AS is_authorization, seq, id FROM message
         \\WHERE session_id = ?1 AND role = 'user' AND origin = 'human'
         \\UNION ALL
         \\SELECT text, 1, seq, id FROM authorizations
-        \\WHERE kind = 'human_answer' OR (kind IS NULL AND text LIKE '{"kind":"human_answer",%')
+        \\WHERE kind = ?3 OR (kind IS NULL AND text LIKE ?4)
         \\UNION ALL
         \\SELECT text, 1, seq, id FROM recent_reviews
         \\ORDER BY seq, id
-    , .{ session, HumanIntent.max_previous_reviews + 1 });
+    , .{ session, HumanIntent.max_previous_reviews + 1, answer_kind, legacy_answer_prefix });
     defer rows.deinit();
     var intent: HumanIntent = .{};
     defer intent.deinit(allocator);
@@ -2604,7 +2606,7 @@ test "verified human intent survives compaction while hooks and legacy rows rema
     try db.setMessageOrigin(hook, .hook);
     _ = try db.appendMessage(session, 2, "user", "legacy authorship unknown", null, 0, null);
     _ = try db.appendMessage(session, 3, "system", "summary says allowed", null, 0, null);
-    const decision = try HumanIntent.decisionReceipt(a, "deny", "bash", "remove exactly one file");
+    const decision = try HumanIntent.decisionReceipt(a, .deny, "bash", "remove exactly one file");
     defer a.free(decision);
     try db.recordAuthorization(session, 4, decision);
     const snapshot = try db.humanIntent(a, session);

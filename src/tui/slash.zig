@@ -7,6 +7,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const skill = @import("../core/skill.zig");
+const SlashCommand = @import("../core/slash_command.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
 
@@ -50,7 +51,7 @@ const unlabelled_skill = "run this skill";
 /// alphabetically: the ones that change what the model sees come first.
 pub const commands: []const Command = &.{
     .{ .name = "clear", .description = "clear the transcript and start a fresh session", .is_destructive = true },
-    .{ .name = "compact", .description = "summarise the conversation so far, freeing context", .is_destructive = true },
+    .{ .name = SlashCommand.compact, .description = "summarise the conversation so far, freeing context", .is_destructive = true },
     .{ .name = "model", .description = "switch the model this session runs on", .argument = optional_name },
     .{ .name = "effort", .description = "set how hard the model thinks, where it has levels", .argument = .{ .optional = "level" } },
     .{ .name = "sessions", .description = "switch to another session" },
@@ -63,9 +64,9 @@ pub const commands: []const Command = &.{
     .{ .name = "approvals", .description = "who decides calls: ask you, auto (a model judges), or all", .argument = .{ .optional = "ask|auto|all" } },
     .{ .name = "rewind", .description = "put back files as they were before an earlier prompt" },
     .{ .name = "permissions", .description = "see, edit and remove what is always allowed here" },
-    .{ .name = "cd", .description = "change the session working directory", .argument = .{ .optional = "path" } },
-    .{ .name = "add-dir", .description = "add a permitted directory to this session", .argument = .{ .required = "path" } },
-    .{ .name = "hooks", .description = "list, review, trust, enable or disable lifecycle hooks", .argument = .{ .optional = "action [id]" } },
+    .{ .name = SlashCommand.cd, .description = "change the session working directory", .argument = .{ .optional = "path" } },
+    .{ .name = SlashCommand.add_dir, .description = "add a permitted directory to this session", .argument = .{ .required = "path" } },
+    .{ .name = SlashCommand.hooks, .description = "list, review, trust, enable or disable lifecycle hooks", .argument = .{ .optional = "action [id]" } },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
     .{ .name = "theme", .description = "change the color theme", .argument = optional_name },
     .{ .name = "rename", .description = "name this session", .argument = optional_name },
@@ -149,7 +150,7 @@ pub fn update(self: *Slash, text: []const u8, cursor: usize) !void {
 
     self.active = true;
     self.selected = 0;
-    self.has_argument = std.mem.trim(u8, text[word_end..], whitespace).len > 0;
+    self.has_argument = std.mem.trim(u8, text[word_end..], SlashCommand.whitespace).len > 0;
     try self.filter(text[1..word_end]);
 }
 
@@ -213,10 +214,8 @@ pub fn completion(self: *const Slash, arena: std.mem.Allocator, draft: []const u
     return try std.fmt.allocPrint(arena, "/{s} ", .{command.name});
 }
 
-const whitespace = " \t\r\n";
-
 pub fn commandWordEnd(text: []const u8) usize {
-    return std.mem.indexOfAny(u8, text, whitespace) orelse text.len;
+    return std.mem.indexOfAny(u8, text, SlashCommand.whitespace) orelse text.len;
 }
 
 fn typedArgument(draft: []const u8) []const u8 {

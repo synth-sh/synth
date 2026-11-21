@@ -2,7 +2,19 @@ const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
 const Hooks = @import("../core/hooks.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
+const retry = @import("retry.zig");
+const ModelSettings = @import("../core/model_policy.zig").Settings;
 const http_status_digits = 3;
+
+pub const json_content_type = "application/json";
+pub const identity_encoding = "identity";
+pub const sse_data_prefix = "data:";
+
+pub fn writeNumericSetting(w: *std.Io.Writer, settings: ModelSettings, comptime field: std.meta.FieldEnum(ModelSettings)) !void {
+    const name = @tagName(field);
+    if (@field(settings, name)) |value| try w.print(",\"" ++ name ++ "\":{d}", .{value});
+}
 
 /// The seam every model backend plugs into.
 const Provider = @This();
@@ -62,7 +74,7 @@ pub const Turn = struct {
     backend: ?*@import("backend.zig") = null,
     stop: ?*const std.atomic.Value(bool) = null,
     model_policy: @import("../core/model_policy.zig").Policy = .{},
-    settings: @import("../core/model_policy.zig").Settings = .{},
+    settings: ModelSettings = .{},
     /// The system prompt, complete. Borrowed for the length of the call.
     system: []const u8,
     /// Tool definitions as JSON, from `Registry.schemaJson`. Empty means the
@@ -128,7 +140,7 @@ pub const Attempt = struct {
         invocation.output_tokens = self.usage.completion_tokens;
         var result = runner.evaluate(self.allocator, invocation) catch |err| {
             if (runner.runtime) |runtime| {
-                const message = std.fmt.allocPrint(self.allocator, "{s} hook failed: {s}", .{ event.name(), @errorName(err) }) catch return;
+                const message = std.fmt.allocPrint(self.allocator, HooksCopy.named_failure, .{ event.name(), @errorName(err) }) catch return;
                 defer self.allocator.free(message);
                 runtime.notice(message) catch {};
             }
@@ -215,8 +227,8 @@ pub fn mentionsOverflow(why: []const u8) bool {
 
 pub fn errorType(err: anyerror, details: []const u8) []const u8 {
     switch (err) {
-        error.ContextTooLarge => return "invalid_request",
-        error.NotSignedIn => return "authentication_failed",
+        error.ContextTooLarge => return @tagName(retry.ErrorType.invalid_request),
+        error.NotSignedIn => return @tagName(retry.ErrorType.authentication_failed),
         else => {},
     }
     var words = std.mem.tokenizeAny(u8, details, " \t\r\n:");
@@ -230,9 +242,9 @@ pub fn errorType(err: anyerror, details: []const u8) []const u8 {
             else => continue,
         }
         const rest = std.mem.trimStart(u8, words.rest(), " \t");
-        if (std.ascii.startsWithIgnoreCase(rest, phrase)) return @import("retry.zig").errorType(status);
+        if (std.ascii.startsWithIgnoreCase(rest, phrase)) return @tagName(retry.errorType(status));
     }
-    return "unknown";
+    return @tagName(retry.ErrorType.unknown);
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {

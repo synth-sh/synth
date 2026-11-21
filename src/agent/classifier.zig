@@ -21,6 +21,10 @@ const Conversation = @import("../core/conversation.zig");
 
 pub const Stage = enum { quick, careful };
 
+const allow_word = "ALLOW";
+const block_word = "BLOCK";
+const verdict_marker = "VERDICT:";
+
 pub const Verdict = union(enum) {
     allow,
     /// Why, in the classifier's words, for the agent to read.
@@ -83,15 +87,13 @@ pub const system_prompt =
 /// What the stage is asked to answer with, after the material.
 pub fn instruction(stage: Stage) []const u8 {
     return switch (stage) {
-        .quick =>
-        \\Answer with one word: ALLOW or BLOCK. When in any doubt, BLOCK.
-        ,
-        .careful =>
-        \\Think it through: what exactly the action does, what it could damage,
-        \\and whether the person's messages ask for it. Then end with one last
-        \\line, either "VERDICT: ALLOW" or "VERDICT: BLOCK: <one sentence on why,
-        \\addressed to the agent>".
-        ,
+        .quick => "Answer with one word: " ++ allow_word ++ " or " ++ block_word ++ ". When in any doubt, " ++ block_word ++ ".",
+        .careful => std.fmt.comptimePrint(
+            \\Think it through: what exactly the action does, what it could damage,
+            \\and whether the person's messages ask for it. Then end with one last
+            \\line, either "{s} {s}" or "{s} {s}: <one sentence on why,
+            \\addressed to the agent>".
+        , .{ verdict_marker, allow_word, verdict_marker, block_word }),
     };
 }
 
@@ -165,18 +167,17 @@ pub fn verdict(stage: Stage, reply: []const u8) Verdict {
     const trimmed = std.mem.trim(u8, reply, " \t\r\n*.`");
     switch (stage) {
         .quick => {
-            if (std.ascii.eqlIgnoreCase(trimmed, "ALLOW")) return .allow;
-            if (std.ascii.eqlIgnoreCase(trimmed, "BLOCK")) return .{ .block = "" };
+            if (std.ascii.eqlIgnoreCase(trimmed, allow_word)) return .allow;
+            if (std.ascii.eqlIgnoreCase(trimmed, block_word)) return .{ .block = "" };
             return .unclear;
         },
         .careful => {
-            const marker = "VERDICT:";
-            const at = std.mem.lastIndexOf(u8, trimmed, marker) orelse return .unclear;
-            const rest = std.mem.trim(u8, trimmed[at + marker.len ..], " \t\r\n*.`");
-            if (std.ascii.eqlIgnoreCase(rest, "ALLOW")) return .allow;
-            if (!startsWithWord(rest, "BLOCK")) return .unclear;
+            const at = std.mem.lastIndexOf(u8, trimmed, verdict_marker) orelse return .unclear;
+            const rest = std.mem.trim(u8, trimmed[at + verdict_marker.len ..], " \t\r\n*.`");
+            if (std.ascii.eqlIgnoreCase(rest, allow_word)) return .allow;
+            if (!startsWithWord(rest, block_word)) return .unclear;
             const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
-            const reason = std.mem.trim(u8, rest["BLOCK".len..line_end], " \t:-*`");
+            const reason = std.mem.trim(u8, rest[block_word.len..line_end], " \t:-*`");
             return .{ .block = reason };
         },
     }
@@ -259,7 +260,7 @@ test "human request restrictions survive decision receipts" {
     defer intent.deinit(a);
     const restriction = "inspect only; do not upload";
     try intent.record(a, restriction, false);
-    const receipt = try HumanIntent.decisionReceipt(a, "deny", "bash", "rm exactly-one-file");
+    const receipt = try HumanIntent.decisionReceipt(a, .deny, "bash", "rm exactly-one-file");
     defer a.free(receipt);
     for (0..20) |_| try intent.record(a, receipt, true);
     const text = try material(arena.allocator(), "/repo", try intent.view(arena.allocator()), &.{}, .{ .id = "call", .name = "bash", .arguments = "{}" });

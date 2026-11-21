@@ -14,6 +14,9 @@ const max_review_fragment_bytes = 1000 * 4;
 pub const omission_notice = "Some human instructions or answers are omitted. Do not treat remaining grants as complete authorization.";
 const review_omission_notice = "Some previous approve/deny decisions are omitted. Retained decisions apply only to their described actions.";
 const question_omitted_text = "The question the person answered was too long to keep.";
+const typed_answer_source = "typed";
+pub const ReceiptKind = enum { human_answer, human_tool_decision };
+pub const Decision = enum { approve, deny };
 
 has_human: bool = false,
 next_order: u64 = 0,
@@ -82,16 +85,16 @@ pub fn deinit(self: *Intent, a: std.mem.Allocator) void {
 pub fn answerReceipt(a: std.mem.Allocator, question: []const u8, answer: []const u8) ![]u8 {
     for ([_][]const u8{ question, question_omitted_text }) |shown| {
         if (shown.len +| answer.len > max_record_bytes) continue;
-        const encoded = try std.json.Stringify.valueAlloc(a, .{ .kind = "human_answer", .source = "typed", .question = shown, .answer = answer }, .{});
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .kind = ReceiptKind.human_answer, .source = typed_answer_source, .question = shown, .answer = answer }, .{});
         if (encoded.len <= max_record_bytes) return encoded;
         a.free(encoded);
     }
-    return std.json.Stringify.valueAlloc(a, .{ .kind = "human_answer", .source = "typed", .omitted = true }, .{});
+    return std.json.Stringify.valueAlloc(a, .{ .kind = ReceiptKind.human_answer, .source = typed_answer_source, .omitted = true }, .{});
 }
 
-pub fn decisionReceipt(a: std.mem.Allocator, decision: []const u8, tool: []const u8, action: []const u8) ![]u8 {
+pub fn decisionReceipt(a: std.mem.Allocator, decision: Decision, tool: []const u8, action: []const u8) ![]u8 {
     const description = clip(action, max_review_action_bytes);
-    return std.json.Stringify.valueAlloc(a, .{ .kind = "human_tool_decision", .decision = decision, .tool = tool, .action = description, .action_omitted = description.len < action.len }, .{});
+    return std.json.Stringify.valueAlloc(a, .{ .kind = ReceiptKind.human_tool_decision, .decision = decision, .tool = tool, .action = description, .action_omitted = description.len < action.len }, .{});
 }
 
 pub fn record(self: *Intent, a: std.mem.Allocator, text: []const u8, authorization: bool) !void {
@@ -110,10 +113,11 @@ pub fn record(self: *Intent, a: std.mem.Allocator, text: []const u8, authorizati
     defer parsed.deinit();
     const value = parsed.value;
     if (value != .object) return self.omit(a, &self.answers);
-    const kind = string(value, "kind") orelse return self.omit(a, &self.answers);
-    if (std.mem.eql(u8, kind, "human_answer")) {
+    const name = string(value, "kind") orelse return self.omit(a, &self.answers);
+    const kind = std.meta.stringToEnum(ReceiptKind, name) orelse return self.omit(a, &self.answers);
+    if (kind == .human_answer) {
         const source = string(value, "source") orelse return self.omit(a, &self.answers);
-        if (!std.mem.eql(u8, source, "typed")) return self.omit(a, &self.answers);
+        if (!std.mem.eql(u8, source, typed_answer_source)) return self.omit(a, &self.answers);
         if (value.object.get("omitted")) |omitted| {
             if (omitted == .bool and omitted.bool) {
                 self.has_human = true;
@@ -125,13 +129,10 @@ pub fn record(self: *Intent, a: std.mem.Allocator, text: []const u8, authorizati
         const question = string(value, "question") orelse return self.omit(a, &self.answers);
         return self.insert(a, &self.answers, question, answer, text.len, .agent);
     }
-    if (std.mem.eql(u8, kind, "human_tool_decision")) {
-        if (string(value, "action") == null or string(value, "tool") == null) return self.omit(a, &self.decisions);
-        const decision = string(value, "decision") orelse return self.omit(a, &self.decisions);
-        if (!std.mem.eql(u8, decision, "approve") and !std.mem.eql(u8, decision, "deny")) return self.omit(a, &self.decisions);
-        return self.insert(a, &self.decisions, text, null, text.len, .human_decision);
-    }
-    return self.omit(a, &self.answers);
+    if (string(value, "action") == null or string(value, "tool") == null) return self.omit(a, &self.decisions);
+    const decision = string(value, "decision") orelse return self.omit(a, &self.decisions);
+    if (std.meta.stringToEnum(Decision, decision) == null) return self.omit(a, &self.decisions);
+    return self.insert(a, &self.decisions, text, null, text.len, .human_decision);
 }
 
 fn string(value: std.json.Value, key: []const u8) ?[]const u8 {

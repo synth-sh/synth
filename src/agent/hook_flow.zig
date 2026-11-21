@@ -1,5 +1,6 @@
 const std = @import("std");
 const Hooks = @import("../core/hooks.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
 const HookWatch = @import("../core/hook_watch.zig");
 const Flow = @This();
 const Loop = @import("loop.zig");
@@ -8,7 +9,17 @@ const Database = @import("../core/database.zig");
 pub const identity_bytes = 16;
 const transcript_buffer_bytes = 4 * 1024;
 
-pub const Compaction = enum { manual, during_turn };
+pub const Compaction = enum {
+    manual,
+    during_turn,
+
+    pub fn trigger(self: Compaction) []const u8 {
+        return switch (self) {
+            .manual => "manual",
+            .during_turn => "auto",
+        };
+    }
+};
 pub const Resume = enum { begin_prompt, ask_model, compact, compact_session, after_compact, finish_turn, config_idle, failed_turn };
 pub const Pending = union(enum) {
     prompt,
@@ -176,8 +187,8 @@ pub fn observeHook(self: *Loop, invocation: Hooks.Invocation) void {
     };
 }
 
-pub fn notifyHook(self: *Loop, kind: []const u8, message: []const u8) void {
-    observeHook(self, .{ .event = .notification, .notification_type = kind, .message = message });
+pub fn notifyHook(self: *Loop, kind: Hooks.NotificationType, message: []const u8) void {
+    observeHook(self, .{ .event = .notification, .notification_type = @tagName(kind), .message = message });
 }
 
 pub fn acceptHookResult(self: *Loop, result: *const Hooks.Result) !void {
@@ -186,7 +197,7 @@ pub fn acceptHookResult(self: *Loop, result: *const Hooks.Result) !void {
     }
     if (result.context) |context| {
         const combined = if (self.hook_flow.context) |old|
-            try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ old, context })
+            try std.fmt.allocPrint(self.allocator, HooksCopy.join_lines, .{ old, context })
         else
             try self.allocator.dupe(u8, context);
         if (self.hook_flow.context) |old| self.allocator.free(old);
@@ -206,13 +217,13 @@ pub fn pollHookFiles(self: *Loop, force: bool) !void {
     while (self.hook_flow.watch.take(.file_changed)) |change| observeHook(self, .{ .event = .file_changed, .file_path = change.path, .event_type = change.kind });
 }
 
-pub fn trackModel(self: *Loop, source: []const u8) !void {
+pub fn trackModel(self: *Loop, source: Hooks.ModelSwitchSource) !void {
     if (self.hook_flow.model) |old| {
         if (std.mem.eql(u8, old, self.provider.model)) return;
     }
     const current = try self.allocator.dupe(u8, self.provider.model);
     if (self.hook_flow.model) |old| {
-        observeHook(self, .{ .event = .post_model_switch, .from_model = old, .to_model = current, .source = source });
+        observeHook(self, .{ .event = .post_model_switch, .from_model = old, .to_model = current, .source = @tagName(source) });
         self.allocator.free(old);
     }
     self.hook_flow.model = current;
@@ -222,6 +233,6 @@ pub fn lifecycle(self: *Loop, event: Hooks.Event, next: Resume) !bool {
     return start(self, .{
         .event = event,
         .source = @tagName(self.hook_flow.session_source),
-        .trigger = if (self.hook_flow.compaction != .manual) "auto" else "manual",
+        .trigger = self.hook_flow.compaction.trigger(),
     }, .{ .lifecycle = next });
 }

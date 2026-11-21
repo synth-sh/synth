@@ -19,13 +19,14 @@ const mcp = @import("mcp");
 const mcp_tools = @import("tools/mcp.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
+const terminal = @import("terminal_output.zig");
 
 /// Sessions listed by `session list`.
 const list_limit: usize = 50;
 
-const dim = "\x1b[2m";
-const bold = "\x1b[1m";
-const reset = "\x1b[0m";
+const dim = terminal.dim;
+const bold = terminal.bold;
+const reset = terminal.reset;
 
 /// Config, project and database, which every command here needs.
 const Context = struct {
@@ -271,7 +272,7 @@ fn showSession(ctx: *Context, out: *std.Io.Writer, handle: []const u8) !void {
             .system => "system",
             .summary => "summary",
         };
-        try out.print("{s}▸ {s}{s} {s}\n", .{ bold, label, reset, msg.text });
+        try terminal.writeTranscriptLine(out, label, msg.text);
         for (msg.tool_calls) |call| {
             try out.print("  {s}{s}{s} {s}\n", .{ dim, call.name, reset, call.arguments });
         }

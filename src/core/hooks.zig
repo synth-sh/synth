@@ -1,11 +1,18 @@
 const std = @import("std");
 const ToolInput = @import("hook_tool_input.zig");
+const Filesystem = @import("../tools/filesystem.zig");
 const builtin = @import("builtin");
-pub const Result = @import("hook_result.zig").Result;
 const output = @import("hook_result.zig");
+const HooksCopy = @import("hooks_copy.zig");
 const regex = @import("regex.zig");
 const ansi = @import("ansi.zig");
 const ModelClass = @import("model_class.zig");
+const mcp = @import("../tools/mcp.zig");
+const shell = @import("../tools/shell.zig");
+const task = @import("../tools/task.zig");
+
+pub const Result = output.Result;
+pub const Permission = output.Permission;
 
 const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
@@ -30,7 +37,7 @@ const command_not_found_exit_code = 127;
 const project_dir_variables = [_][]const u8{ "SYNTH_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT" };
 
 const claude_tool_names = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "bash", "Bash" }, .{ "read", "Read" }, .{ "write", "Write" }, .{ "edit", "Edit" }, .{ "task", "Agent" },
+    .{ shell.tool_name, "Bash" }, .{ @tagName(Filesystem.Name.read), "Read" }, .{ @tagName(Filesystem.Name.write), "Write" }, .{ @tagName(Filesystem.Name.edit), "Edit" }, .{ task.tool_name, "Agent" },
 });
 
 pub fn expandProjectDir(arena: std.mem.Allocator, word: []const u8, root: []const u8) ![]const u8 {
@@ -44,7 +51,6 @@ pub fn expandProjectDir(arena: std.mem.Allocator, word: []const u8, root: []cons
     return expanded;
 }
 
-pub const review_notice = "Hooks need review. Use /hooks review or synth hooks review; trust or disable each reviewed id.";
 const max_timeout_ms: u64 = 86_400_000;
 const background_limit: usize = 64;
 const concurrent_limit = 8;
@@ -164,6 +170,10 @@ fn wireName(comptime tag: []const u8) []const u8 {
 
 pub const AgentScope = enum { main, subagent };
 pub const RequestPurpose = @import("model_policy.zig").Purpose;
+pub const ConfigSource = enum { user_settings, project_settings, skills };
+pub const ModelSwitchSource = enum { initial, @"resume", automatic, command, sdk, picker };
+pub const NotificationType = enum { notice, auth_success, idle_prompt, agent_completed, agent_needs_input, permission_prompt };
+pub const inline_source = "config";
 
 pub const When = struct {
     agent_scope: ?AgentScope = null,
@@ -179,7 +189,8 @@ pub const When = struct {
         if (self.tier) |choice| if (!choice.has(input.model_tier)) return false;
         if (self.agent_scope) |value| if (value != input.agent_scope) return false;
         if (self.request_purpose) |value| if (value != input.request_purpose) return false;
-        inline for (.{ "agent_type", "model", "provider" }) |field| {
+        inline for ([_]Invocation.Field{ .agent_type, .model, .provider }) |input_field| {
+            const field = @tagName(input_field);
             if (@field(self, field)) |value| if (!std.mem.eql(u8, value, @field(input, field))) return false;
         }
         return true;
@@ -208,7 +219,7 @@ pub const Hook = struct {
     enabled: bool = true,
     transcript: bool = false,
     stream: bool = false,
-    source: []const u8 = "config",
+    source: []const u8 = inline_source,
     timeout_ms: ?u64 = null,
     async: bool = false,
     type: Kind = .command,
@@ -322,11 +333,15 @@ pub fn parse(allocator: std.mem.Allocator, value: std.json.Value, source: []cons
     return set;
 }
 
+const GroupField = enum { matcher, hooks, when };
+const HandlerField = enum { type, command, timeout_ms, timeout, async, stream, server, tool, arguments, transcript, onFailure };
+const input_alias = "input";
+
 fn unwrapEvents(value: std.json.Value) !std.json.Value {
-    const wrapped = value.object.get("hooks") orelse return value;
+    const wrapped = value.object.get(@tagName(GroupField.hooks)) orelse return value;
     if (wrapped != .object) return error.InvalidHooks;
     for (value.object.keys()) |key| {
-        if (!std.mem.eql(u8, key, "hooks") and !std.mem.eql(u8, key, "description")) return error.InvalidHooks;
+        if (!std.mem.eql(u8, key, @tagName(GroupField.hooks)) and !std.mem.eql(u8, key, "description")) return error.InvalidHooks;
     }
     return wrapped;
 }
@@ -334,11 +349,11 @@ fn unwrapEvents(value: std.json.Value) !std.json.Value {
 const Declaration = struct { event: Event, source: []const u8, matcher: []const u8, when: ?When };
 
 fn parseDeclaration(a: std.mem.Allocator, value: std.json.Value, event: Event, source: []const u8, hooks: *std.ArrayList(Hook)) !void {
-    const matcher = if (value.object.get("matcher")) |field| matcher: {
+    const matcher = if (value.object.get(@tagName(GroupField.matcher))) |field| matcher: {
         if (field != .string) return error.InvalidHookMatcher;
         break :matcher field.string;
     } else "";
-    const filter = if (value.object.get("when")) |field| try parseWhen(a, field) else null;
+    const filter = if (value.object.get(@tagName(GroupField.when))) |field| try parseWhen(a, field) else null;
     const declaration: Declaration = .{ .event = event, .source = source, .matcher = matcher, .when = filter };
     if (event == .file_changed) {
         var names = std.mem.tokenizeScalar(u8, matcher, '|');
@@ -350,14 +365,14 @@ fn parseDeclaration(a: std.mem.Allocator, value: std.json.Value, event: Event, s
             }
         }
     }
-    const group = value.object.get("hooks") orelse {
-        if (value.object.contains("command")) return error.FlatHookFormatNeedsGrouping;
+    const group = value.object.get(@tagName(GroupField.hooks)) orelse {
+        if (value.object.contains(@tagName(HandlerField.command))) return error.FlatHookFormatNeedsGrouping;
         return error.InvalidHooks;
     };
     if (group != .array) return error.InvalidHooks;
     var fields = value.object.iterator();
     while (fields.next()) |field| {
-        if (std.meta.stringToEnum(enum { matcher, hooks, when }, field.key_ptr.*) == null) return error.InvalidHookDefinition;
+        if (std.meta.stringToEnum(GroupField, field.key_ptr.*) == null) return error.InvalidHookDefinition;
     }
     for (group.array.items) |handler| try hooks.append(a, try parseHandler(a, handler, declaration));
 }
@@ -365,13 +380,13 @@ fn parseDeclaration(a: std.mem.Allocator, value: std.json.Value, event: Event, s
 fn parseHandler(a: std.mem.Allocator, definition: std.json.Value, declaration: Declaration) !Hook {
     const value = try withArgumentsKey(a, definition);
     try validateDefinition(value, declaration.source);
-    const timeout_ms: ?u64 = if (value.object.get("timeout")) |seconds| blk: {
-        if (seconds != .integer or seconds.integer <= 0 or seconds.integer > max_timeout_ms / std.time.ms_per_s or value.object.contains("timeout_ms")) return error.InvalidHookTimeout;
+    const timeout_ms: ?u64 = if (value.object.get(@tagName(HandlerField.timeout))) |seconds| blk: {
+        if (seconds != .integer or seconds.integer <= 0 or seconds.integer > max_timeout_ms / std.time.ms_per_s or value.object.contains(@tagName(HandlerField.timeout_ms))) return error.InvalidHookTimeout;
         break :blk @intCast(seconds.integer * std.time.ms_per_s);
     } else null;
     var hook = try std.json.parseFromValueLeaky(Hook, a, value, .{ .ignore_unknown_fields = true });
     if (timeout_ms) |ms| hook.timeout_ms = ms;
-    if (value.object.get("onFailure")) |setting| {
+    if (value.object.get(@tagName(HandlerField.onFailure))) |setting| {
         if (setting != .string) return error.InvalidHookDefinition;
         hook.on_failure = std.meta.stringToEnum(Hook.OnFailure, setting.string) orelse return error.InvalidHookDefinition;
     }
@@ -380,7 +395,7 @@ fn parseHandler(a: std.mem.Allocator, definition: std.json.Value, declaration: D
     hook.when = declaration.when;
     if (hook.type == .command and hook.command.len == 0) return error.InvalidHooks;
     if (hook.type == .mcp_tool) {
-        if (hook.server.len == 0 or hook.tool.len == 0 or !value.object.contains("arguments")) return error.InvalidHookDefinition;
+        if (hook.server.len == 0 or hook.tool.len == 0 or !value.object.contains(@tagName(HandlerField.arguments))) return error.InvalidHookDefinition;
         if (hook.arguments != .object and hook.arguments != .string) return error.InvalidHookDefinition;
         if (hook.async) return error.AsyncMcpHookUnsupported;
         if (declaration.event == .session_end) return error.SessionEndMcpHookUnsupported;
@@ -398,23 +413,22 @@ fn parseHandler(a: std.mem.Allocator, definition: std.json.Value, declaration: D
 
 fn withArgumentsKey(a: std.mem.Allocator, definition: std.json.Value) !std.json.Value {
     if (definition != .object) return definition;
-    const input = definition.object.get("input") orelse return definition;
-    if (definition.object.contains("arguments")) return error.InvalidHookDefinition;
+    const input = definition.object.get(input_alias) orelse return definition;
+    if (definition.object.contains(@tagName(HandlerField.arguments))) return error.InvalidHookDefinition;
     var object = try definition.object.clone(a);
-    _ = object.orderedRemove("input");
-    try object.put(a, "arguments", input);
+    _ = object.orderedRemove(input_alias);
+    try object.put(a, @tagName(HandlerField.arguments), input);
     return .{ .object = object };
 }
 
 fn validateDefinition(value: std.json.Value, source: []const u8) !void {
     if (value != .object) return error.InvalidHooks;
-    const kind: Hook.Kind = if (value.object.get("type")) |field| blk: {
+    const kind: Hook.Kind = if (value.object.get(@tagName(HandlerField.type))) |field| blk: {
         if (field != .string) return error.InvalidHookDefinition;
         break :blk std.meta.stringToEnum(Hook.Kind, field.string) orelse return error.UnsupportedHookHandlerType;
     } else .command;
-    const Field = enum { type, command, timeout_ms, timeout, async, stream, server, tool, arguments, transcript, onFailure };
     for (value.object.keys()) |key| {
-        const field = std.meta.stringToEnum(Field, key) orelse {
+        const field = std.meta.stringToEnum(HandlerField, key) orelse {
             std.log.warn("{s}: ignoring unknown hook handler key {s}", .{ source, key });
             continue;
         };
@@ -428,6 +442,8 @@ fn validateDefinition(value: std.json.Value, source: []const u8) !void {
 }
 
 pub const Invocation = struct {
+    const Field = std.meta.FieldEnum(Invocation);
+
     request_system: []const u8 = "",
     request_instruction: []const u8 = "",
     request_tools: []const u8 = "",
@@ -521,7 +537,7 @@ pub const Record = struct {
     agent_scope: AgentScope = .main,
     request_purpose: RequestPurpose = .agent,
     duration_ms: i64,
-    status: []const u8,
+    status: Status,
     exit_code: ?u8 = null,
     error_name: []const u8 = "",
     request_id: u64 = 0,
@@ -530,6 +546,8 @@ pub const Record = struct {
     session_id: [record_id_bytes]u8 = @splat(0),
     turn_id: [record_id_bytes]u8 = @splat(0),
     call_id: [record_id_bytes]u8 = @splat(0),
+
+    pub const Status = enum { started, failed, completed };
 };
 
 pub const Runtime = struct {
@@ -563,7 +581,7 @@ pub const Runtime = struct {
     fn leave(self: *Runtime) void {
         _ = self.active.fetchSub(1, .release);
     }
-    fn record(self: *Runtime, hook: Hook, invocation: Invocation, started: i64, status: []const u8, exit_code: ?u8, error_name: []const u8) void {
+    fn record(self: *Runtime, hook: Hook, invocation: Invocation, started: i64, status: Record.Status, exit_code: ?u8, error_name: []const u8) void {
         self.records_mutex.lockUncancelable(self.io);
         defer self.records_mutex.unlock(self.io);
         var record_value: Record = .{ .event = invocation.event, .duration_ms = std.Io.Clock.now(.awake, self.io).toMilliseconds() - started, .status = status };
@@ -573,10 +591,12 @@ pub const Runtime = struct {
         record_value.request_id = invocation.request_id;
         record_value.attempt = invocation.attempt;
         record_value.error_name = error_name;
-        inline for (.{ .{ "session_id", "session_id" }, .{ "turn_id", "turn_id" }, .{ "call_id", "tool_call_id" }, .{ "agent_id", "agent_id" } }) |pair| {
-            const value = @field(invocation, pair[1]);
+        inline for ([_]Invocation.Field{ .session_id, .turn_id, .tool_call_id, .agent_id }) |field| {
+            const name = @tagName(field);
+            const record_field = if (field == .tool_call_id) "call_id" else name;
+            const value = @field(invocation, name);
             const length = @min(record_id_bytes, value.len);
-            @memcpy(@field(record_value, pair[0])[0..length], value[0..length]);
+            @memcpy(@field(record_value, record_field)[0..length], value[0..length]);
         }
         if (invocation.turn_number) |number| _ = std.fmt.bufPrint(&record_value.turn_id, "{d}", .{number}) catch {};
         const id_len = @min(record_value.id.len, hook.id.len);
@@ -611,7 +631,7 @@ pub const Runtime = struct {
     }
     fn collect(self: *Runtime, job: *Dispatch) !void {
         if (job.failed) |err| {
-            const message = try std.fmt.allocPrint(self.allocator, "Background hook failed: {s}", .{@errorName(err)});
+            const message = try std.fmt.allocPrint(self.allocator, HooksCopy.named_failure, .{ "Background", @errorName(err) });
             if (self.pending.message) |old| self.allocator.free(old);
             self.pending.message = message;
             return;
@@ -721,7 +741,8 @@ pub const Runtime = struct {
         return std.fmt.allocPrint(allocator, "{s}/{s}.{s}", .{ self.temp_dir.?, std.fmt.bytesToHex(nonce, .lower), extension });
     }
     pub fn bound(self: *Runtime, allocator: std.mem.Allocator, result: *Result) !void {
-        inline for (.{ "context", "message", "blocked", "feedback" }) |field| {
+        inline for ([_]Result.Field{ .context, .message, .blocked, .feedback }) |result_field| {
+            const field = @tagName(result_field);
             if (@field(result, field)) |value| {
                 if (value.len > max_inline_output_bytes) {
                     const path = try self.privatePath(allocator, "txt");
@@ -824,7 +845,7 @@ pub const Runner = struct {
             if (!hook.enabled) continue;
             if (!try hookMatches(runtime.allocator, self.root, hook, invocation)) continue;
             if (!hook.trusted) {
-                try runtime.notice("Hooks need review; an observation handler was not executed");
+                try runtime.notice(HooksCopy.observation_needs_review);
                 continue;
             }
             try runtime.launch(self, hook, invocation);
@@ -847,7 +868,7 @@ pub const Runner = struct {
         const matched = hookMatches(allocator, self.root, hook, invocation) catch |err| {
             if (err == error.OutOfMemory) return err;
             failure.record(index, err);
-            if (self.runtime) |runtime| runtime.record(hook, invocation, std.Io.Clock.now(.awake, self.io).toMilliseconds(), "failed", null, @errorName(err));
+            if (self.runtime) |runtime| runtime.record(hook, invocation, std.Io.Clock.now(.awake, self.io).toMilliseconds(), .failed, null, @errorName(err));
             return false;
         };
         if (matched and !hook.trusted) {
@@ -909,7 +930,7 @@ pub const Runner = struct {
         if (failure.err) |err| {
             const strict = !invocation.event.observational() and invocation.event != .post_tool_use;
             if (strict or err == error.OutOfMemory) return err;
-            var diagnostic: Result = .{ .message = try std.fmt.allocPrint(allocator, "{s} hook failed: {s}", .{ invocation.event.name(), @errorName(err) }) };
+            var diagnostic: Result = .{ .message = try std.fmt.allocPrint(allocator, HooksCopy.named_failure, .{ invocation.event.name(), @errorName(err) }) };
             defer diagnostic.deinit(allocator);
             try outcome.merge(allocator, diagnostic);
         }
@@ -927,19 +948,19 @@ pub const Runner = struct {
             if (started >= deadline) return error.Timeout;
             configured.timeout_ms = @min(configured.timeout_ms, @as(u64, @intCast(deadline - started)));
         }
-        if (self.runtime) |runtime| runtime.record(hook, invocation, started, "started", null, "");
+        if (self.runtime) |runtime| runtime.record(hook, invocation, started, .started, null, "");
         var exit_code: ?u8 = null;
         var result = configured.executeHook(allocator, hook, invocation, &exit_code) catch |err| {
-            if (self.runtime) |runtime| runtime.record(hook, invocation, started, "failed", exit_code, @errorName(err));
+            if (self.runtime) |runtime| runtime.record(hook, invocation, started, .failed, exit_code, @errorName(err));
             return err;
         };
         errdefer result.deinit(allocator);
         if (self.runtime) |runtime| {
             runtime.bound(allocator, &result) catch |err| {
-                runtime.record(hook, invocation, started, "failed", exit_code, @errorName(err));
+                runtime.record(hook, invocation, started, .failed, exit_code, @errorName(err));
                 return err;
             };
-            runtime.record(hook, invocation, started, "completed", exit_code, "");
+            runtime.record(hook, invocation, started, .completed, exit_code, "");
         }
         return result;
     }
@@ -975,19 +996,21 @@ pub const Runner = struct {
             result.message = try allocator.dupe(u8, std.fmt.comptimePrint("Observation hook exited {d}; control effect ignored", .{blocking_exit_code}));
         } else if (command.code == blocking_exit_code) {
             const reason = std.mem.trim(u8, command.stderr, " \t\r\n");
-            result.blocked = try allocator.dupe(u8, if (reason.len > 0) reason else "blocked by hook");
+            result.blocked = try allocator.dupe(u8, if (reason.len > 0) reason else HooksCopy.blocked);
         } else if (command.code == 0) {
             result = try output.parse(allocator, command.stdout, invocation.event);
         }
-        if (result.feedback != null and !std.mem.startsWith(u8, invocation.tool_name, "mcp__")) return error.UnsupportedHookEffect;
-        inline for (.{ "context", "blocked", "feedback" }) |field| {
+        if (result.feedback != null and !std.mem.startsWith(u8, invocation.tool_name, mcp.prefix)) return error.UnsupportedHookEffect;
+        inline for ([_]Result.Field{ .context, .blocked, .feedback }) |result_field| {
+            const field = @tagName(result_field);
             if (@field(result, field)) |text_value| {
                 const attributed = try std.fmt.allocPrint(allocator, "[Hook {s}{s}]\n{s}", .{ hook.source, if (hook.type == .mcp_tool) " / external MCP tool" else "", text_value });
                 allocator.free(text_value);
                 @field(result, field) = attributed;
             }
         }
-        inline for (.{ "context", "message", "blocked", "feedback", "display_content" }) |field| {
+        inline for ([_]Result.Field{ .context, .message, .blocked, .feedback, .display_content }) |result_field| {
+            const field = @tagName(result_field);
             if (@field(result, field)) |value| {
                 if (ansi.hasControls(value)) {
                     const cleaned = try ansi.clean(allocator, value);
@@ -1310,23 +1333,24 @@ fn writeJson(
     try json.write(invocation.event.name());
     try json.objectField("cwd");
     try json.write(invocation.cwd orelse root);
-    inline for (.{
-        "agent_scope",       "request_purpose",   "request_system",      "request_instruction",    "request_tools",    "request_routes",
-        "permission_effect", "action",            "http",                "route",                  "request_context",  "request_settings",
-        "provider",          "parent_agent_id",   "parent_tool_call_id", "old_cwd",                "new_cwd",          "directory",
-        "session_id",        "tool_call_id",      "agent_id",            "agent_type",             "model",            "model_trust",
-        "model_tier",        "permission_mode",   "source",              "trigger",                "status",           "error_type",
-        "error_message",     "parent_session_id", "reason",              "notification_type",      "message",          "title",
-        "file_path",         "event_type",        "load_reason",         "memory_type",            "from_model",       "to_model",
-        "task_id",           "task_subject",      "task_description",    "command_name",           "command_args",     "expanded_prompt",
-        "message_id",        "delta",             "requested_model",     "last_assistant_message", "http_status",      "retry_delay_ms",
-        "retry_allowed",     "request_id",        "attempt",             "transcript_path",        "stop_hook_active", "input_tokens",
-        "output_tokens",     "is_interrupt",      "duration_ms",         "index",                  "final",
+    inline for ([_]Invocation.Field{
+        .agent_scope,       .request_purpose,   .request_system,      .request_instruction,    .request_tools,    .request_routes,
+        .permission_effect, .action,            .http,                .route,                  .request_context,  .request_settings,
+        .provider,          .parent_agent_id,   .parent_tool_call_id, .old_cwd,                .new_cwd,          .directory,
+        .session_id,        .tool_call_id,      .agent_id,            .agent_type,             .model,            .model_trust,
+        .model_tier,        .permission_mode,   .source,              .trigger,                .status,           .error_type,
+        .error_message,     .parent_session_id, .reason,              .notification_type,      .message,          .title,
+        .file_path,         .event_type,        .load_reason,         .memory_type,            .from_model,       .to_model,
+        .task_id,           .task_subject,      .task_description,    .command_name,           .command_args,     .expanded_prompt,
+        .message_id,        .delta,             .requested_model,     .last_assistant_message, .http_status,      .retry_delay_ms,
+        .retry_allowed,     .request_id,        .attempt,             .transcript_path,        .stop_hook_active, .input_tokens,
+        .output_tokens,     .is_interrupt,      .duration_ms,         .index,                  .final,
     }) |field| {
-        try json.objectField(field);
-        try json.write(@field(invocation, field));
+        const name = @tagName(field);
+        try json.objectField(name);
+        try json.write(@field(invocation, name));
     }
-    try json.objectField("turn_id");
+    try json.objectField(@tagName(Invocation.Field.turn_id));
     if (invocation.turn_number) |number| try json.print("\"{d}\"", .{number}) else try json.write(invocation.turn_id);
     try json.objectField("tool_use_id");
     try json.write(invocation.tool_call_id);
@@ -1389,6 +1413,26 @@ test "a matching pre-tool hook can block" {
     });
     defer result.deinit(testing.allocator);
     try testing.expectEqualStrings("[Hook config]\nblocked by policy", result.blocked.?);
+}
+
+test "command and JSON hook denials share the default reason" {
+    const testing = std.testing;
+    const commands = [_][]const u8{
+        "exit 2",
+        "printf '%s' '{\"decision\":\"block\"}'",
+        "printf '%s' '{\"decision\":\"block\",\"reason\":null}'",
+        "printf '%s' '{\"decision\":\"block\",\"reason\":\"\"}'",
+    };
+    for (commands) |command| {
+        const runner: Runner = .{
+            .io = testing.io,
+            .root = ".",
+            .set = .{ .pre_tool_use = &.{.{ .command = command }} },
+        };
+        var result = try runner.evaluate(testing.allocator, .{ .event = .pre_tool_use });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqualStrings("[Hook config]\n" ++ HooksCopy.blocked, result.blocked.?);
+    }
 }
 
 test "a hook with closed pipes still times out" {

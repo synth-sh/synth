@@ -1,6 +1,8 @@
 const std = @import("std");
 const Hooks = @import("hooks.zig");
 const Config = @import("config.zig");
+const paths = @import("paths.zig");
+const SlashCommand = @import("slash_command.zig");
 
 const max_trust_store_bytes = 1024 * 1024;
 const max_hook_file_bytes = 64 * 1024;
@@ -8,6 +10,7 @@ const store_writer_buffer_bytes = 4 * 1024;
 const hash_writer_buffer_bytes = 512;
 const min_trust_id_chars: usize = 32;
 const min_revoke_id_chars: usize = 8;
+const record_id_padding = "\x00";
 
 pub const State = struct { trusted: bool = false, disabled: bool = false };
 pub const Store = struct {
@@ -48,11 +51,15 @@ pub const Store = struct {
     }
 };
 
+pub fn configPath(a: std.mem.Allocator, base: []const u8) ![]u8 {
+    return std.fs.path.join(a, &.{ base, paths.synth_config_dir, "hooks.json" });
+}
+
 pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, root: []const u8, home: ?[]const u8, store: Store) !Hooks.Set {
     var set = inline_set;
-    const user_source = if (home) |dir| try std.fs.path.join(arena, &.{ dir, ".synth", "hooks.json" }) else null;
+    const user_source = if (home) |dir| try configPath(arena, dir) else null;
     if (user_source) |path| try loadFile(arena, io, &set, path);
-    try loadFile(arena, io, &set, try std.fs.path.join(arena, &.{ root, ".synth", "hooks.json" }));
+    try loadFile(arena, io, &set, try configPath(arena, root));
     var source_counts: std.StringHashMapUnmanaged(usize) = .empty;
     defer source_counts.deinit(arena);
     inline for (std.meta.fields(Hooks.Set)) |field| {
@@ -63,7 +70,7 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
             const count = try source_counts.getOrPut(arena, hook.source);
             if (!count.found_existing) count.value_ptr.* = 0;
             const source_path = try std.fs.path.resolve(arena, &.{ root, hook.source });
-            const source_is_user = (if (user_source) |path| std.mem.eql(u8, path, hook.source) else false) or !@import("paths.zig").inside(root, source_path);
+            const source_is_user = (if (user_source) |path| std.mem.eql(u8, path, hook.source) else false) or !paths.inside(root, source_path);
             const user_hook = source_is_user and independentCommand(hook.command);
             var buffer: [hash_writer_buffer_bytes]u8 = undefined;
             var hash = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&buffer);
@@ -167,9 +174,12 @@ test "rewriting a script a hook runs makes the hook untrusted" {
 pub const Command = struct { action: Action, id: []const u8 };
 
 pub fn parseCommand(line: []const u8) !Command {
-    var words = std.mem.tokenizeAny(u8, line, " \t\r\n");
+    var words = std.mem.tokenizeAny(u8, line, SlashCommand.whitespace);
     _ = words.next();
-    const action = std.meta.stringToEnum(Action, words.next() orelse "list") orelse return error.UnknownSubcommand;
+    const action = if (words.next()) |verb|
+        std.meta.stringToEnum(Action, verb) orelse return error.UnknownSubcommand
+    else
+        .list;
     const id = words.next() orelse "";
     if (words.next() != null) return error.UnexpectedArgument;
     if (action != .list and action != .review and id.len == 0) return error.MissingHookId;
@@ -252,9 +262,9 @@ pub fn report(allocator: std.mem.Allocator, set: Hooks.Set, timeout_ms: u64, rev
         for (0..active.records_len) |at| {
             const index = (active.records_next + active.records.len - active.records_len + at) % active.records.len;
             const record = active.records[index];
-            try writer.writer.print("  recent: {s} {s} {s} {d}ms\n", .{ &record.id, record.event.name(), record.status, record.duration_ms });
-            try writer.writer.print("    session={s} turn={s} call={s}\n", .{ std.mem.trimEnd(u8, &record.session_id, "\x00"), std.mem.trimEnd(u8, &record.turn_id, "\x00"), std.mem.trimEnd(u8, &record.call_id, "\x00") });
-            try writer.writer.print("    agent={s} request={d} attempt={d}\n", .{ std.mem.trimEnd(u8, &record.agent_id, "\x00"), record.request_id, record.attempt });
+            try writer.writer.print("  recent: {s} {s} {s} {d}ms\n", .{ &record.id, record.event.name(), @tagName(record.status), record.duration_ms });
+            try writer.writer.print("    session={s} turn={s} call={s}\n", .{ std.mem.trimEnd(u8, &record.session_id, record_id_padding), std.mem.trimEnd(u8, &record.turn_id, record_id_padding), std.mem.trimEnd(u8, &record.call_id, record_id_padding) });
+            try writer.writer.print("    agent={s} request={d} attempt={d}\n", .{ std.mem.trimEnd(u8, &record.agent_id, record_id_padding), record.request_id, record.attempt });
             try writer.writer.print("    scope={s} purpose={s}\n", .{ @tagName(record.agent_scope), @tagName(record.request_purpose) });
             if (record.error_name.len > 0) try writer.writer.print("    error: {s}\n", .{record.error_name});
             if (record.exit_code) |code| try writer.writer.print("    exit: {d}\n", .{code});

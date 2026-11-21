@@ -23,6 +23,8 @@ const Registry = @import("registry.zig");
 /// built-in, two servers offering the same name would collide with each other,
 /// and neither failure would be visible in a transcript.
 pub const prefix = "mcp__";
+const cancelled_before_call = "cancelled before MCP call";
+const timed_out_before_call = "timed out before MCP call";
 
 /// Cap on a tool name. OpenAI rejects a function name over 64 characters, and a
 /// rejected request fails the whole turn rather than the one tool, so the limit
@@ -736,11 +738,11 @@ fn call(ctx: tool.Context, input: tool.Input) !tool.Output {
     );
     const binding: *Host.Binding = @ptrCast(@alignCast(raw));
     while (!binding.connection.call_mutex.tryLock()) {
-        if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) "cancelled before MCP call" else "timed out before MCP call"));
+        if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) cancelled_before_call else timed_out_before_call));
         try std.Io.sleep(ctx.io, .fromMilliseconds(call_lock_poll_ms), .awake);
     }
     defer binding.connection.call_mutex.unlock(ctx.io);
-    if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) "cancelled before MCP call" else "timed out before MCP call"));
+    if (ctx.shouldStop()) return tool.Output.err(try ctx.allocator.dupe(u8, if (ctx.givenUp()) cancelled_before_call else timed_out_before_call));
 
     var arena_state: std.heap.ArenaAllocator = .init(ctx.allocator);
     defer arena_state.deinit();
