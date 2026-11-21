@@ -26,8 +26,9 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See [MCP](mcp.md). |
-| `hooks` | object | none | Commands and MCP tools triggered by [hook events](hooks.md#events). |
+| `hooks` | object | none | Commands and MCP tools triggered by [hook events](hooks-reference.md#hook-events). |
 | `model_requests` | object | active session model | Choose [models by request purpose](#models-by-request-purpose). |
+| `model_classes` | array | `[]` | Declare model trust and tier for [hook filters](hooks-reference.md#filter-by-agent-request-purpose-or-model). |
 | `hook_timeout_ms` | integer | `30000` | Default hook timeout in milliseconds, from 1 to 86,400,000. |
 | `web` | object | none | Settings for the web tools. See below. |
 | `prune` | object | shed after 30 days | What a prune throws away. See [Pruning](#pruning). |
@@ -185,5 +186,5 @@ to set supported generation controls such as `max_output_tokens`. Set
 `context_limit` to the usable window in tokens, up to 1,048,576. Zero uses
 the backend default or known model limit. Ollama receives a positive limit as
 `num_ctx` and uses its server default when the limit is zero. See [Model request
-hooks](hooks.md#model-requests) for per-request changes and the
+hooks](hooks-reference.md#model-requests) for per-request changes and the
 [configuration schema](../config.schema.json) for all keys.

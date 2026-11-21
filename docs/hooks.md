@@ -1,177 +1,280 @@
-# Hooks
+# Automate actions with hooks
 
-Hooks run commands or MCP tools when Synth events occur.
+Hooks run shell commands or MCP tools at session events. See the
+[hooks reference](hooks-reference.md) for event fields and configuration.
 
-## Block edits to protected files
+## Set up your first hook
 
-1. Copy the [path-protection script](../examples/hooks/protect-paths.py) to
-   `.synth/protect-paths.py` in your project. It requires Python 3.
-2. Add this to `.synth/hooks.json`:
+1. Add this macOS notification hook to `.synth/hooks.json` in your project.
+   Keep any existing event groups.
 
    ```json
    {
-     "PreToolUse": [{
-       "matcher": "^(write|edit)$",
-       "hooks": [{
-         "command": "python3 \"$SYNTH_PROJECT_DIR/.synth/protect-paths.py\""
-       }]
-     }]
+     "Notification": [
+       {
+         "matcher": "^permission_prompt$",
+         "hooks": [
+           {
+             "type": "command",
+             "command": "cat >/dev/null && osascript -e 'display notification \"A tool needs your approval\" with title \"Synth\"'"
+           }
+         ]
+       }
+     ]
    }
    ```
 
-3. Run `/hooks review`, inspect the definition and script, then run
-   `/hooks trust <id>` with the reviewed ID.
-4. Ask Synth to create a placeholder `.env` file. The hook blocks the write.
+2. From the project root, review the command and trust its ID.
 
-## Configuration and trust
+   ```console
+   synth hooks review
+   synth hooks trust <id>
+   ```
 
-Synth combines `config.json`'s `hooks`, `~/.synth/hooks.json`, and the
-original project's `.synth/hooks.json` in that order. A standalone file is an
-event map, or the same map under `hooks` next to an optional `description`, as
-Claude Code and Codex write it. Unknown events and handler keys are ignored
-with a warning. An older flat definition (a `command` with no `hooks` list)
-must be wrapped: `{"matcher": "bash", "hooks": [{"command": "..."}]}`.
+   In the TUI, use `/hooks review` and `/hooks trust <id>`.
+3. In Build mode, set `/approvals ask` and ask Synth to create a scratch file
+   with `write`. Expect a notification when the approval card appears.
 
-Commands run as you from `$SYNTH_PROJECT_DIR`, without Bash profiles.
-Use the payload's `cwd` for relative tool paths. Trust covers the
-declaration and the contents of every file the command names, so rewriting
-a script makes its hook untrusted until you review it again. Files a script
-calls in turn are not covered. File-tool edits to Synth control files,
-`.git/` and `.synth/` require human approval.
+## What you can automate
 
-An untrusted hook never runs. Observers are skipped with a notice. A policy
-hook that matches blocks the event until you trust or disable it.
-The [CLI](cli.md#hook-review) and `/hooks` take the same subcommands.
-Use at least 32 ID characters for `trust` or `enable`, eight for `revoke` or
-`disable`. Prefixes must be unique. User hooks with absolute commands and
-file arguments can share trust across checkouts.
+Add each recipe's event groups to `.synth/hooks.json`, then review and trust
+them as in the [walkthrough](#set-up-your-first-hook).
 
-## Handlers and matching
+### Get notified when Synth needs input
 
-Each event takes an array of groups. Put the handlers in each group's
-`hooks` array, with optional `matcher` and `when` fields alongside it.
-Matchers use regular expressions and recognize tool names and aliases such
-as `Bash` and `Edit`. For `FileChanged`, use project-relative paths such as
-`subdir/.env`, separated by `|`. An omitted matcher runs for every occurrence
-of the event.
-
-Use `timeout_ms` (milliseconds) or `timeout` (seconds) to override
-[`hook_timeout_ms`](configuration.md). Command handlers accept `async: true`
-for background context or diagnostics. Permission and request preparation
-require synchronous handlers. Use `transcript: true` to request a private
-snapshot at `transcript_path`.
-
-A handler that exits with a code other than 0 or 2 blocks the action on request
-events and lets it go ahead on every other event. Set `onFailure` to `block` or
-`continue` to change that for one handler.
-
-For synchronous MCP handlers use `type: "mcp_tool"`, `server`, `tool`, and
-`arguments`. Interpolate with `${input.field.path}`. Whole-value references
-preserve the JSON type. Session shutdown supports command handlers only.
-
-### Targeted routing
-
-Add `when` beside `matcher` to filter by `agent_scope` (`main`, `subagent`),
-`request_purpose` (`agent`, `approval_judge`, `compaction`), `agent_type`,
-`model`, `provider`, `trust` or `tier`. All filters must match.
-
-`trust` and `tier` describe the model, and you declare them in `config.json`
-(a model you don't list is `hosted` and `small`):
+Match `^(permission_prompt|agent_needs_input)$` to include questions. For a
+Linux desktop, swap in this handler.
 
 ```json
 {
-  "model_classes": [
-    { "model": "qwen3:27b", "trust": "local", "tier": "small" },
-    { "model": "astra", "trust": "hosted", "tier": "frontier" }
+  "type": "command",
+  "command": "cat >/dev/null && notify-send 'Synth' 'Synth needs your input'"
+}
+```
+
+### Auto-format code after edits
+
+Save the [example formatter](../examples/hooks/format-after-edit.sh) as
+`.synth/format-after-edit.sh`. It runs `zig fmt src build.zig` after a successful
+edit or write.
+
+```json
+{
+  "PostToolUse": [
+    {
+      "matcher": "^(edit|write)$",
+      "hooks": [
+        { "command": "bash \"$SYNTH_PROJECT_DIR/.synth/format-after-edit.sh\"" }
+      ]
+    }
   ]
 }
 ```
 
-`trust` is `local`, `private` (your own server) or `hosted`. `tier` is
-`small`, `mid` or `frontier`. A filter takes one value or a list, so a hook
-can guard only small or local models: `"when": {"tier": ["small", "mid"]}`.
-Every hook input carries `model_trust` and `model_tier`, and `/hooks list`
-prints each hook's `when`.
+### Block edits to protected files
 
-## Events
+1. Save the [path protection script](../examples/hooks/protect-paths.py) as
+   `.synth/protect-paths.py`. It requires Python 3.
+2. Add the hook, then review and trust it.
 
-| Events | Control |
-| --- | --- |
-| `SessionStart`, `UserPromptSubmit` | Supply context or block admission |
-| `UserPromptExpansion`, `ConfigChange`, `PreModelSwitch` | Reject the proposed operation |
-| `PreToolUse` | Reject, request approval, replace arguments, or supply context |
-| `PermissionEvaluate` | Deny or require human approval |
-| `PermissionRequest` | Deny a call awaiting approval |
-| `PostToolUse`, `PostToolUseFailure` | Add context or diagnostics. Successful MCP results also accept feedback. |
-| `PostToolBatch` | Supply context or stop before the next model request |
-| `TaskCreated`, `TaskCompleted` | Reject a todo-list change |
-| `PreCompact`, `PostCompact` | Stop compaction or its automatic continuation |
-| `Stop`, `SubagentStop` | Request further work within the existing turn budgets |
-| `SubagentStart` | Observe child creation or supply context |
-| `PermissionDenied` | Observe a denial or use `retry` to tell the agent it may try again |
-| `SessionEnd`, `Interrupt`, `StopFailure`, `Notification`, `InstructionsLoaded`, `FileChanged`, `PostModelSwitch`, `CwdChanged`, `DirectoryAdded` | Observe |
-| `MessageDisplay` | Replace displayed text via `displayContent` |
-| `PreModelRequest`, `PostModelRequest` | Observe each physical transport attempt |
-| `ModelResolve`, `ModelSettings`, `ModelContext`, `ModelRetry` | Prepare a request or decide a retry |
-| `HttpRequest`, `HttpResponse` | Adapt inference HTTP payloads |
+   ```json
+   {
+     "PreToolUse": [
+       {
+         "matcher": "^(write|edit)$",
+         "hooks": [
+           { "command": "python3 \"$SYNTH_PROJECT_DIR/.synth/protect-paths.py\"" }
+         ]
+       }
+     ]
+   }
+   ```
 
-## Input and output
+3. Ask Synth to create a placeholder `.env` with `write`. The guard checks
+   symlink targets too. Shell commands need their own policy.
 
-Read one JSON object from stdin. It includes `hook_event_name` and `cwd`.
-Tool events include `tool_name`, `tool_input`, and `tool_call_id`. Decode
-JSON strings such as `action` and `http` before reading their fields.
+```mermaid
+flowchart LR
+    A["Proposed write or edit"] --> B["PreToolUse"]
+    B --> C{"Protected path?"}
+    C -->|Yes| D["Exit 2 and explain on stderr"]
+    D --> E["Reject the tool call"]
+    C -->|No| F["Exit 0"]
+    F --> G["Continue to permission checks"]
 
-Exit 2 blocks supported operations with a reason from stderr. With exit 0,
-handlers can write structured JSON to stdout:
+    classDef step fill:#dbeafe,stroke:#2563eb,color:#172554,stroke-width:2px
+    classDef check fill:#fef3c7,stroke:#b45309,color:#451a03,stroke-width:2px
+    classDef proceed fill:#dcfce7,stroke:#15803d,color:#14532d,stroke-width:2px
+    classDef block fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d,stroke-width:2px
+    class A,B step
+    class C check
+    class F,G proceed
+    class D,E block
+```
+
+### Re-inject context after compaction
+
+Run `/compact` in an existing conversation to trigger `SessionStart` with
+`source: "compact"` and restore a project instruction.
 
 ```json
 {
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "This file is protected"
-  }
+  "SessionStart": [
+    {
+      "matcher": "^compact$",
+      "hooks": [
+        {
+          "command": "cat >/dev/null && printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Run zig build test before handing off changes.\"}}'"
+        }
+      ]
+    }
+  ]
 }
 ```
 
-Use `updatedInput` to replace tool arguments. File tools accept aliases
-such as `file_path`, `old_string`, and `new_string`. Conflicting edits to an
-argument cause rejection. A hook's `allow` leaves approval to normal policy.
-A mandatory human approval is refused in headless mode, even with `--allow`.
+### Audit configuration changes
 
-## Model requests
+With `jq` installed, edit a [watched file](hooks-reference.md#configchange),
+submit a prompt, and check `~/.synth-config-audit.jsonl`.
 
-Return these fields in `hookSpecificOutput`. See [model routes](configuration.md#models-by-request-purpose).
+```json
+{
+  "ConfigChange": [
+    {
+      "hooks": [
+        {
+          "command": "jq -c '{timestamp: (now | todate), source, file_path}' >> \"$HOME/.synth-config-audit.jsonl\""
+        }
+      ]
+    }
+  ]
+}
+```
 
-| Event | Output |
+### React when the directory or a file changes
+
+Try `/cd` within the project or save `README.md` while Synth is open. Check
+`.synth/changes.jsonl` in the original project root.
+
+```json
+{
+  "CwdChanged": [
+    {
+      "hooks": [
+        { "command": "jq -c '{hook_event_name, old_cwd, new_cwd}' >> .synth/changes.jsonl" }
+      ]
+    }
+  ],
+  "FileChanged": [
+    {
+      "matcher": "README.md|docs/usage.md",
+      "hooks": [
+        { "command": "jq -c '{hook_event_name, event, file_path}' >> .synth/changes.jsonl" }
+      ]
+    }
+  ]
+}
+```
+
+### Auto-approve specific permission prompts
+
+This hook approves the exact command `pwd`. To test it, set `/approvals ask`
+and turn off `auto_approve_safe_commands` in [config.json](configuration.md#files).
+
+```json
+{
+  "PermissionRequest": [
+    {
+      "matcher": "^bash$",
+      "hooks": [
+        {
+          "command": "jq -c 'if .tool_input.command == \"pwd\" then {hookSpecificOutput: {hookEventName: \"PermissionRequest\", decision: {behavior: \"allow\"}}} else {} end'"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Protected actions and explicit hook asks still need a person. See the
+[permission flow](hooks-reference.md#permissionrequest).
+
+## How hooks work
+
+See the [hook lifecycle](hooks-reference.md#hook-lifecycle) and
+[model trust and tier](hooks-reference.md#model-trust-and-tier) in the reference.
+
+### Combine results from multiple hooks
+
+Matching synchronous handlers can run concurrently. Synth merges results in
+declaration order, joins context, and picks the strictest permission decision
+(`deny` > `ask` > `allow`). Side effects from sibling hooks still happen.
+
+### Read input and return output
+
+```mermaid
+flowchart LR
+    A["Event JSON"] -->|stdin| B["Command hook"]
+    B -->|"Exit 0 with JSON on stdout"| C["Apply supported output"]
+    B -->|"Exit 2 with reason on stderr"| D["Block where supported"]
+    B -->|"Other exit status"| E["Apply failure policy"]
+
+    classDef step fill:#dbeafe,stroke:#2563eb,color:#172554,stroke-width:2px
+    classDef check fill:#fef3c7,stroke:#b45309,color:#451a03,stroke-width:2px
+    classDef proceed fill:#dcfce7,stroke:#15803d,color:#14532d,stroke-width:2px
+    classDef block fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d,stroke-width:2px
+    class A,B step
+    class E check
+    class C proceed
+    class D block
+```
+
+Consume stdin even for constant responses. Leave stdout empty on exit 0
+for a hook that only has side effects. See the [JSON protocol](hooks-reference.md#hook-input-and-output).
+
+### Filter hooks with matchers
+
+Match the tool name, then inspect arguments in `tool_input` as in the
+[permission recipe](#auto-approve-specific-permission-prompts).
+
+### Filter by agent, request purpose, or model
+
+To scope the [example command guard](../examples/hooks/deny-command.sh) to
+small and mid-tier subagents, save it as `.synth/deny-command.sh` and add `when`.
+
+```json
+{
+  "PreToolUse": [
+    {
+      "matcher": "^bash$",
+      "when": { "agent_scope": "subagent", "tier": ["small", "mid"] },
+      "hooks": [
+        { "command": "bash \"$SYNTH_PROJECT_DIR/.synth/deny-command.sh\"" }
+      ]
+    }
+  ]
+}
+```
+
+See [matchers and filters](hooks-reference.md#matcher-patterns).
+
+### Configure hook location
+
+Use `.synth/hooks.json` for a project or `~/.synth/hooks.json` for all projects.
+See all [hook locations and formats](hooks-reference.md#hook-locations).
+
+## Limitations and troubleshooting
+
+| Symptom | What to check |
 | --- | --- |
-| `ModelResolve` | `route` selects a route ID allowed for the current purpose. |
-| `ModelSettings` | `settings` sets supported generation and retry controls. Unsupported settings block the request. |
-| `ModelContext` | `requestContext` can set `system`, `instruction`, allowed `tools`, and `messages` edits by `seq`. Keep tool calls paired with their results. Approval-review evidence is protected. |
-| `ModelRetry` | `retryAllowed` can permit or veto a retry within transport limits. `retryDelayMs` sets the delay. |
+| Prompt blocked pending review | Use `/hooks review` to identify the matching policy hook, trust or disable it, then resubmit. |
+| Hook never fires | Check the event name, matcher, `when`, trust, and enabled state. A `FileChanged` watcher needs explicit paths. |
+| `/hooks` lists no hooks | Check the file location and ensure event keys map to arrays of groups. A standalone file accepts the event map directly or under `hooks`. |
+| Hook failed or timed out | Check `/hooks list` for recent runs, then check `PATH`, the script path, and the effective timeout. |
+| JSON has no effect | Exit 0 and write only one object to stdout. Set `hookEventName` to the triggering event and check the fields that event accepts. |
 
-## HTTP adapters
+## Learn more
 
-For Chat, Responses, Messages, and Ollama inference, decode the input's
-`http` string and return `hookSpecificOutput.http`. Known credential headers
-are redacted. Destinations, routed models, and reviewer evidence are protected.
-
-| Phase | Output fields |
-| --- | --- |
-| `request` | `headers`, replacement JSON object `body` |
-| `headers` | `headers`, `status` |
-| `body` | replacement JSON `body` |
-| `event` | `body` or `drop: true` for an SSE or NDJSON record |
-
-Set a header to `null` to remove it. Set `stream: true` on each
-`HttpResponse` handler that needs records.
-
-## Troubleshooting
-
-- **Prompt blocked for review.** Trust or disable pending hooks, then
-  resubmit the prompt from the composer.
-- **Hook fails or times out.** Use `/hooks list` to inspect recent runs.
-  Check `PATH`, script paths, and timeouts. Missing commands and malformed
-  synchronous policy output can block the operation.
-- **JSON has no effect.** Exit 0 and emit only JSON on stdout. Check that
-  the effect is supported by the event.
+- [MCP tool hooks](hooks-reference.md#mcp-tool-hook-fields)
+- [HTTP adapters](hooks-reference.md#http-adapters)
+- [Example scripts](../examples/hooks)

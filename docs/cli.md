@@ -76,4 +76,4 @@ id offers the sessions there to pick from.
 
 Run `synth hooks review` from the project to inspect hook definitions and
 trust status without executing hooks or connecting to a model provider.
-See [Hooks](hooks.md#configuration-and-trust) for trust and enable controls.
+See the [hooks reference](hooks-reference.md#the-hooks-commands) for trust and enable controls.
