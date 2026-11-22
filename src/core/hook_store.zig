@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Hooks = @import("hooks.zig");
 const HookCommand = @import("hook_command.zig");
+const ShellWords = @import("shell_words.zig");
 const Config = @import("config.zig");
 const paths = @import("paths.zig");
 const SlashCommand = @import("slash_command.zig");
@@ -98,9 +99,11 @@ pub fn discover(arena: std.mem.Allocator, io: std.Io, inline_set: Hooks.Set, roo
 }
 
 fn hashScripts(arena: std.mem.Allocator, io: std.Io, hasher: *Sha256, root: []const u8, home: ?[]const u8, command: []const u8) !void {
-    var words = std.mem.tokenizeAny(u8, command, " \t\r\n;&|<>()");
+    if (command.len == 0) return;
+    const variables = try HookCommand.scriptVariables(arena, root, home);
+    var words = ShellWords.commandWords(command);
     while (words.next()) |word| {
-        const expanded = try expandScriptPath(arena, root, home, word);
+        const expanded = try ShellWords.literalWord(arena, word, variables) orelse continue;
         if (expanded.len == 0 or expanded[0] == '-') continue;
         if (try protectedSystemExecutable(arena, io, expanded)) {
             hasher.update(system_executable_marker);
@@ -207,13 +210,6 @@ fn homeReference(word: []const u8) ?HomeReference {
     return null;
 }
 
-fn expandScriptPath(arena: std.mem.Allocator, root: []const u8, home: ?[]const u8, word: []const u8) ![]const u8 {
-    if (home) |dir| {
-        if (homeReference(word)) |reference| return std.fs.path.join(arena, &.{ dir, reference.relative });
-    }
-    return HookCommand.expandDirectories(arena, std.mem.trim(u8, word, "\"'"), root);
-}
-
 fn hashFile(io: std.Io, hasher: *Sha256, path: []const u8) !void {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false });
     defer file.close(io);
@@ -304,6 +300,7 @@ test "rewriting a script a hook runs makes the hook untrusted" {
     const a = arena.allocator();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     try tmp.dir.createDirPath(std.testing.io, ".synth/plugin-data");
+    try tmp.dir.createDirPath(std.testing.io, "hook (fixtures)");
     var store = try Store.init(std.testing.allocator, std.testing.io, null);
     defer store.deinit();
     const cases = [_]struct { path: []const u8, command: []const u8 }{
@@ -311,6 +308,10 @@ test "rewriting a script a hook runs makes the hook untrusted" {
         .{ .path = "guard.sh", .command = "sh \"$SYNTH_PROJECT_DIR/guard.sh\"" },
         .{ .path = ".synth/plugin-data/guard.sh", .command = "sh \"${CLAUDE_PLUGIN_DATA}/guard.sh\"" },
         .{ .path = ".synth/plugin-data/guard.sh", .command = "sh \"$PLUGIN_DATA/guard.sh\"" },
+        .{ .path = "hook (fixtures)/guard.sh", .command = "sh './hook (fixtures)/guard.sh'" },
+        .{ .path = "hook (fixtures)/guard.sh", .command = "sh \"${SYNTH_PROJECT_DIR}/hook (fixtures)/guard.sh\"" },
+        .{ .path = "hook (fixtures)/guard.sh", .command = "sh ./hook\\ \\(fixtures\\)/guard.sh" },
+        .{ .path = "hook (fixtures)/guard.sh", .command = "true # fixture's comment\nsh './hook (fixtures)/guard.sh'" },
     };
     for (cases) |case| {
         const set: Hooks.Set = .{ .pre_tool_use = &.{.{ .command = case.command }} };
@@ -365,7 +366,8 @@ test "rewriting a script under HOME invalidates trust when Bash expands the path
     defer tmp.cleanup();
     const a = arena.allocator();
     const path = "home/bin/guard.sh";
-    try tmp.dir.createDirPath(io, "home/bin");
+    const spaced_path = "home/bin/test fixtures/guard.sh";
+    try tmp.dir.createDirPath(io, "home/bin/test fixtures");
     try tmp.dir.createDirPath(io, "project");
     const home = try tmp.dir.realPathFileAlloc(io, "home", a);
     const root = try tmp.dir.realPathFileAlloc(io, "project", a);
@@ -376,20 +378,24 @@ test "rewriting a script under HOME invalidates trust when Bash expands the path
         .{ .command = "sh \"$HOME\"/bin/guard.sh" },
         .{ .command = "sh $HOME\"/bin/guard.sh\"" },
         .{ .command = "sh ${HOME}\"/bin/guard.sh\"" },
+        .{ .command = "sh \"$HOME/bin/test fixtures/guard.sh\"" },
+        .{ .command = "sh ${HOME}\"/bin/test fixtures/guard.sh\"" },
         .{ .command = "sh '$HOME/bin/guard.sh'" },
         .{ .command = "sh \"~/bin/guard.sh\"" },
     } };
     var store = try Store.init(testing.allocator, io, null);
     defer store.deinit();
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "exit 0" });
+    try tmp.dir.writeFile(io, .{ .sub_path = spaced_path, .data = "exit 0" });
     const original = try discover(a, io, hooks, root, home, store);
     for (original.pre_tool_use) |hook| try store.put(hook.id, .{ .trusted = true });
     const unchanged = try discover(a, io, hooks, root, home, store);
     for (unchanged.pre_tool_use) |hook| try testing.expect(hook.trusted);
 
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "exit 2" });
+    try tmp.dir.writeFile(io, .{ .sub_path = spaced_path, .data = "exit 2" });
     const rewritten = try discover(a, io, hooks, root, home, store);
-    for (rewritten.pre_tool_use, [_]bool{ false, false, false, false, false, false, true, true }) |hook, trusted| {
+    for (rewritten.pre_tool_use, [_]bool{ false, false, false, false, false, false, false, false, true, true }) |hook, trusted| {
         try testing.expectEqual(trusted, hook.trusted);
     }
 }

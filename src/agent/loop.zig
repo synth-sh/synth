@@ -1797,17 +1797,32 @@ fn abandonPending(self: *Loop, reason: []const u8) !void {
     try self.appendToolResults(null);
 }
 
+fn idleNotificationAt(self: *const Loop) ?i64 {
+    if (self.state != .idle or self.hook_flow.idle_notified) return null;
+    const since = self.hook_flow.idle_since orelse return null;
+    const runner = self.hooks orelse return null;
+    const input = self.hookInput(.{ .event = .notification, .notification_type = @tagName(Hooks.NotificationType.idle_prompt) });
+    if (!runner.hasMatching(self.allocator, input, false)) return null;
+    return since + idle_notification_delay_ms;
+}
+
+pub fn idleHookPollDelay(self: *const Loop) ?std.Io.Duration {
+    const now = tool.monotonicMilliseconds(self.io);
+    const watch = self.hook_flow.watch.nextPollAt(now);
+    const notification = self.idleNotificationAt();
+    const deadline = if (watch) |at| @min(at, notification orelse at) else notification orelse return null;
+    return .fromMilliseconds(@max(0, deadline - now));
+}
+
 /// Advance the loop. Called from the UI's tick; returns true if anything
 /// changed and the screen needs redrawing.
 pub fn poll(self: *Loop) !bool {
     try self.pollHookFiles(false);
     if (self.state == .idle and try self.startConfigChange(.config_idle)) return true;
-    if (self.state == .idle and !self.hook_flow.idle_notified) {
-        if (self.hook_flow.idle_since) |since| {
-            if (tool.monotonicMilliseconds(self.io) - since >= idle_notification_delay_ms) {
-                self.hook_flow.idle_notified = true;
-                self.notifyHook(.idle_prompt, "The agent is waiting for input");
-            }
+    if (self.idleNotificationAt()) |deadline| {
+        if (tool.monotonicMilliseconds(self.io) >= deadline) {
+            self.hook_flow.idle_notified = true;
+            self.notifyHook(.idle_prompt, "The agent is waiting for input");
         }
     }
     var background_changed = false;

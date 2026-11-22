@@ -82,7 +82,7 @@ pub fn reset(self: *Flow, allocator: std.mem.Allocator) void {
     self.idle_notified = false;
 }
 
-pub fn hookInput(self: *Loop, invocation: Hooks.Invocation) Hooks.Invocation {
+pub fn hookInput(self: *const Loop, invocation: Hooks.Invocation) Hooks.Invocation {
     var input = invocation;
     input.cwd = self.workingDirectory();
     input.is_interrupt = invocation.event == .interrupt;

@@ -686,6 +686,12 @@ pub const Runtime = struct {
         }
         return result;
     }
+
+    pub fn hasBackgroundWork(self: *Runtime) bool {
+        self.background_mutex.lockUncancelable(self.io);
+        defer self.background_mutex.unlock(self.io);
+        return self.background.items.len > 0 or self.pending.message != null;
+    }
     pub fn registerSnapshot(self: *Runtime, path: []const u8) !void {
         self.temp_mutex.lockUncancelable(self.io);
         defer self.temp_mutex.unlock(self.io);

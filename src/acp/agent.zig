@@ -54,7 +54,7 @@ const Agent = @This();
 /// the database and page back in on request.
 const max_messages: usize = 200;
 
-/// How often a busy session is polled. An idle one sleeps until told to act.
+/// How often a busy session is polled.
 const poll_interval: std.Io.Duration = .fromMilliseconds(20);
 /// What a client may have queued and unsent before it is cut off, rather
 /// than the agent holding an unbounded backlog for it.
@@ -177,9 +177,9 @@ pub fn serve(self: *Agent) void {
         }
         _ = arena_state.reset(.retain_capacity);
 
-        const ticking = if (self.session) |session| session.busy() or session.stack.titler.busy() else false;
-        if (ticking) {
-            self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } }) catch {};
+        const next_poll = if (self.session) |session| session.pollDelay() else null;
+        if (next_poll) |delay| {
+            self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = delay, .clock = .awake } }) catch {};
         } else {
             self.wake.waitUncancelable(self.io);
         }
@@ -1663,6 +1663,11 @@ const Session = struct {
         for (self.model_jobs) |job| if (job != null) return true;
         return self.stack.loop.isBusy() or self.stack.runner.busy() or self.sign_in != null or
             self.sign_out != null or self.stack.mcp_host.connecting();
+    }
+
+    fn pollDelay(self: *Session) ?std.Io.Duration {
+        if (self.busy() or self.stack.titler.busy() or self.stack.hook_runtime.hasBackgroundWork()) return poll_interval;
+        return self.stack.loop.idleHookPollDelay();
     }
 
     fn notice(self: *Session, severity: protocol.Severity, comptime fmt: []const u8, args: anytype) void {
@@ -3181,6 +3186,36 @@ test "a synth client opens a session and has its snapshot before the reply" {
     try testing.expectEqual(rpc.code.method_not_found, (try client.expectError(unknown)).code);
     const relative = try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = "project" });
     try testing.expectEqualStrings("cwd must be an absolute path", (try client.expectError(relative)).message);
+}
+
+test "an idle ACP session delivers file hooks without a client request" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const io = testing.io;
+    const a = fixture.arena.allocator();
+    fixture.config.hooks.file_changed = &.{.{
+        .matcher = "watched.txt",
+        .command = "printf '%s' '{\"systemMessage\":\"idle file hook ran\"}'",
+    }};
+    const state_path = try std.fs.path.join(a, &.{ fixture.project, "hook-trust.json" });
+    fixture.config.hook_state_path = state_path;
+    var store = try HookStore.Store.init(testing.allocator, io, null);
+    defer store.deinit();
+    const discovered = try HookStore.discover(a, io, fixture.config.hooks, fixture.project, null, store);
+    try store.put(discovered.file_changed[0].id, .{ .trusted = true });
+    try store.save(io, state_path);
+
+    const client = try fixture.connect();
+    defer client.close();
+    try client.initialize(true);
+    const session = (try client.open(fixture.project)).sessionId;
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(try client.prompt(session, "read the note")));
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "project/watched.txt", .data = "changed while idle" });
+
+    const message = try client.awaitMethod(synth.method.notice);
+    const reported = try rpc.parse(synth.Notice, a, message.params);
+    try testing.expectEqualStrings(session, reported.sessionId);
+    try testing.expect(std.mem.indexOf(u8, reported.text, "idle file hook ran") != null);
 }
 
 test "a turn runs, its approval asked as a permission request and its prompt answered at the end" {

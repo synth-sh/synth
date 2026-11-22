@@ -89,10 +89,15 @@ fn stamp(io: std.Io, path: []const u8) !?Stamp {
     return .{ .inode = stat.inode, .size = stat.size, .modified = stat.mtime.nanoseconds };
 }
 
+pub fn nextPollAt(self: *const Watch, now: i64) ?i64 {
+    if (self.entries.items.len == 0) return null;
+    return if (self.last_poll_ms) |previous| previous + poll_interval_ms else now;
+}
+
 pub fn poll(self: *Watch, io: std.Io, force: bool) !void {
-    if (self.entries.items.len == 0) return;
     const now = std.Io.Clock.now(.awake, io).toMilliseconds();
-    if (!force) if (self.last_poll_ms) |previous| if (now - previous < poll_interval_ms) return;
+    const next = self.nextPollAt(now) orelse return;
+    if (!force and now < next) return;
     self.last_poll_ms = now;
     for (self.entries.items) |*entry| {
         const current = try stamp(io, entry.path);

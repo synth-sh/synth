@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const paths = @import("paths.zig");
+const ShellWords = @import("shell_words.zig");
 
 pub const output_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
@@ -29,18 +30,16 @@ fn environment(a: std.mem.Allocator, root: []const u8) ![directory_variables.len
     return entries;
 }
 
-pub fn expandDirectories(a: std.mem.Allocator, word: []const u8, root: []const u8) ![]const u8 {
-    var expanded = word;
-    inline for (directory_variables) |variable| {
-        const braced = "${" ++ variable.name ++ "}";
-        const bare = "$" ++ variable.name;
-        if (std.mem.indexOf(u8, expanded, braced) != null or std.mem.indexOf(u8, expanded, bare) != null) {
-            const directory = if (variable.suffix.len == 0) root else try std.fmt.allocPrint(a, "{s}{s}", .{ root, variable.suffix });
-            if (std.mem.indexOf(u8, expanded, braced) != null) expanded = try std.mem.replaceOwned(u8, a, expanded, braced, directory);
-            if (std.mem.indexOf(u8, expanded, bare) != null) expanded = try std.mem.replaceOwned(u8, a, expanded, bare, directory);
-        }
+pub fn scriptVariables(arena: std.mem.Allocator, root: []const u8, home: ?[]const u8) ![]const ShellWords.Variable {
+    const vars = try arena.alloc(ShellWords.Variable, directory_variables.len + @as(usize, @intFromBool(home != null)));
+    for (directory_variables, vars[0..directory_variables.len]) |variable, *entry| {
+        entry.* = .{
+            .name = variable.name,
+            .value = if (variable.suffix.len == 0) root else try std.mem.concat(arena, u8, &.{ root, variable.suffix }),
+        };
     }
-    return expanded;
+    if (home) |value| vars[directory_variables.len] = .{ .name = "HOME", .value = value };
+    return vars;
 }
 
 pub const Options = struct {
