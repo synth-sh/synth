@@ -1,8 +1,10 @@
-//! Naming a session nobody has named, from its first prompt and reply.
+//! Naming a session nobody has named, from its first prompt and the model's
+//! first reply.
 //!
-//! The question goes out on a client of its own, beside whatever the session
-//! does next, and is shown only the two messages it is about: never the live
-//! transcript, which the next turn may be writing to.
+//! The question goes out as soon as that reply lands, not when the turn ends,
+//! on a client of its own beside the turn still running. It is shown only the
+//! two messages it is about: never the live transcript, which the turn is
+//! writing to.
 
 const std = @import("std");
 const testing = std.testing;
@@ -43,9 +45,9 @@ backend: ?*Backend = null,
 /// calling meanwhile.
 provider: ?Provider = null,
 pending: ?Pending = null,
-/// `loop.finished` when a title was last asked for, so each turn is asked
-/// about once and a failure waits for the next.
-asked_at: ?usize = null,
+/// The reply a title was last asked about, so each is asked about once and a
+/// failure waits for the next.
+asked_about: ?u64 = null,
 
 const Pending = struct {
     request: *Request,
@@ -72,31 +74,33 @@ pub fn busy(self: *const Titler) bool {
     return self.pending != null;
 }
 
-/// Ask for a title once an untitled session finishes a turn, and name it when
-/// the answer comes. Returns true when the title changed.
+/// Ask for a title once an untitled session has a reply, however the turn
+/// goes on, and name it when the answer comes. Returns true when the title
+/// changed.
 pub fn poll(self: *Titler, loop: *Loop) !bool {
     if (self.pending) |pending| return self.collect(loop, pending);
 
-    if (loop.isBusy() or loop.title().len > 0) return false;
-    if ((loop.outcome orelse return false) != .done) return false;
-    if (self.asked_at == loop.finished) return false;
+    if (loop.title().len > 0) return false;
     const session_id = loop.session_id orelse return false;
-    self.asked_at = loop.finished;
-    try self.ask(loop.conversation, session_id);
+    const reply = latestReply(loop.conversation) orelse return false;
+    if (self.asked_about == reply.seq) return false;
+    self.asked_about = reply.seq;
+    try self.ask(loop.conversation, reply.text, session_id);
     return false;
 }
 
-fn ask(self: *Titler, convo: *Conversation, session_id: i64) !void {
+fn ask(self: *Titler, convo: *Conversation, said: []const u8, session_id: i64) !void {
     if (self.backend == null and self.provider == null) return;
     const asked = firstPrompt(convo) orelse return;
-    const said = lastReply(convo) orelse return;
 
     const shown = try self.allocator.create(Conversation);
     errdefer self.allocator.destroy(shown);
     shown.* = .init(self.allocator);
     errdefer shown.deinit();
     _ = try shown.addUser(clip(asked, excerpt_bytes), &.{}, &.{});
-    _ = try shown.addAssistant(clip(said, excerpt_bytes), null, null);
+    if (said.len > 0 and !std.mem.eql(u8, said, Loop.no_reply)) {
+        _ = try shown.addAssistant(clip(said, excerpt_bytes), null, null);
+    }
 
     const spawned = if (self.backend) |backend| try backend.spawn(self.allocator) else null;
     errdefer if (spawned) |client| client.deinit();
@@ -140,14 +144,12 @@ fn firstPrompt(convo: *const Conversation) ?[]const u8 {
     return null;
 }
 
-fn lastReply(convo: *const Conversation) ?[]const u8 {
+fn latestReply(convo: *const Conversation) ?*const Conversation.Message {
     var at = convo.messages.items.len;
     while (at > 0) {
         at -= 1;
-        const msg = convo.messages.items[at];
-        if (msg.role != .assistant) continue;
-        if (msg.text.len == 0 or std.mem.eql(u8, msg.text, Loop.no_reply)) continue;
-        return msg.text;
+        const msg = &convo.messages.items[at];
+        if (msg.role == .assistant) return msg;
     }
     return null;
 }
@@ -192,9 +194,12 @@ test "a long title is cut on a character boundary" {
     try testing.expect(cut[cut.len - 1] != ' ');
 }
 
-/// Answers a turn plainly and a request for a title with `title`.
+/// Answers a turn with `said` and a request for a title with `title`.
 const Fake = struct {
     title: []const u8 = "Fix the login redirect\nsecond line",
+    said: []const u8 = "Done.",
+    /// Open each turn with a call nothing has approved, so the turn waits.
+    call_first: bool = false,
     titles_asked: usize = 0,
     /// Fail the title request, the way a dropped connection does.
     fail_titles: bool = false,
@@ -211,13 +216,27 @@ const Fake = struct {
         _: ?Provider.Sink,
     ) anyerror!Provider.Reply {
         const self: *Fake = @ptrCast(@alignCast(ptr));
-        if (!std.mem.eql(u8, asked.instruction, prompt)) return .{ .text = try allocator.dupe(u8, "Done.") };
+        if (!std.mem.eql(u8, asked.instruction, prompt)) {
+            const reply: Provider.Reply = .{ .text = try allocator.dupe(u8, self.said) };
+            if (!self.call_first or convo.last().?.role != .user) return reply;
+            const calls = try allocator.alloc(Conversation.ToolCall, 1);
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call_0"),
+                .name = try allocator.dupe(u8, "write"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{ .text = reply.text, .tool_calls = calls };
+        }
 
         self.titles_asked += 1;
         if (self.fail_titles) return error.ConnectionResetByPeer;
-        try testing.expectEqual(@as(usize, 2), convo.messages.items.len);
         try testing.expectEqualStrings("the login page loops", convo.messages.items[0].text);
-        try testing.expectEqualStrings("Done.", convo.messages.items[1].text);
+        if (self.said.len == 0) {
+            try testing.expectEqual(@as(usize, 1), convo.messages.items.len);
+        } else {
+            try testing.expectEqual(@as(usize, 2), convo.messages.items.len);
+            try testing.expectEqualStrings(self.said, convo.messages.items[1].text);
+        }
         return .{ .text = try allocator.dupe(u8, self.title) };
     }
 };
@@ -281,7 +300,7 @@ const Fixture = struct {
     }
 };
 
-test "an untitled session is named after its first turn" {
+test "an untitled session is named from its first reply" {
     const fixture = try Fixture.create();
     defer fixture.destroy();
 
@@ -307,7 +326,7 @@ test "a session named by hand is not renamed" {
     try testing.expectEqual(@as(usize, 0), fixture.fake.titles_asked);
 }
 
-test "a failed title leaves the session untitled until the next turn" {
+test "a failed title leaves the session untitled until the next reply" {
     const fixture = try Fixture.create();
     defer fixture.destroy();
     fixture.fake.fail_titles = true;
@@ -340,5 +359,41 @@ test "an answer that came before teardown still names the session" {
 
     fixture.titler.deinit(&fixture.loop);
     try testing.expect(!fixture.titler.busy());
+    try testing.expectEqualStrings("Fix the login redirect", fixture.loop.title());
+}
+
+/// Poll until the turn stops for approval, naming the session meanwhile.
+fn untilApproval(fixture: *Fixture) !void {
+    var waited_ms: usize = 0;
+    while (fixture.loop.state != .awaiting_approval or fixture.titler.busy()) {
+        _ = try fixture.loop.poll();
+        _ = try fixture.titler.poll(&fixture.loop);
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+        waited_ms += 1;
+        if (waited_ms > 5_000) return error.DidNotSettle;
+    }
+}
+
+test "a session is named while its first turn is still running" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    fixture.fake.call_first = true;
+    fixture.fake.said = "Looking.";
+
+    try fixture.loop.submit("the login page loops", .{});
+    try untilApproval(fixture);
+    try testing.expect(fixture.loop.isBusy());
+    try testing.expectEqualStrings("Fix the login redirect", fixture.loop.title());
+    try testing.expectEqual(@as(usize, 1), fixture.fake.titles_asked);
+}
+
+test "a first reply that only calls tools names the session from the prompt" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    fixture.fake.call_first = true;
+    fixture.fake.said = "";
+
+    try fixture.loop.submit("the login page loops", .{});
+    try untilApproval(fixture);
     try testing.expectEqualStrings("Fix the login redirect", fixture.loop.title());
 }
