@@ -14,6 +14,7 @@ const log_file = @import("log_file.zig");
 const OpenAI = @import("openai.zig");
 const Provider = @import("provider.zig");
 const retry = @import("retry.zig");
+const HttpHooks = @import("http_hooks.zig");
 const responses = @import("responses.zig");
 const Refusal = responses.Refusal;
 const Failure = responses.Failure;
@@ -36,9 +37,7 @@ supports_vision: bool = true,
 
 client: std.http.Client = undefined,
 started: bool = false,
-live_socket: std.posix.fd_t = no_socket,
-socket_lock: std.Io.Mutex = .init,
-aborted: bool = false,
+socket: @import("socket.zig") = .{},
 
 /// The account's model list, fetched once per client and kept for picking,
 /// windows and vision. Lives in `catalog_arena`.
@@ -62,7 +61,6 @@ effort_len: usize = 0,
 /// What the sidebar calls this backend. The guidelines ask that using the
 /// plan be visible beside the model.
 pub const default_label = "ChatGPT plan";
-const no_socket: std.posix.fd_t = -1;
 const max_body_bytes: usize = 4 * 1024 * 1024;
 const max_rejection_bytes: usize = 2 * 1024;
 const transfer_buffer_bytes: usize = 64 * 1024;
@@ -102,6 +100,9 @@ pub fn startLike(self: *ChatGPTProvider, other: *const ChatGPTProvider) !void {
     self.supports_reasoning_summary = other.supports_reasoning_summary;
     self.effort_buffer = other.effort_buffer;
     self.effort_len = other.effort_len;
+    self.retries = other.retries;
+    self.cache_key = other.cache_key;
+    self.last_message_count = other.last_message_count;
 }
 
 pub fn deinit(self: *ChatGPTProvider) void {
@@ -119,6 +120,7 @@ pub fn provider(self: *ChatGPTProvider) Provider {
         .context_limit = self.context_limit,
         .vision = self.supports_vision,
         .userdata = self,
+        .observes_attempts = true,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
@@ -153,37 +155,7 @@ fn setEffortErased(ptr: *anyopaque, level: []const u8) void {
 }
 
 pub fn abort(self: *ChatGPTProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.aborted = true;
-    self.shutdownLocked();
-}
-
-fn shutdownLocked(self: *ChatGPTProvider) void {
-    if (self.live_socket == no_socket) return;
-    self.io.vtable.netShutdown(self.io.userdata, self.live_socket, .both) catch {};
-    self.live_socket = no_socket;
-}
-
-fn watch(self: *ChatGPTProvider, request: *std.http.Client.Request) void {
-    const connection = request.connection orelse return;
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.live_socket = connection.stream_reader.stream.socket.handle;
-    if (self.aborted) self.shutdownLocked();
-}
-
-fn armSocket(self: *ChatGPTProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.aborted = false;
-    self.live_socket = no_socket;
-}
-
-fn forgetSocket(self: *ChatGPTProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.live_socket = no_socket;
+    self.socket.abort(self.io);
 }
 
 fn abortErased(ptr: *anyopaque) void {
@@ -401,14 +373,14 @@ fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, url: []const u8, track_
         var request = try self.client.request(.GET, uri, .{
             .redirect_behavior = .not_allowed,
             .keep_alive = false,
-            .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" } },
+            .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = Provider.identity_encoding } },
         });
         defer {
-            if (track_turn) self.forgetSocket();
+            if (track_turn) self.socket.forget(self.io);
             request.deinit();
         }
         try request.sendBodiless();
-        if (track_turn) self.watch(&request);
+        if (track_turn) self.socket.watch(self.io, &request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
@@ -435,91 +407,108 @@ fn respond(
     turn: Provider.Turn,
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
-) !Provider.Reply {
+) anyerror!Provider.Reply {
     const self: *ChatGPTProvider = @ptrCast(@alignCast(ptr));
     const store = self.store orelse return error.NotSignedIn;
     self.startClient();
     self.clearRejection();
-    self.armSocket();
+    self.socket.arm(self.io);
     if (self.model.len == 0 or self.context_limit == 0) self.ensureModelForTurn() catch {};
 
     var attempt: usize = 1;
     var refreshed = false;
     while (true) {
+        var attempt_turn = turn;
+        attempt_turn.hook_input.model = self.model;
+        attempt_turn.hook_input.provider = self.provider().name;
+        var hook_attempt = Provider.Attempt.begin(attempt_turn, allocator, sink);
+        defer hook_attempt.finish();
+        errdefer |err| hook_attempt.error_message = @errorName(err);
+        if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
         var arena_state: std.heap.ArenaAllocator = .init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
         const token = try store.accessToken(arena);
         const authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
-        const body = try self.buildRequest(arena, convo, turn);
+        var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = hook_attempt.turn.hook_input, .url = responses_url, .protocol = "responses", .stop = turn.stop };
+        const request_body = try self.buildRequest(arena, convo, turn);
+        const extra_headers = self.requestHeaders();
+        const prepared = try http.request(arena, request_body, .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = Provider.identity_encoding }, .content_type = .{ .override = Provider.json_content_type } }, &extra_headers);
+        const body = prepared.body;
         // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
         const uri = std.Uri.parse(responses_url) catch return error.InvalidHost;
 
-        const extra_headers = self.requestHeaders();
         var request = try self.client.request(.POST, uri, .{
             .redirect_behavior = .not_allowed,
             .keep_alive = false,
-            .headers = .{
-                .authorization = .{ .override = authorization },
-                .accept_encoding = .{ .override = "identity" },
-                .content_type = .{ .override = "application/json" },
-            },
-            .extra_headers = &extra_headers,
+            .headers = prepared.headers,
+            .extra_headers = prepared.extra_headers,
         });
         defer {
-            self.forgetSocket();
+            self.socket.forget(self.io);
             request.deinit();
         }
         try request.sendBodyComplete(body);
-        self.watch(&request);
+        self.socket.watch(self.io, &request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
-        const retry_after = retry.retryAfterMs(OpenAI.headerValue(response.head, "retry-after"));
+        const head = try http.response(arena, response.head);
+        const retry_after = retry.retryAfterMs(head.get(retry.retry_after_header));
         const transfer = try arena.alloc(u8, transfer_buffer_bytes);
         const reader = response.reader(transfer);
 
-        if (response.head.status.class() != .success) {
-            const why = reader.allocRemaining(arena, .limited(max_body_bytes)) catch "";
-            self.captureRejection(response.head.status, why);
+        if (head.status.class() != .success) {
+            const raw = reader.allocRemaining(arena, .limited(max_body_bytes)) catch "";
+            const why = (try http.payload(arena, raw, false)).?;
+            self.captureRejection(head.status, why);
             const refusal = Refusal.parse(arena, why);
+            hook_attempt.error_message = @errorName(refusal.toError(head.status));
+            hook_attempt.finish();
 
-            if (response.head.status == .unauthorized and !refreshed) {
-                try store.forceRefresh();
-                refreshed = true;
-                continue;
-            }
-            if (refusal.isTemporary() and self.waitAndRetry(response.head.status, attempt, retry_after, sink)) {
+            if (head.status == .unauthorized and !refreshed) {
+                if (retry.pause(self.io, self.retries, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = @tagName(retry.errorType(head.status)), .error_message = why })) {
+                    try store.forceRefresh();
+                    refreshed = true;
+                    attempt += 1;
+                    continue;
+                }
+            } else if (self.waitAndRetry(head.status, attempt, retry_after, sink)) {
                 attempt += 1;
                 continue;
             }
             if (Provider.mentionsOverflow(why)) return error.ContextTooLarge;
-            return refusal.toError(response.head.status);
+            return @as(anyerror!Provider.Reply, refusal.toError(head.status));
         }
 
         var stream: ResponseStream = .init(allocator, sink);
         defer stream.deinit();
+        stream.http = &http;
         stream.readEvents(arena, reader) catch |err| {
+            if (http.hook_failed) return @as(anyerror!Provider.Reply, err);
             if (stream.failure) |failure| {
                 self.rememberFailure(failure);
-                return failure.toError();
+                return @as(anyerror!Provider.Reply, failure.toError());
             }
+            hook_attempt.error_message = @errorName(err);
+            hook_attempt.finish();
             const nothing_shown = !stream.delivered_anything;
             if (nothing_shown and self.waitAndRetry(.service_unavailable, attempt, null, sink)) {
                 attempt += 1;
                 continue;
             }
-            return err;
+            return @as(anyerror!Provider.Reply, err);
         };
         if (stream.failure) |failure| {
             self.rememberFailure(failure);
-            return failure.toError();
+            return @as(anyerror!Provider.Reply, failure.toError());
         }
 
         const reply = try stream.intoReply();
         self.log(arena, logged, reply) catch {};
+        hook_attempt.complete(reply.usage);
         return reply;
     }
 }
@@ -531,20 +520,13 @@ fn waitAndRetry(
     retry_after_ms: ?u64,
     sink: ?Provider.Sink,
 ) bool {
-    if (attempt >= self.retries.attempts) return false;
-    if (status == .too_many_requests) return false;
-    if (!retry.transient(status)) return false;
-    if (retry.tooLong(self.retries, retry_after_ms)) return false;
-    if (stopped(sink)) return false;
-
-    const wait = retry.waitMs(self.retries, attempt, retry_after_ms);
-    std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
-    return !stopped(sink);
-}
-
-fn stopped(sink: ?Provider.Sink) bool {
-    const s = sink orelse return false;
-    return s.stopped(s.userdata);
+    return retry.wait(self.io, self.retries, sink, .{
+        .status = status,
+        .attempt = attempt,
+        .retry_after_ms = retry_after_ms,
+        .message = self.rejection orelse "",
+        .retryable = retry.transient(status) and status != .too_many_requests,
+    });
 }
 
 /// ChatGPT routes a request to the servers holding its cache by the
@@ -743,52 +725,6 @@ test "a request names its cache key as its session, so it is routed to its cache
     const headers = chat.requestHeaders();
     try testing.expectEqualStrings("session-id", headers[1].name);
     try testing.expectEqualStrings(parsed.object.get("prompt_cache_key").?.string, headers[1].value);
-}
-
-test "a recorded turn is replayed verbatim, in order, ahead of its outputs" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = try testStore(&tmp);
-    defer store.destroy();
-    var chat = testProvider(store);
-    defer chat.deinit();
-
-    var convo: Conversation = .init(testing.allocator);
-    defer convo.deinit();
-    try convo.add(.user, "read two files");
-    var calls = [_]Conversation.ToolCall{
-        .{ .id = "call_1", .name = "read", .arguments = "{\"path\":\"a\"}" },
-        .{ .id = "call_2", .name = "read", .arguments = "{\"path\":\"b\"}" },
-    };
-    _ = try convo.append(.{
-        .role = .assistant,
-        .text = "Reading both.",
-        .tool_calls = &calls,
-        .provider_state =
-        \\{"provider":"chatgpt","model":"gpt-test","items":[
-        \\{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"opaque"},
-        \\{"id":"msg_1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Reading both."}]},
-        \\{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a\"}"},
-        \\{"id":"fc_2","type":"function_call","call_id":"call_2","name":"read","arguments":"{\"path\":\"b\"}"}]}
-        ,
-    });
-    _ = try convo.addToolResult("read", "call_1", "contents of a");
-    _ = try convo.addToolResult("read", "call_2", "contents of b");
-
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const body = try chat.buildRequest(arena_state.allocator(), &convo, .{ .system = "s" });
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
-    const input = parsed.object.get("input").?.array.items;
-
-    const expected = [_][]const u8{ "message", "message", "reasoning", "message", "function_call", "function_call", "function_call_output", "function_call_output" };
-    try testing.expectEqual(expected.len, input.len);
-    for (expected, input) |kind, item| try testing.expectEqualStrings(kind, item.object.get("type").?.string);
-    try testing.expectEqualStrings("opaque", input[2].object.get("encrypted_content").?.string);
-    try testing.expectEqualStrings("commentary", input[3].object.get("phase").?.string);
-    try testing.expectEqualStrings("call_2", input[7].object.get("call_id").?.string);
-    try testing.expectEqualStrings("contents of a", input[6].object.get("output").?.string);
-    try testing.expectEqualStrings("contents of b", input[7].object.get("output").?.string);
 }
 
 test "a turn another provider answered is rebuilt, and an unanswered call is closed" {

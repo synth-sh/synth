@@ -9,6 +9,12 @@
 //! were made.
 
 const std = @import("std");
+const Hooks = @import("../core/hooks.zig");
+const HooksCopy = @import("../core/hooks_copy.zig");
+const ask_user = @import("../tools/ask.zig");
+const HookStore = @import("../core/hook_store.zig");
+const SlashCommand = @import("../core/slash_command.zig");
+const paths = @import("../core/paths.zig");
 
 const pkg = @import("pkg");
 const mcp = @import("mcp");
@@ -48,7 +54,7 @@ const Agent = @This();
 /// the database and page back in on request.
 const max_messages: usize = 200;
 
-/// How often a busy session is polled. An idle one sleeps until told to act.
+/// How often a busy session is polled.
 const poll_interval: std.Io.Duration = .fromMilliseconds(20);
 /// What a client may have queued and unsent before it is cut off, rather
 /// than the agent holding an unbounded backlog for it.
@@ -171,9 +177,9 @@ pub fn serve(self: *Agent) void {
         }
         _ = arena_state.reset(.retain_capacity);
 
-        const ticking = if (self.session) |session| session.busy() or session.stack.titler.busy() else false;
-        if (ticking) {
-            self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } }) catch {};
+        const next_poll = if (self.session) |session| session.pollDelay() else null;
+        if (next_poll) |delay| {
+            self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = delay, .clock = .awake } }) catch {};
         } else {
             self.wake.waitUncancelable(self.io);
         }
@@ -210,6 +216,9 @@ fn finishedConnections(self: *Agent) !std.ArrayList(*Connection) {
 fn drop(self: *Agent, connection: *Connection) void {
     const left = connection.leaving;
     if (self.asked) |*asked| asked.forget(connection);
+    if (self.session) |session| if (session.model_switch) |waiting| {
+        if (waiting.reply.connection == connection) session.cancelModelSwitch();
+    };
     var at: usize = 0;
     while (at < self.prompts.items.len) {
         if (self.prompts.items[at].connection == connection) {
@@ -276,11 +285,11 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
 
     if (eql(u8, method, protocol.method.session_cancel)) {
         const session = try self.sessionFor((try rpc.parse(protocol.SessionId, arena, params)).sessionId);
-        if (session.stack.loop.isBusy()) try session.stack.loop.cancel();
+        try session.stack.loop.cancel();
         return;
     }
     if (eql(u8, method, protocol.method.cancel_request)) {
-        return self.cancelPrompt(connection, (try rpc.parse(protocol.CancelRequest, arena, params)).requestId);
+        return self.cancelRequest(connection, (try rpc.parse(protocol.CancelRequest, arena, params)).requestId);
     }
     if (eql(u8, method, synth.method.leave)) {
         connection.leaving = true;
@@ -347,8 +356,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     if (eql(u8, method, protocol.method.session_set_config_option)) {
         const request = try rpc.parse(protocol.SetConfigOption, arena, params);
         const session = try self.sessionFor(request.sessionId);
-        try session.setConfigOption(request);
-        return connection.reply(asked, protocol.ConfigOptions{ .configOptions = try session.configOptions(arena) });
+        return session.setConfigOption(request, connection, asked, arena);
     }
     if (std.mem.startsWith(u8, method, "_synth/")) return self.performSynth(connection, asked, method, params, arena);
     return error.MethodNotFound;
@@ -411,6 +419,14 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         for (files) |*file| file.path = projectRelative(session.stack.loop.project_root, file.path);
         if (asked.apply and files.len > 0) self.noticeFmt(.info, "Put back {d} file{s} as before that prompt", .{ files.len, if (files.len == 1) "" else "s" });
         return connection.reply(id, files);
+    } else if (eql(u8, method, m.change_directory) or eql(u8, method, m.add_directory)) {
+        const asked = try rpc.parse(synth.Directory, arena, params);
+        const action: Session.DirectoryAction = if (eql(u8, method, m.change_directory)) .change else .add;
+        try session.applyDirectory(action, asked.path, asked.source, false);
+        try session.publish(arena, true);
+    } else if (eql(u8, method, m.hooks)) {
+        const asked = try rpc.parse(synth.Hooks, arena, params);
+        return connection.reply(id, try session.stack.manageHooks(arena, asked.action, asked.id));
     } else if (eql(u8, method, m.approvals)) {
         return connection.reply(id, try session.allowances(arena));
     } else if (eql(u8, method, m.set_approvals)) {
@@ -619,6 +635,16 @@ fn share(self: *Agent, session: *Session) !void {
     self.live = .{ .handle = handle, .root = root };
 }
 
+fn shareDirectory(self: *Agent, path: []const u8) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const live = if (self.live) |*value| value else return;
+    if (std.mem.eql(u8, live.root, path)) return;
+    const owned = try self.allocator.dupe(u8, path);
+    self.allocator.free(live.root);
+    live.root = owned;
+}
+
 fn unshare(self: *Agent) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
@@ -638,6 +664,10 @@ fn closeSession(self: *Agent) void {
         waiting.deinit(self.allocator);
     }
     self.prompts.clearRetainingCapacity();
+    if (session.model_switch) |waiting| {
+        waiting.reply.connection.fail(waiting.reply.id, rpc.code.request_cancelled, "cancelled");
+        session.cancelModelSwitch();
+    }
     self.unshare();
     self.session = null;
     session.destroy();
@@ -688,7 +718,11 @@ fn notifyAll(self: *Agent, audience: Audience, method: []const u8, params: anyty
 
 fn noticeFmt(self: *Agent, severity: protocol.Severity, comptime fmt: []const u8, args: anytype) void {
     var buffer: [512]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, fmt, args) catch fmt;
+    const text = std.fmt.bufPrint(&buffer, fmt, args) catch {
+        const owned = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        defer self.allocator.free(owned);
+        return self.notice(severity, owned);
+    };
     self.notice(severity, text);
 }
 
@@ -720,10 +754,15 @@ fn settlePrompts(self: *Agent) void {
     self.prompts.clearRetainingCapacity();
 }
 
-/// `$/cancel_request` for a prompt: it is answered at once, and the turn
-/// left running. `session/cancel` is what stops a turn.
-fn cancelPrompt(self: *Agent, connection: *Connection, request: std.json.Value) void {
+fn cancelRequest(self: *Agent, connection: *Connection, request: std.json.Value) void {
     const id = rpc.Id.from(request) orelse return;
+    if (self.session) |session| if (session.model_switch) |waiting| {
+        if (waiting.reply.connection == connection and waiting.reply.id.eql(id)) {
+            connection.fail(id, rpc.code.request_cancelled, "cancelled");
+            session.cancelModelSwitch();
+            return;
+        }
+    };
     for (self.prompts.items, 0..) |*waiting, at| {
         if (waiting.connection != connection or !waiting.id.eql(id)) continue;
         connection.fail(waiting.id, rpc.code.request_cancelled, "cancelled");
@@ -758,7 +797,7 @@ fn ask(self: *Agent, arena: std.mem.Allocator, session: *Session, waiting: Sessi
     try self.put(arena, session, &asked, waiting);
     if (asked.for_answer and asked.requests.items.len == 0 and asked.considered.items.len > 0) {
         asked.deinit(self.allocator);
-        return session.stack.loop.answer(unanswerable);
+        return session.stack.loop.answerWithSource(.{ .text = unanswerable });
     }
     self.asked = asked;
 }
@@ -834,10 +873,12 @@ fn answered(self: *Agent, connection: *Connection, message: rpc.Message) void {
     if (asked.for_answer) {
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena_state.deinit();
-        const text = updates.answerOf(arena_state.allocator(), message.result) catch null;
+        const call = loop.pendingQuestion() orelse return;
+        const has_options = ask_user.options(arena_state.allocator(), call.arguments).len > 0;
+        const response = updates.answerOf(arena_state.allocator(), message.result, has_options) catch null;
         _ = asked.requests.swapRemove(index);
         self.withdraw();
-        loop.answer(text orelse declined) catch |err| self.noticeFmt(.warning, "Could not answer: {s}", .{@errorName(err)});
+        loop.answerWithSource(response orelse .{ .text = declined }) catch |err| self.noticeFmt(.warning, "Could not answer: {s}", .{@errorName(err)});
         return;
     }
     const chosen = protocol.chosenOption(message.result) orelse return;
@@ -937,6 +978,7 @@ fn describe(err: anyerror) []const u8 {
         error.ModelFixed => "this provider has only the one model",
         error.UnknownModel, error.UnknownCopilotModel => "no such model from this provider",
         error.Busy => "finish the turn first",
+        error.HookBlocked => HooksCopy.blocked,
         error.UnknownSkill => "no such skill",
         error.UnknownConfigOption => "no such setting",
         error.ProviderFixed => "this agent's provider is fixed",
@@ -1385,6 +1427,7 @@ const Session = struct {
     activate_after_sign_in: bool = true,
     sign_out: ?*SignOutTask = null,
     stack: *Stack,
+    model_switch: ?ModelSwitch = null,
     /// Every message sent, by seq, with a signature of the parts of it that
     /// change after it is appended.
     sent: std.AutoHashMapUnmanaged(u64, u64) = .empty,
@@ -1421,6 +1464,14 @@ const Session = struct {
     model_recent: u32 = 5,
 
     const Place = struct { seq: u64, call: usize };
+
+    const ModelSwitch = struct {
+        arena: std.heap.ArenaAllocator,
+        reply: Prompting,
+        chosen: Chosen,
+        effort: ?[]const u8,
+        source: Hooks.ModelSwitchSource,
+    };
 
     const Told = struct {
         plan: std.ArrayList(u8) = .empty,
@@ -1614,8 +1665,16 @@ const Session = struct {
             self.sign_out != null or self.stack.mcp_host.connecting();
     }
 
+    fn pollDelay(self: *Session) ?std.Io.Duration {
+        if (self.busy() or self.stack.titler.busy() or self.stack.hook_runtime.hasBackgroundWork()) return poll_interval;
+        return self.stack.loop.idleHookPollDelay();
+    }
+
     fn notice(self: *Session, severity: protocol.Severity, comptime fmt: []const u8, args: anytype) void {
-        self.agent.noticeFmt(severity, fmt, args);
+        const text = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        defer self.allocator.free(text);
+        self.agent.notice(severity, text);
+        self.stack.loop.notifyHook(.notice, text);
     }
 
     /// Advance the session, and do what a TUI's tick does for a local one:
@@ -1625,7 +1684,7 @@ const Session = struct {
         self.finishListings();
         const loop = &self.stack.loop;
         if (self.providerSource()) |providers| {
-            if (providers.model_unchecked) {
+            if (providers.model_unchecked and self.model_switch == null) {
                 const previous = self.allocator.dupe(u8, loop.provider.model) catch null;
                 defer if (previous) |name| self.allocator.free(name);
                 if (providers.checkModel()) {
@@ -1643,6 +1702,7 @@ const Session = struct {
         } else |_| {}
         _ = self.stack.runner.poll() catch |err| self.notice(.@"error", "Subagent failed: {s}", .{@errorName(err)});
         _ = loop.poll() catch |err| self.notice(.@"error", "The turn failed: {s}", .{@errorName(err)});
+        self.settleModelSwitch();
         _ = self.stack.titler.poll(loop) catch |err| self.notice(.warning, "Could not name the session: {s}", .{@errorName(err)});
 
         if (loop.takeHookNotice()) |text| {
@@ -1656,7 +1716,7 @@ const Session = struct {
         if (loop.takeSteering()) |taken| {
             var next = taken;
             defer next.deinit(loop.allocator);
-            loop.submit(next.prompt, next.asExtras()) catch |err| self.notice(.warning, "Could not start the next turn: {s}", .{@errorName(err)});
+            loop.submit(next.prompt, next.extras) catch |err| self.notice(.warning, "Could not start the next turn: {s}", .{@errorName(err)});
         }
     }
 
@@ -1677,23 +1737,59 @@ const Session = struct {
             .other => {},
         };
 
-        const loop = &self.stack.loop;
-        if (std.mem.startsWith(u8, text.items, "/")) {
-            if (skill.findIn(self.stack.skills.skills, skill.idOf(text.items))) |found| {
-                if (loop.isBusy()) return error.Busy;
-                try attachments.append(arena, .{
-                    .path = try std.fs.path.join(arena, &.{ found.dir, skill.file_name }),
-                    .content = try skill_tool.render(arena, found),
-                });
-                return loop.submit(text.items, .{ .attachments = attachments.items, .images = images.items });
-            }
-            if (std.mem.eql(u8, std.mem.trimEnd(u8, text.items, " \t\n"), "/compact")) {
-                if (loop.isBusy()) return error.Busy;
-                return loop.compact();
-            }
-        }
+        if (std.mem.startsWith(u8, text.items, "/") and try self.slashCommand(arena, text.items, &attachments, images.items)) return;
         const extras: Loop.Extras = .{ .attachments = attachments.items, .images = images.items };
+        const loop = &self.stack.loop;
         if (!try loop.steer(text.items, extras)) try loop.submit(text.items, extras);
+    }
+
+    const DirectoryAction = enum { change, add };
+
+    fn applyDirectory(self: *Session, action: DirectoryAction, path: []const u8, source: synth.Directory.Source, from_slash: bool) !void {
+        const loop = &self.stack.loop;
+        const applied = switch (action) {
+            .change => loop.changeDirectory(path),
+            .add => loop.addDirectory(path, @tagName(source)),
+        };
+        applied catch |err| {
+            const verb = if (action == .change) "change directory to" else "add directory";
+            const text = std.fmt.allocPrint(self.allocator, "Cannot {s} {s}: {s}", .{ verb, path, paths.directoryError(err) }) catch return err;
+            defer self.allocator.free(text);
+            self.agent.notice(.warning, text);
+            if (from_slash) loop.notifyHook(.notice, text);
+            return err;
+        };
+    }
+
+    fn slashCommand(self: *Session, arena: std.mem.Allocator, line: []const u8, attachments: *std.ArrayList(mention.Attachment), images: []const []const u8) !bool {
+        const split = std.mem.indexOfAny(u8, line, SlashCommand.whitespace) orelse line.len;
+        const name = line[0..split];
+        const arguments = std.mem.trim(u8, line[split..], SlashCommand.whitespace);
+        const loop = &self.stack.loop;
+        if (std.mem.eql(u8, name, "/" ++ SlashCommand.cd)) {
+            if (arguments.len == 0) {
+                self.notice(.info, "{s}", .{loop.workingDirectory()});
+                return true;
+            }
+            self.applyDirectory(.change, arguments, .slash_command, true) catch return true;
+            self.notice(.info, "Working directory: {s}", .{loop.workingDirectory()});
+        } else if (std.mem.eql(u8, name, "/" ++ SlashCommand.add_dir)) {
+            self.applyDirectory(.add, arguments, .slash_command, true) catch return true;
+            self.notice(.info, "Directory added to this session", .{});
+        } else if (skill.findIn(self.stack.skills.skills, skill.idOf(name))) |found| {
+            if (loop.isBusy()) return error.Busy;
+            const expanded = try skill_tool.render(arena, found);
+            try attachments.append(arena, .{ .path = try std.fs.path.join(arena, &.{ found.dir, skill.file_name }), .content = expanded });
+            try loop.submit(line, .{ .attachments = attachments.items, .images = images, .command_name = found.id, .command_args = arguments, .expanded_prompt = expanded });
+        } else if (std.mem.eql(u8, name, "/" ++ SlashCommand.hooks)) {
+            const command = try HookStore.parseCommand(line);
+            const report = try self.stack.manageHooks(arena, command.action, command.id);
+            self.agent.notice(.info, report);
+        } else if (std.mem.eql(u8, name, "/" ++ SlashCommand.compact) and arguments.len == 0) {
+            if (loop.isBusy()) return error.Busy;
+            try loop.compact();
+        } else return false;
+        return true;
     }
 
     /// A linked file in the project, attached as a mention of it would be.
@@ -1799,28 +1895,80 @@ const Session = struct {
         return .{ .id = protocol.config_model, .name = "Model", .category = "model", .currentValue = current, .options = groups.items };
     }
 
-    fn setConfigOption(self: *Session, request: protocol.SetConfigOption) !void {
+    fn setConfigOption(self: *Session, request: protocol.SetConfigOption, connection: *Connection, id: rpc.Id, arena: std.mem.Allocator) !void {
         const loop = &self.stack.loop;
         if (std.mem.eql(u8, request.configId, protocol.config_effort)) {
             if (loop.isBusy()) return error.Busy;
-            return self.chooseEffort(request.value);
+            try self.chooseEffort(request.value);
+            return connection.reply(id, protocol.ConfigOptions{ .configOptions = try self.configOptions(arena) });
         }
         if (!std.mem.eql(u8, request.configId, protocol.config_model)) return error.UnknownConfigOption;
-        if (loop.isBusy()) return error.Busy;
 
         const extra: synth.SetModel = if (request._meta) |meta| meta.synth orelse .{} else .{};
         const by_editor = request._meta == null and self.agent.options.source == .providers;
         const chosen: Chosen = if (by_editor) chosenModel(request.value) else .{ .provider = extra.provider, .model = request.value };
+        const source: Hooks.ModelSwitchSource = if (by_editor) .sdk else .picker;
+        var owned: std.heap.ArenaAllocator = .init(self.allocator);
+        errdefer owned.deinit();
+        const a = owned.allocator();
+        const reply = try Prompting.init(a, connection, id);
+        const target: Chosen = .{
+            .provider = if (chosen.provider) |provider| try a.dupe(u8, provider) else null,
+            .model = try a.dupe(u8, chosen.model),
+        };
+        const effort = if (extra.effort) |level| try a.dupe(u8, level) else null;
+        if (try loop.beginModelSwitch(target.model, source)) {
+            self.model_switch = .{ .arena = owned, .reply = reply, .chosen = target, .effort = effort, .source = source };
+            return;
+        }
+        try self.applyModelSwitch(chosen, extra.effort, source);
+        connection.reply(id, protocol.ConfigOptions{ .configOptions = try self.configOptions(arena) });
+        owned.deinit();
+    }
+
+    fn cancelModelSwitch(self: *Session) void {
+        var waiting = self.model_switch orelse return;
+        self.model_switch = null;
+        self.stack.loop.cancel() catch {};
+        waiting.arena.deinit();
+    }
+
+    fn settleModelSwitch(self: *Session) void {
+        var waiting = self.model_switch orelse return;
+        const result = self.stack.loop.pollModelSwitch();
+        if (result) |ready| {
+            if (!ready) return;
+        } else |_| {}
+        self.model_switch = null;
+        defer waiting.arena.deinit();
+        const connection = waiting.reply.connection;
+        const id = waiting.reply.id;
+        const options = self.finishModelSwitch(&waiting, result) catch |err| {
+            if (err == error.Canceled) return connection.fail(id, rpc.code.request_cancelled, "cancelled");
+            return connection.fail(id, rpc.code.internal_error, describe(err));
+        };
+        connection.reply(id, protocol.ConfigOptions{ .configOptions = options });
+    }
+
+    fn finishModelSwitch(self: *Session, waiting: *ModelSwitch, result: anyerror!bool) ![]const protocol.ConfigOption {
+        _ = try result;
+        try self.applyModelSwitch(waiting.chosen, waiting.effort, waiting.source);
+        return self.configOptions(waiting.arena.allocator());
+    }
+
+    fn applyModelSwitch(self: *Session, chosen: Chosen, effort: ?[]const u8, source: Hooks.ModelSwitchSource) !void {
+        const loop = &self.stack.loop;
         const provider_id = self.providerId();
         const switching = if (chosen.provider) |wanted| !std.mem.eql(u8, wanted, provider_id) else false;
         if (switching) {
             const entry = catalog.find(chosen.provider.?) orelse return error.UnknownProvider;
             try self.useProvider(entry, null, null, .{ .select = chosen.model });
+            try loop.trackModel(source);
         } else {
-            try loop.switchModel(chosen.model);
+            try loop.commitModelSwitch(chosen.model, source);
         }
         self.rememberModel();
-        if (extra.effort) |level| try self.chooseEffort(level) else self.restoreEffort();
+        if (effort) |level| try self.chooseEffort(level) else self.restoreEffort();
         if (switching) self.announceProvider();
     }
 
@@ -1844,6 +1992,7 @@ const Session = struct {
     /// the streaming request, and the status. With `send` false, only note
     /// it as sent, for a snapshot about to carry it.
     fn publish(self: *Session, arena: std.mem.Allocator, send: bool) !void {
+        try self.agent.shareDirectory(self.stack.loop.workingDirectory());
         const convo = &self.stack.convo;
         for (convo.messages.items) |*msg| {
             const mark = signature(msg);
@@ -1956,9 +2105,12 @@ const Session = struct {
     /// skills, and compacting.
     fn tellCommands(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
         const skills = self.stack.skills.skills;
-        const commands = try arena.alloc(protocol.Command, skills.len + 1);
-        commands[0] = .{ .name = "compact", .description = "Summarise the conversation so far to free up context" };
-        for (skills, commands[1..]) |found, *command| command.* = .{
+        const commands = try arena.alloc(protocol.Command, skills.len + 4);
+        commands[0] = .{ .name = SlashCommand.compact, .description = "Summarise the conversation so far to free up context" };
+        commands[1] = .{ .name = SlashCommand.hooks, .description = "Review, trust and control lifecycle hooks", .input = .{ .hint = "[list|review|trust|revoke|enable|disable] [id]" } };
+        commands[2] = .{ .name = SlashCommand.cd, .description = "Change the session working directory", .input = .{ .hint = "[path]" } };
+        commands[3] = .{ .name = SlashCommand.add_dir, .description = "Add a permitted directory to this session", .input = .{ .hint = "path" } };
+        for (skills, commands[4..]) |found, *command| command.* = .{
             .name = found.id,
             .description = if (found.description.len > 0) found.description else found.name,
             .input = .{ .hint = "what to do, if anything" },
@@ -2027,7 +2179,8 @@ const Session = struct {
             if (thinking.len > self.told_thinking) self.tell(.{ .agent_thought_chunk = .{ .content = .{ .text = thinking[self.told_thinking..] } } });
         }
         const streamed = self.told_text.items;
-        const rest = if (std.mem.startsWith(u8, msg.text, streamed)) msg.text[streamed.len..] else msg.text;
+        const visible = msg.displayedText();
+        const rest = if (std.mem.startsWith(u8, visible, streamed)) visible[streamed.len..] else visible;
         if (rest.len > 0) self.tell(.{ .agent_message_chunk = .{ .content = .{ .text = rest } } });
     }
 
@@ -2118,6 +2271,8 @@ const Session = struct {
             .title = loop.title(),
             .handle = self.handle,
             .root = self.cwd,
+            .cwd = loop.workingDirectory(),
+            .additional_roots = loop.additional_roots.items,
             .project = self.stack.project.root,
             .branch = self.stack.project.branch orelse "",
             .agent = loop.agent.id,
@@ -2231,6 +2386,7 @@ const Session = struct {
 
     fn connectProvider(self: *Session, request: synth.ConnectProvider) !void {
         const providers = try self.providerSource();
+        if (providers.model_policy.restrict_routes) return error.ModelRouteDenied;
         if (self.stack.loop.isBusy()) return error.Busy;
         const entry = catalog.find(request.provider) orelse return error.UnknownProvider;
         const active = std.mem.eql(u8, entry.id, providers.active_id) and !providers.isMissing();
@@ -2281,6 +2437,7 @@ const Session = struct {
 
         const loop = &self.stack.loop;
         loop.provider = try providers.connect(entry, where, key, model);
+        loop.backend = providers.backend;
         self.stack.runner.backend = providers.backend;
         try loop.setModel(loop.provider.model);
         if (entry.host_editable) if (at) |host| {
@@ -2316,6 +2473,7 @@ const Session = struct {
         self.configureProvider(entry, null, token, self.activate_after_sign_in, .automatic) catch |err| {
             return self.notice(.warning, "Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
         };
+        self.stack.loop.notifyHook(.auth_success, entry.label);
         if (std.mem.eql(u8, entry.id, catalog.chatgpt_id)) self.welcomeToPlanUsage();
     }
 
@@ -2373,6 +2531,7 @@ const Session = struct {
     }
 
     fn toggleMcp(self: *Session, name: []const u8) !void {
+        if (self.stack.loop.isBusy()) return error.Busy;
         const mcp_host = &self.stack.mcp_host;
         const server = for (mcp_host.servers) |server| {
             if (std.mem.eql(u8, server.name, name)) break server;
@@ -2381,6 +2540,7 @@ const Session = struct {
         if (mcp_host.connecting()) return error.StillConnecting;
         const store = mcp_host.auth orelse return error.NoMcpState;
 
+        self.stack.hook_runtime.cancelBackground();
         const wanted = mcp_host.wants(server);
         try store.setEnabled(server.name, !wanted);
         store.save(server.name) catch |err| self.notice(.warning, "Could not remember that: {s}", .{@errorName(err)});
@@ -2394,6 +2554,7 @@ const Session = struct {
     /// Once servers turned on have been reached: offer their tools, and say
     /// which would not come up.
     fn settleMcp(self: *Session) void {
+        if (self.stack.loop.tools != null) return;
         const mcp_host = &self.stack.mcp_host;
         if (!mcp_host.settled()) return;
         const added = mcp_host.install(&self.stack.registry) catch 0;
@@ -2438,6 +2599,7 @@ const Session = struct {
     }
 
     fn startListings(self: *Session, arena: std.mem.Allocator) !void {
+        if (self.stack.loop.model_policy.restrict_routes) return;
         const providers = self.agent.options.source.providers;
         for (catalog.all, 0..) |entry, i| {
             if (self.model_jobs[i] != null) continue;
@@ -2628,10 +2790,13 @@ fn callSignature(call: *const Conversation.ToolCall) u64 {
 fn signature(msg: *const Conversation.Message) u64 {
     var hasher: std.hash.Wyhash = .init(0);
     std.hash.autoHash(&hasher, msg.text.len);
+    std.hash.autoHash(&hasher, msg.display_text != null);
+    if (msg.display_text) |text| hasher.update(text);
     std.hash.autoHash(&hasher, if (msg.thinking) |text| text.len else 0);
     std.hash.autoHash(&hasher, msg.thinking_ms);
     for (msg.tool_calls) |call| {
         std.hash.autoHash(&hasher, call.status);
+        hasher.update(call.arguments);
         std.hash.autoHash(&hasher, if (call.result) |result| result.len else 0);
         std.hash.autoHash(&hasher, call.result_bytes);
         std.hash.autoHash(&hasher, call.elapsed_ms);
@@ -3021,6 +3186,36 @@ test "a synth client opens a session and has its snapshot before the reply" {
     try testing.expectEqual(rpc.code.method_not_found, (try client.expectError(unknown)).code);
     const relative = try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = "project" });
     try testing.expectEqualStrings("cwd must be an absolute path", (try client.expectError(relative)).message);
+}
+
+test "an idle ACP session delivers file hooks without a client request" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const io = testing.io;
+    const a = fixture.arena.allocator();
+    fixture.config.hooks.file_changed = &.{.{
+        .matcher = "watched.txt",
+        .command = "printf '%s' '{\"systemMessage\":\"idle file hook ran\"}'",
+    }};
+    const state_path = try std.fs.path.join(a, &.{ fixture.project, "hook-trust.json" });
+    fixture.config.hook_state_path = state_path;
+    var store = try HookStore.Store.init(testing.allocator, io, null);
+    defer store.deinit();
+    const discovered = try HookStore.discover(a, io, fixture.config.hooks, fixture.project, null, store);
+    try store.put(discovered.file_changed[0].id, .{ .trusted = true });
+    try store.save(io, state_path);
+
+    const client = try fixture.connect();
+    defer client.close();
+    try client.initialize(true);
+    const session = (try client.open(fixture.project)).sessionId;
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(try client.prompt(session, "read the note")));
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "project/watched.txt", .data = "changed while idle" });
+
+    const message = try client.awaitMethod(synth.method.notice);
+    const reported = try rpc.parse(synth.Notice, a, message.params);
+    try testing.expectEqualStrings(session, reported.sessionId);
+    try testing.expect(std.mem.indexOf(u8, reported.text, "idle file hook ran") != null);
 }
 
 test "a turn runs, its approval asked as a permission request and its prompt answered at the end" {
@@ -3507,6 +3702,20 @@ test "a question is put as a form to the clients that draw them, and the answer 
 
     try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(prompted));
     try testing.expectEqualStrings("green", try settledWith(editor, asked.toolCallId.?));
+    const another = try client.prompt(session, "ask me");
+    const choice = try client.awaitMethod(protocol.method.elicitation_create);
+    try client.answer(choice.id.?, .{ .action = "accept", .content = .{ .answer = "blue" } });
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(another));
+    const stored = (try fixture.db.sessionByHandle(session)).?;
+    const evidence = try fixture.db.humanIntent(testing.allocator, stored);
+    defer evidence.deinit(testing.allocator);
+    var typed = false;
+    for (evidence.messages) |word| {
+        if (word.origin != .human) continue;
+        if (std.mem.eql(u8, word.text, "green")) typed = true;
+        try testing.expect(!std.mem.eql(u8, word.text, "blue"));
+    }
+    try testing.expect(typed);
 }
 
 test "a question no one connected can answer is answered so, and the turn goes on" {
@@ -3527,6 +3736,12 @@ test "a question no one connected can answer is answered so, and the turn goes o
         if (std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call")) seq = update.get("toolCallId").?.string;
     }
     try testing.expectEqualStrings(unanswerable, try settledWith(editor, seq.?));
+    const stored = (try fixture.db.sessionByHandle(session)).?;
+    const evidence = try fixture.db.humanIntent(testing.allocator, stored);
+    defer evidence.deinit(testing.allocator);
+    for (evidence.messages) |word| {
+        if (word.origin == .human) try testing.expect(!std.mem.eql(u8, word.text, unanswerable));
+    }
 }
 
 test "a declined question tells the model so" {
@@ -3543,6 +3758,12 @@ test "a declined question tells the model so" {
     const asked = try rpc.parse(protocol.FormElicitation(updates.Question), editor.arena.allocator(), message.params);
     try editor.answer(message.id.?, .{ .action = "decline" });
     try testing.expectEqualStrings(declined, try settledWith(editor, asked.toolCallId.?));
+    const stored = (try fixture.db.sessionByHandle(session)).?;
+    const evidence = try fixture.db.humanIntent(testing.allocator, stored);
+    defer evidence.deinit(testing.allocator);
+    for (evidence.messages) |word| {
+        if (word.origin == .human) try testing.expect(!std.mem.eql(u8, word.text, declined));
+    }
 }
 
 test "a model and its effort are chosen through config options, and remembered" {
@@ -3576,6 +3797,41 @@ test "a model and its effort are chosen through config options, and remembered" 
 
     const missing = try client.request(protocol.method.session_set_config_option, protocol.SetConfigOption{ .sessionId = session, .configId = protocol.config_model, .value = "missing" });
     try testing.expectEqualStrings("no such model from this provider", (try client.expectError(missing)).message);
+}
+
+test "ACP still answers requests while a hook decides whether to switch models" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    const io = testing.io;
+    const a = fixture.arena.allocator();
+    fixture.config.hooks.pre_model_switch = &.{.{
+        .command = "while [ ! -f reject-switch ]; do sleep 0.01; done; exit 2",
+    }};
+    fixture.config.hook_state_path = try std.fs.path.join(a, &.{ fixture.project, "hook-trust.json" });
+    var store = try HookStore.Store.init(testing.allocator, io, null);
+    defer store.deinit();
+    const discovered = try HookStore.discover(a, io, fixture.config.hooks, fixture.project, null, store);
+    try store.put(discovered.pre_model_switch[0].id, .{ .trusted = true });
+    try store.save(io, fixture.config.hook_state_path.?);
+
+    try client.initialize(true);
+    const session = (try client.open(fixture.project)).sessionId;
+    const request: protocol.SetConfigOption = .{ .sessionId = session, .configId = protocol.config_model, .value = "bigger" };
+    const asked = try client.request(protocol.method.session_set_config_option, request);
+    const listed = try client.request(synth.method.models, synth.ListModels{ .sessionId = session });
+    _ = try client.expectResult(listed);
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "project/reject-switch", .data = "" });
+    try testing.expectEqualStrings(HooksCopy.blocked, (try client.expectError(asked)).message);
+
+    const effort = try client.request(protocol.method.session_set_config_option, protocol.SetConfigOption{
+        .sessionId = session,
+        .configId = protocol.config_effort,
+        .value = "high",
+    });
+    const options = try rpc.parse(protocol.ConfigOptions, a, try client.expectResult(effort));
+    try testing.expectEqualStrings("scripted", options.configOptions[0].currentValue);
 }
 
 test "a client without synth's extension is offered every model once the session opens" {

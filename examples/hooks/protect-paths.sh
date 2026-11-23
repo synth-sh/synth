@@ -1,38 +1,27 @@
 #!/usr/bin/env bash
-#
-# PreToolUse hook for `edit` and `write`. Refuses changes to files that are
-# not the agent's to change.
-#
-# `matcher` takes one exact tool name, so register it twice:
-#
-#   { "matcher": "edit",  "command": "./examples/hooks/protect-paths.sh" },
-#   { "matcher": "write", "command": "./examples/hooks/protect-paths.sh" }
-#
-# Needs jq to read the path out of the payload.
-set -euo pipefail
 
-# Read the payload first: exiting with it unread leaves synth writing to a
-# closed pipe.
-payload=$(cat)
-command -v jq >/dev/null || exit 0
+exec python3 -c '
+import fnmatch
+import json
+import os
+import sys
 
-path=$(jq -r '.tool_input.path // ""' <<<"$payload")
-[[ -n "$path" ]] || exit 0
-
-deny() {
-  printf '%s is not agent-editable: %s\n' "$path" "$1" >&2
-  exit 2
-}
-
-case "$path" in
-  .env|.env.*|*/.env|*/.env.*)
-    deny "it holds credentials" ;;
-  *.lock|*.lockb|package-lock.json|build.zig.zon.lock)
-    deny "lockfiles are written by their tool, not by hand" ;;
-  .github/*|.gitlab-ci.yml|Jenkinsfile)
-    deny "CI config decides what runs on every push" ;;
-  src/core/migrations/*)
-    deny "an applied migration is history; add a new one instead" ;;
-  *.pem|*.key|*id_rsa*|*id_ed25519*)
-    deny "it is a private key" ;;
-esac
+try:
+    payload = json.load(sys.stdin)
+    path = payload["tool_input"]["path"]
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be a non-empty string")
+    root = os.getcwd()
+    absolute = os.path.abspath(os.path.join(payload.get("cwd", root), path))
+    patterns = (".env", ".env.*", "*/.env", "*/.env.*", "*.lock", "*.lockb",
+                "package-lock.json", ".github/*", ".gitlab-ci.yml", "Jenkinsfile",
+                "src/core/migrations/*", "*.pem", "*.key", "*id_rsa*", "*id_ed25519*")
+    for target in (absolute, os.path.realpath(absolute)):
+        candidate = os.path.relpath(target, root) if os.path.commonpath((root, target)) == root else target
+        if any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns):
+            print(f"{path} is protected", file=sys.stderr)
+            sys.exit(2)
+except Exception as error:
+    print(f"Cannot validate path: {error}", file=sys.stderr)
+    sys.exit(2)
+'

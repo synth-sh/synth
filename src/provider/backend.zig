@@ -16,6 +16,7 @@ const OpenAIProvider = @import("openai.zig");
 const Provider = @import("provider.zig");
 
 const Backend = @This();
+const stream_options_key_bytes = std.crypto.hash.sha2.Sha256.digest_length;
 
 /// What a client is built from. Kept so a switch to another protocol can build
 /// its replacement with the same settings.
@@ -43,6 +44,23 @@ pub const Options = struct {
 
 options: Options,
 client: Client,
+unsupported_stream_options: std.ArrayList([stream_options_key_bytes]u8) = .empty,
+transport_mutex: std.Io.Mutex = .init,
+
+fn streamOptionsKey(client: *const OpenAIProvider) [stream_options_key_bytes]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(std.mem.asBytes(&client.host.len));
+    hash.update(client.host);
+    hash.update(client.model);
+    return hash.finalResult();
+}
+
+fn lacksStreamOptions(self: *const Backend, key: [stream_options_key_bytes]u8) bool {
+    for (self.unsupported_stream_options.items) |known| {
+        if (std.mem.eql(u8, &known, &key)) return true;
+    }
+    return false;
+}
 
 pub const Client = union(catalog.Kind) {
     ollama: OllamaProvider,
@@ -114,7 +132,21 @@ pub fn start(self: *Backend) !void {
     }
 }
 
+pub fn startWithoutProbe(self: *Backend) !void {
+    switch (self.client) {
+        .ollama => |*client| try client.startWithoutProbe(),
+        .openai => |*client| try client.startWithoutProbe(),
+        .chatgpt => |*client| try client.startLike(client),
+        .copilot => |*client| try client.start(),
+    }
+}
+
 pub fn deinit(self: *Backend) void {
+    self.unsupported_stream_options.deinit(self.options.allocator);
+    self.deinitClient();
+}
+
+fn deinitClient(self: *Backend) void {
     switch (self.client) {
         inline else => |*client| client.deinit(),
     }
@@ -138,6 +170,74 @@ pub const Spawned = struct {
         allocator.destroy(self);
     }
 
+    pub fn configure(self: *Spawned, route: @import("../core/model_policy.zig").Route) !void {
+        const a = self.arena.allocator();
+        var options = self.backend.options;
+        options.host = try a.dupe(u8, route.endpoint);
+        options.label = try a.dupe(u8, route.id);
+        options.model = try a.dupe(u8, route.model);
+        options.num_ctx = route.context_limit;
+        options.api_key = if (route.api_key) |key| try a.dupe(u8, key) else null;
+        self.backend.deinitClient();
+        self.backend.options = options;
+        self.backend.client = build(switch (route.provider) {
+            .openai => .openai,
+            .ollama => .ollama,
+        }, options);
+        switch (self.backend.client) {
+            .openai => |*client| {
+                client.wire = switch (route.protocol) {
+                    .chat => .chat,
+                    .responses => .responses,
+                    .messages => .messages,
+                };
+                if (client.wire == .chat) client.send_stream_options = !self.backend.lacksStreamOptions(streamOptionsKey(client));
+                try client.startWithoutProbe();
+                if (route.context_limit > 0) client.context_limit = route.context_limit;
+            },
+            .ollama => |*client| {
+                try client.startWithoutProbe();
+                if (route.context_limit > 0) client.context_limit = route.context_limit;
+            },
+            else => unreachable,
+        }
+    }
+
+    pub fn probe(self: *Spawned, route: @import("../core/model_policy.zig").Route) void {
+        if (self.backend.client == .ollama) {
+            self.backend.client.ollama.probe();
+            if (route.context_limit > 0) self.backend.client.ollama.context_limit = route.context_limit;
+        }
+    }
+
+    pub fn settings(self: *Spawned, value: @import("../core/model_policy.zig").Settings) !void {
+        try value.validate();
+        switch (self.backend.client) {
+            .chatgpt, .copilot => if (value.temperature != null or value.max_output_tokens != null or value.top_p != null or value.top_k != null or value.seed != null or value.frequency_penalty != null or value.presence_penalty != null or value.stop != null) return error.UnsupportedModelSettings,
+            else => {},
+        }
+        if (value.reasoning_effort) |effort| if (self.backend.client != .openai) {
+            const selected_provider = self.backend.provider();
+            const choices = selected_provider.efforts orelse return error.UnsupportedModelSettings;
+            const supported = choices(selected_provider.userdata, selected_provider.model);
+            var found = false;
+            for (supported.levels) |level| if (std.mem.eql(u8, level, effort)) {
+                found = true;
+            };
+            if (!found) return error.UnsupportedModelSettings;
+            if (selected_provider.set_effort) |set| set(selected_provider.userdata, effort) else return error.UnsupportedModelSettings;
+        };
+        const retries = switch (self.backend.client) {
+            .copilot => |*client| &client.inner.retries,
+            inline else => |*client| &client.retries,
+        };
+        if (value.attempts) |n| retries.attempts = n;
+        if (value.retry_delay_ms) |n| {
+            retries.base_ms = n;
+            retries.max_ms = n;
+        }
+    }
+
     pub fn provider(self: *Spawned) Provider {
         return self.backend.provider();
     }
@@ -152,6 +252,8 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     errdefer child.arena.deinit();
     const arena = child.arena.allocator();
 
+    self.transport_mutex.lockUncancelable(self.options.io);
+    defer self.transport_mutex.unlock(self.options.io);
     var options = self.options;
     options.copilot_integration_id = try arena.dupe(u8, self.options.copilot_integration_id);
     options.host = try arena.dupe(u8, self.currentHost());
@@ -160,6 +262,9 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     options.api_key = if (self.currentKey()) |value| try arena.dupe(u8, value) else null;
 
     child.backend = .init(std.meta.activeTag(self.client), options);
+    child.backend.unsupported_stream_options = try self.unsupported_stream_options.clone(options.allocator);
+    errdefer child.backend.unsupported_stream_options.deinit(options.allocator);
+    if (self.client == .openai) try child.backend.rememberStreamOptions(&self.client.openai);
     switch (child.backend.client) {
         .ollama => |*client| try client.startLike(&self.client.ollama),
         .openai => |*client| try client.startLike(&self.client.openai),
@@ -167,6 +272,45 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
         .copilot => |*client| try client.startLike(&self.client.copilot),
     }
     return child;
+}
+
+fn rememberStreamOptions(self: *Backend, client: *const OpenAIProvider) !void {
+    if (client.wire != .chat or client.send_stream_options) return;
+    const key = streamOptionsKey(client);
+    if (!self.lacksStreamOptions(key)) try self.unsupported_stream_options.append(self.options.allocator, key);
+}
+
+pub fn rememberTransport(self: *Backend, child: *const Spawned, purpose: @import("../core/model_policy.zig").Purpose) void {
+    self.transport_mutex.lockUncancelable(self.options.io);
+    defer self.transport_mutex.unlock(self.options.io);
+    if (child.backend.client == .openai) self.rememberStreamOptions(&child.backend.client.openai) catch {};
+    switch (self.client) {
+        .openai => |*parent| {
+            if (child.backend.client != .openai) return;
+            const learned = &child.backend.client.openai;
+            const same_target = std.mem.eql(u8, parent.host, learned.host) and std.mem.eql(u8, parent.model, learned.model) and parent.wire == learned.wire;
+            if (same_target) parent.send_stream_options = parent.send_stream_options and learned.send_stream_options;
+        },
+        .ollama => |*parent| {
+            if (child.backend.client != .ollama) return;
+            const learned = &child.backend.client.ollama;
+            const same_target = std.mem.eql(u8, parent.host, learned.host) and std.mem.eql(u8, parent.model, learned.model) and parent.num_ctx == learned.num_ctx;
+            if (same_target) parent.runtime_limit = learned.runtime_limit;
+        },
+        .chatgpt => |*parent| {
+            if (purpose != .agent or child.backend.client != .chatgpt) return;
+            const learned = &child.backend.client.chatgpt;
+            if (parent.store == learned.store and std.mem.eql(u8, parent.model, learned.model)) {
+                parent.cache_key = learned.cache_key;
+                parent.last_message_count = learned.last_message_count;
+            }
+        },
+        .copilot => |*parent| {
+            if (child.backend.client != .copilot) return;
+            const learned = &child.backend.client.copilot;
+            if (parent.started and learned.started and std.mem.eql(u8, parent.model, learned.model)) parent.inner.send_stream_options = parent.inner.send_stream_options and learned.inner.send_stream_options;
+        },
+    }
 }
 
 /// The host this is pointed at, which a runtime connect may have replaced.
@@ -256,14 +400,14 @@ pub fn connect(
         };
         errdefer replacement.deinit();
         try replacement.reconnect(connection);
-        self.deinit();
+        self.deinitClient();
         self.client = .{ .copilot = replacement };
         self.client.copilot.relocate();
         return self.provider();
     }
 
     if (entry.kind != std.meta.activeTag(self.client)) {
-        self.deinit();
+        self.deinitClient();
         // Built empty then reconnected: only `reconnect` copies the strings.
         self.client = build(entry.kind, .{
             .allocator = self.options.allocator,
@@ -448,4 +592,21 @@ test "an ollama tag matches loosely, an openai id exactly" {
     try testing.expect(local.sameModel("qwen3:latest", "qwen3"));
     try testing.expect(!hosted.sameModel("gpt-4o-2024-08-06", "gpt-4o"));
     try testing.expect(hosted.sameModel("gpt-4o", "gpt-4o"));
+}
+
+test "named routes isolate credentials models and retry settings" {
+    const a = std.testing.allocator;
+    var base: Backend = .init(.openai, .{ .allocator = a, .io = std.testing.io, .host = "http://127.0.0.1:9/v1", .label = "primary", .model = "main", .api_key = "primary-secret" });
+    defer base.deinit();
+    try base.startWithoutProbe();
+    const review = try base.spawn(a);
+    defer review.deinit();
+    try review.configure(.{ .id = "local-review", .provider = .openai, .endpoint = "http://127.0.0.1:8/v1", .model = "decision", .context_limit = 8192 });
+    try review.settings(.{ .attempts = 1, .retry_delay_ms = 7 });
+    try std.testing.expect(review.backend.currentKey() == null);
+    try std.testing.expectEqualStrings("decision", review.backend.model());
+    try std.testing.expectEqual(@as(u32, 8192), review.provider().context_limit);
+    try std.testing.expectEqual(@as(usize, 1), review.backend.client.openai.retries.attempts);
+    try std.testing.expectEqualStrings("main", base.model());
+    try std.testing.expectEqualStrings("primary-secret", base.currentKey().?);
 }

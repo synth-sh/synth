@@ -33,8 +33,9 @@ pub const ToolCall = struct {
     /// Provider-assigned id, or "" when the provider does not supply one.
     id: []const u8,
     name: []const u8,
-    /// Raw JSON object of arguments, as the model produced it.
     arguments: []const u8,
+    prepared_action: ?[]const u8 = null,
+    approved_action: ?[]const u8 = null,
     status: Status = .pending,
     /// Tool output once it has run, or the failure message. May be truncated to
     /// `preview_bytes`; `result_bytes` holds the full length so the UI knows
@@ -110,6 +111,8 @@ pub const ToolCall = struct {
         allocator.free(self.id);
         allocator.free(self.name);
         allocator.free(self.arguments);
+        if (self.prepared_action) |value| allocator.free(value);
+        if (self.approved_action) |value| allocator.free(value);
         if (self.result) |result| allocator.free(result);
     }
 };
@@ -126,7 +129,10 @@ test "every tool call status is marked differently" {
     }
 }
 
+pub const Origin = enum { unknown, human, human_decision, agent, tool, hook, harness };
+
 pub const Message = struct {
+    origin: Origin = .unknown,
     /// Stable, monotonic position in the session. Never reused, even when the
     /// message is trimmed from memory, so it matches the database `seq` column
     /// and lets the UI key per-message state (thought rows, tool cards) without
@@ -134,6 +140,7 @@ pub const Message = struct {
     seq: u64 = 0,
     role: Role,
     text: []const u8,
+    display_text: ?[]const u8 = null,
     /// Reasoning the model emitted for this turn. Assistant messages only. May
     /// be truncated to `preview_bytes`; `thinking_bytes` holds the full length.
     thinking: ?[]const u8 = null,
@@ -154,6 +161,10 @@ pub const Message = struct {
     /// What the provider asked to have replayed with this turn. Assistant
     /// messages only; see `Provider.Reply.provider_state`.
     provider_state: ?[]const u8 = null,
+
+    pub fn displayedText(self: *const Message) []const u8 {
+        return self.display_text orelse self.text;
+    }
 
     /// Whether every tool call on this message has finished. An unsettled
     /// message is still being written to, so it must stay in memory.
@@ -179,6 +190,7 @@ pub const Message = struct {
     pub fn clone(self: Message, allocator: std.mem.Allocator) !Message {
         var owned: Message = .{
             .seq = self.seq,
+            .origin = self.origin,
             .role = self.role,
             .text = try allocator.dupe(u8, self.text),
             .thinking_ms = self.thinking_ms,
@@ -187,6 +199,7 @@ pub const Message = struct {
         };
         errdefer owned.deinit(allocator);
 
+        if (self.display_text) |text| owned.display_text = try allocator.dupe(u8, text);
         if (self.thinking) |thinking| owned.thinking = try allocator.dupe(u8, thinking);
         if (self.provider_state) |state| owned.provider_state = try allocator.dupe(u8, state);
         if (self.tool_name) |name| owned.tool_name = try allocator.dupe(u8, name);
@@ -205,6 +218,8 @@ pub const Message = struct {
                     .id = try allocator.dupe(u8, call.id),
                     .name = try allocator.dupe(u8, call.name),
                     .arguments = try allocator.dupe(u8, call.arguments),
+                    .prepared_action = if (call.prepared_action) |value| try allocator.dupe(u8, value) else null,
+                    .approved_action = if (call.approved_action) |value| try allocator.dupe(u8, value) else null,
                     .status = call.status,
                     .result = if (call.result) |result| try allocator.dupe(u8, result) else null,
                     .result_bytes = call.result_bytes,
@@ -254,6 +269,7 @@ pub const Message = struct {
 
     pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
+        if (self.display_text) |text| allocator.free(text);
         if (self.thinking) |thinking| allocator.free(thinking);
         if (self.tool_name) |name| allocator.free(name);
         if (self.tool_call_id) |id| allocator.free(id);
@@ -311,7 +327,11 @@ pub fn clear(self: *Conversation) void {
 
 /// Append a plain text message.
 pub fn add(self: *Conversation, role: Role, text: []const u8) !void {
-    _ = try self.append(.{ .role = role, .text = text });
+    _ = try self.append(.{ .role = role, .text = text, .origin = switch (role) {
+        .assistant => .agent,
+        .tool => .tool,
+        else => .harness,
+    } });
 }
 
 /// Append a user turn along with any files it mentioned.
@@ -323,6 +343,7 @@ pub fn addUser(
 ) !*Message {
     return self.append(.{
         .role = .user,
+        .origin = .human,
         .text = text,
         .attachments = @constCast(attachments),
         .images = @constCast(images),
@@ -338,6 +359,7 @@ pub fn addAssistant(
 ) !*Message {
     return self.append(.{
         .role = .assistant,
+        .origin = .agent,
         .text = text,
         .thinking = thinking,
         .thinking_ms = thinking_ms,
@@ -353,6 +375,7 @@ pub fn addToolResult(
 ) !*Message {
     return self.append(.{
         .role = .tool,
+        .origin = .tool,
         .text = output,
         .tool_name = tool_name,
         .tool_call_id = tool_call_id,

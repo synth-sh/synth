@@ -70,21 +70,17 @@ once.
 
 ### Auto approvals
 
-`/approvals auto` (or `"approvals": "auto"` in `config.json`) hands those
-decisions to the session's own model instead. Reads, the safe commands, narrow
-allowances and edits inside the project run as before; everything else is
-judged first, by a model shown only what you asked for and the calls the agent
-has made - not what the agent said, and not what any tool returned. Text
-planted in a file reaches it only inside a call's arguments (a heredoc, a file
-being written), fenced off as data it is told not to follow. The safe commands
-skip it as they skip the prompt, wherever they point: `cat ~/.ssh/id_rsa` runs
-unjudged unless `auto_approve_safe_commands` is off. It blocks what looks destructive,
-reaches outside the project, sends data out, touches credentials, or goes past
-the task, and a block reaches the agent as a refused call with the reason.
-Allowances that would run anything (`python3 *`, `npm run *`) are set aside
-while it judges. Three blocks in a row, or twenty in a session, hand decisions
-back to you. `/approvals all` runs everything without asking; `/approvals ask`
-goes back to the prompt.
+Use `/approvals auto` to send actions that would prompt for approval to a
+model reviewer. It sees your requests, answers, and relevant actions. Broad
+shell allowances such as `npm run *` still go to review. Preset read-only
+shell commands skip review by default, including commands that read outside the
+project. Set `auto_approve_safe_commands` to `false` to review those commands.
+
+The session model reviews calls by default. Use [models by request purpose](configuration.md#models-by-request-purpose)
+to configure a separate reviewer, deadline, or fallback. With the default
+fallback, three refusals in a row or twenty in a session return decisions to
+you. With `reviewer_fallback: "deny"`, repeated refusals stop the turn.
+Use `/approvals ask` to return to interactive approval.
 
 ### Rewind
 
@@ -93,3 +89,14 @@ a file in a turn, synth keeps what the file held; `/rewind` lists the prompts
 that changed files, shows what going back to before one would put back, flags
 anything changed since by other means, and restores it. Files changed through
 the shell are not tracked, and the transcript stays as it was.
+
+## Hooks and workspace
+
+`/hooks review` shows configured hooks. Use `/hooks trust <id>` to approve a
+reviewed declaration, or `/hooks disable <id>` to continue without it. See
+[Hooks](hooks.md) for configuration and controls.
+
+`/cd <path>` changes the session working directory; `/cd` shows it. File
+access follows the project root and any roots explicitly permitted with
+`/add-dir <path>`. Both commands require an idle session and accept paths
+containing spaces.

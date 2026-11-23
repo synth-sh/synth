@@ -11,6 +11,7 @@ const tool = @import("tool.zig");
 const Context = tool.Context;
 const Input = tool.Input;
 const Output = tool.Output;
+pub const tool_name = "task";
 
 /// The agent record a subagent runs as. Named here rather than taken from the
 /// model, so a prompt cannot talk its way into a more capable agent.
@@ -18,7 +19,7 @@ const agent_id = "task";
 
 pub const all: []const tool.Tool = &.{
     .{
-        .name = "task",
+        .name = tool_name,
         .description =
         \\Hand a self-contained search or investigation to a subagent and get back only its answer.
         \\Use it when finding something will take several searches whose output you do not need to keep: the subagent's steps stay out of this conversation.

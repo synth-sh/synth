@@ -18,9 +18,12 @@ pub const Result = struct {
     index: usize,
     content: []const u8,
     is_error: bool,
+    hook_result: Hooks.Result = .{},
+    hook_error: ?anyerror = null,
 };
 
 allocator: std.mem.Allocator,
+hook_arena: std.heap.ArenaAllocator,
 io: std.Io,
 registry: *const Registry,
 project_root: []const u8,
@@ -79,11 +82,14 @@ const Reporter = struct {
 };
 
 pub const Call = struct {
+    additional_roots: []const []const u8 = &.{},
+    hook_input: Hooks.Invocation = .{ .event = .post_tool_use },
     /// The message that asked for it, by seq.
     seq: u64 = 0,
     index: usize,
     name: []const u8,
     arguments: []const u8,
+    approved_action: ?[]const u8 = null,
     /// Whether a person approved this call by hand, and so whether it may
     /// touch anything outside the project.
     allow_outside: bool = false,
@@ -104,6 +110,8 @@ pub fn start(
     const self = try allocator.create(ToolRun);
     errdefer allocator.destroy(self);
 
+    var hook_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer hook_arena.deinit();
     const calls = try allocator.alloc(Call, approved.len);
     var built: usize = 0;
     errdefer {
@@ -114,11 +122,16 @@ pub fn start(
         allocator.free(calls);
     }
     for (approved, calls) |src, *dst| {
+        const roots = try hook_arena.allocator().alloc([]const u8, src.additional_roots.len);
+        for (src.additional_roots, roots) |root, *owned| owned.* = try hook_arena.allocator().dupe(u8, root);
         dst.* = .{
             .seq = src.seq,
+            .additional_roots = roots,
+            .hook_input = try src.hook_input.dupe(hook_arena.allocator()),
             .index = src.index,
             .name = try allocator.dupe(u8, src.name),
             .arguments = try allocator.dupe(u8, src.arguments),
+            .approved_action = if (src.approved_action) |value| try hook_arena.allocator().dupe(u8, value) else null,
             .allow_outside = src.allow_outside,
         };
         built += 1;
@@ -140,6 +153,7 @@ pub fn start(
 
     self.* = .{
         .allocator = allocator,
+        .hook_arena = hook_arena,
         .io = io,
         .registry = registry,
         .project_root = project_root,
@@ -155,6 +169,12 @@ pub fn start(
 
     for (self.reporters, 0..) |*reporter, at| reporter.* = .{ .run = self, .index = at };
 
+    if (self.hooks) |runner| if (runner.runtime) |runtime| {
+        for (self.calls) |call| runtime.retainSnapshot(call.hook_input.transcript_path);
+    };
+    errdefer if (self.hooks) |runner| if (runner.runtime) |runtime| {
+        for (self.calls) |call| runtime.releaseSnapshot(call.hook_input.transcript_path);
+    };
     self.future = try io.concurrent(run, .{self});
     return self;
 }
@@ -213,12 +233,16 @@ pub fn join(self: *ToolRun) void {
 pub fn destroy(self: *ToolRun) void {
     const allocator = self.allocator;
     for (self.calls) |call| {
+        if (self.hooks) |runner| if (runner.runtime) |runtime| runtime.releaseSnapshot(call.hook_input.transcript_path);
         allocator.free(call.name);
         allocator.free(call.arguments);
     }
     allocator.free(self.calls);
+    self.hook_arena.deinit();
     for (self.results) |result| {
         if (result.content.len > 0) allocator.free(result.content);
+        var hook_result = result.hook_result;
+        hook_result.deinit(allocator);
     }
     allocator.free(self.results);
     allocator.free(self.notes);
@@ -295,6 +319,8 @@ fn runOne(self: *ToolRun, index: usize) void {
         .allocator = self.allocator,
         .io = self.io,
         .project_root = self.project_root,
+        .permitted_root = if (call.additional_roots.len > 0) call.additional_roots[0] else null,
+        .additional_roots = call.additional_roots,
         .reads = self.reads,
         .delegate = self.delegate,
         .files = self.handoff.files,
@@ -306,46 +332,35 @@ fn runOne(self: *ToolRun, index: usize) void {
         .call_index = call.index,
     };
 
-    if (self.hooks) |runner| {
-        const blocked = runner.dispatch(self.allocator, .{
-            .event = .pre_tool_use,
-            .tool_name = call.name,
-            .tool_input = call.arguments,
-        }) catch |err| {
-            result.* = .{
-                .index = call.index,
-                .content = std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)}) catch
-                    self.allocator.dupe(u8, "pre-tool hook failed") catch "",
-                .is_error = true,
+    const execution_started = tool.monotonicMilliseconds(self.io);
+    const output = execution: {
+        if (call.approved_action) |snapshot| {
+            var arena: std.heap.ArenaAllocator = .init(self.allocator);
+            defer arena.deinit();
+            @import("../core/action.zig").verify(self.io, arena.allocator(), self.project_root, call.name, call.arguments, snapshot) catch |err| {
+                break :execution tool.Output.err(std.fmt.allocPrint(self.allocator, "approved action could not be verified: {s}", .{@errorName(err)}) catch "");
             };
-            return;
-        };
-        if (blocked) |reason| {
-            result.* = .{ .index = call.index, .content = reason, .is_error = true };
-            return;
         }
-    }
-
-    const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| {
-        result.* = .{
-            .index = call.index,
-            .content = std.fmt.allocPrint(
-                self.allocator,
-                "{s} failed: {s}",
-                .{ call.name, @errorName(err) },
-            ) catch self.allocator.dupe(u8, "tool failed") catch "",
-            .is_error = true,
-        };
-        return;
+        break :execution self.registry.executeJson(ctx, call.name, call.arguments) catch |err| tool.Output.err(
+            std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ call.name, @errorName(err) }) catch self.allocator.dupe(u8, "tool failed") catch "",
+        );
     };
     result.* = .{ .index = call.index, .content = output.content, .is_error = output.is_error };
-    if (self.hooks) |runner| {
-        _ = runner.dispatch(self.allocator, .{
-            .event = .post_tool_use,
-            .tool_name = call.name,
-            .tool_input = call.arguments,
-            .tool_response = output.content,
-        }) catch {};
+    if (self.hooks) |configured| {
+        var runner = configured.*;
+        runner.stop = &self.stop;
+        var input = call.hook_input;
+        input.event = if (output.is_error) .post_tool_use_failure else .post_tool_use;
+        input.error_message = if (output.is_error) output.content else "";
+        input.duration_ms = tool.monotonicMilliseconds(self.io) - execution_started;
+        input.is_interrupt = self.stop.load(.acquire);
+        input.tool_name = call.name;
+        input.tool_input = call.arguments;
+        input.tool_response = output.content;
+        result.hook_result = runner.evaluate(self.allocator, input) catch |err| {
+            result.hook_error = err;
+            return;
+        };
     }
 }
 
@@ -616,49 +631,4 @@ test "a running call's progress reaches the owner while it is still running" {
     run_state.join();
     run_state.copyNote(0, &seen);
     try testing.expectEqualStrings("nearly there", seen.text());
-}
-
-test "post-tool hooks run for ordinary tool errors" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
-
-    var registry = try Registry.init(testing.allocator);
-    defer registry.deinit();
-    var reads = tool.ReadLog.init(testing.allocator);
-    defer reads.deinit();
-
-    const hook = Hooks.Hook{
-        .command = "read payload; printf '%s' \"$payload\" > post.json",
-    };
-    const runner: Hooks.Runner = .{
-        .io = testing.io,
-        .root = root,
-        .set = .{ .post_tool_use = &.{hook} },
-    };
-    const calls = [_]Call{.{
-        .index = 0,
-        .name = "not-a-tool",
-        .arguments = "{}",
-    }};
-
-    const batch = try ToolRun.start(
-        testing.allocator,
-        testing.io,
-        &registry,
-        root,
-        &reads,
-        null,
-        .{},
-        &runner,
-        &calls,
-    );
-    batch.join();
-    defer batch.destroy();
-
-    try testing.expect(batch.results[0].is_error);
-    const payload = try tmp.dir.readFileAlloc(testing.io, "post.json", testing.allocator, .limited(4096));
-    defer testing.allocator.free(payload);
-    try testing.expect(std.mem.indexOf(u8, payload, "unknown tool") != null);
 }

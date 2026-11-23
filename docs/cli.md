@@ -5,6 +5,9 @@ synth [project]                start the TUI (default)
 synth run [--allow] <message>  one headless turn, no TUI
 synth session list|show|rm     sessions for this project
 synth session search <text>    find text in this project's transcripts
+synth hooks list|review       inspect hooks and trust status
+synth hooks trust|revoke <id>  change trust for a reviewed definition
+synth hooks enable|disable <id> control whether a hook runs
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
 synth db status|prune|vacuum   what the database holds, and shrinking it
@@ -19,12 +22,12 @@ synth remote new <host> [dir]  start one there, in your home by default
   -c, --continue               resume the most recent session here
   -s, --session <id>           resume a session by handle (ses_7k3f9a2b)
   -m, --model <name>           override the model, this run only
-      --allow                  run only: approve calls that would prompt
+      --allow                  run only: allow ordinary approval prompts
 ```
 
-`synth run` is the fastest way to answer "does this model actually emit tool
-calls" - it drives the real loop and provider and prints each step, denying
-anything that would change the project unless `--allow` is given.
+`synth run` drives one turn and prints each step. By default it declines
+operations that prompt for approval. `--allow` authorizes ordinary approval
+prompts. Calls that specifically require a human are refused in headless runs.
 
 ## ACP
 
@@ -35,7 +38,8 @@ elsewhere attaches to it there. An editor that offers its own view of files
 gets reads and edits through it, unsaved changes included, and one that keeps
 terminals runs commands in them, shown in the call as they run. MCP servers
 the editor brings connect beside those in `config.json`, which wins a clash of
-names; skills and `/compact` are offered as its slash commands.
+names. ACP offers skills, `/compact`, `/hooks`, `/cd`, and `/add-dir` as
+slash commands.
 
 Quitting stops the session, a turn in progress included, unless another
 terminal is attached to it. `/detach` leaves it running instead, and so does
@@ -44,6 +48,19 @@ losing the terminal without quitting, a closed window or a crash:
 any terminal, and quitting from there stops it. Each session listens on a
 socket in `$SYNTH_SOCKET_DIR`, else `/tmp/synth-<uid>`. An editor's sessions
 stop when the editor goes.
+
+### Synth ACP extensions
+
+Clients opt in with `"_meta": {"synth": {"protocol": 2}}` in `initialize`.
+
+| Method | Params | Effect |
+| --- | --- | --- |
+| `_synth/change_directory` | `{"sessionId":"…","path":"…"}` | Change the working directory of an idle session. |
+| `_synth/add_directory` | `{"sessionId":"…","path":"…"}` | Add a permitted file root to an idle session. A new root emits `DirectoryAdded` with `source: "register_repo_root"` by default. |
+| `_synth/hooks` | `{"sessionId":"…","action":"review"}` | Return a hook report. Use `id` for `trust`, `revoke`, `enable`, and `disable`, which require an idle session. The default action is `list`. |
+
+`_synth/status` includes `cwd` and `additional_roots`. The `root` and
+`project` fields identify the original project.
 
 ## Remote
 
@@ -54,3 +71,9 @@ starts `synth acp` under your login shell, so tools see the environment a
 login there would. A remote session keeps running when the connection
 drops, as it does after `/detach`, and `synth remote connect <host>` with no
 id offers the sessions there to pick from.
+
+## Hook review
+
+Run `synth hooks review` from the project to inspect hook definitions and
+trust status without executing hooks or connecting to a model provider.
+See the [hooks reference](hooks-reference.md#the-hooks-commands) for trust and enable controls.

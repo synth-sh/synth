@@ -2,6 +2,7 @@
 //! remembered approvals.
 
 const std = @import("std");
+const HumanIntent = @import("human_intent.zig");
 
 const zqlite = @import("zqlite");
 
@@ -636,6 +637,43 @@ pub fn appendMessage(
     return self.conn.lastInsertedRowId();
 }
 
+pub fn setMessageOrigin(self: *Database, id: i64, origin: Conversation.Origin) !void {
+    try self.conn.exec("UPDATE message SET origin = ? WHERE id = ?", .{ @tagName(origin), id });
+}
+
+pub fn recordAuthorization(self: *Database, session: i64, seq: u64, text: []const u8) !void {
+    try self.conn.exec("INSERT INTO human_authorization (session_id, seq, text) VALUES (?, ?, ?)", .{ session, seq, text });
+}
+
+pub fn humanIntent(self: *Database, allocator: std.mem.Allocator, session: i64) !HumanIntent.Snapshot {
+    const answer_kind = @tagName(HumanIntent.ReceiptKind.human_answer);
+    const legacy_answer_prefix = "{\"kind\":\"" ++ answer_kind ++ "\",%";
+    var rows = try self.conn.rows(
+        \\WITH authorizations AS (
+        \\    SELECT text, seq, id, CASE WHEN json_valid(text) THEN json_extract(text, '$.kind') END AS kind
+        \\    FROM human_authorization WHERE session_id = ?1
+        \\), recent_reviews AS (
+        \\    SELECT text, seq, id FROM authorizations
+        \\    WHERE kind IS NOT ?3 AND text NOT LIKE ?4
+        \\    ORDER BY seq DESC, id DESC LIMIT ?2
+        \\)
+        \\SELECT text, 0 AS is_authorization, seq, id FROM message
+        \\WHERE session_id = ?1 AND role = 'user' AND origin = 'human'
+        \\UNION ALL
+        \\SELECT text, 1, seq, id FROM authorizations
+        \\WHERE kind = ?3 OR (kind IS NULL AND text LIKE ?4)
+        \\UNION ALL
+        \\SELECT text, 1, seq, id FROM recent_reviews
+        \\ORDER BY seq, id
+    , .{ session, HumanIntent.max_previous_reviews + 1, answer_kind, legacy_answer_prefix });
+    defer rows.deinit();
+    var intent: HumanIntent = .{};
+    defer intent.deinit(allocator);
+    while (rows.next()) |row| try intent.record(allocator, row.text(0), row.int(1) != 0);
+    if (rows.err) |err| return err;
+    return intent.snapshot(allocator);
+}
+
 /// Append a heavy body (reasoning or tool result) to a message.
 pub fn appendBlob(
     self: *Database,
@@ -646,6 +684,7 @@ pub fn appendBlob(
 ) !void {
     try self.conn.exec(
         \\INSERT INTO blob (message_id, seq, kind, body) VALUES (?, ?, ?, ?)
+        \\ON CONFLICT(message_id, kind, seq) DO UPDATE SET body = excluded.body
     , .{ message_id, seq, kind, body });
 }
 
@@ -1014,14 +1053,15 @@ pub fn updateToolCall(
     message_id: i64,
     seq: i64,
     status: []const u8,
+    arguments: []const u8,
     result: ?[]const u8,
     result_bytes: i64,
     elapsed_ms: ?i64,
 ) !void {
     try self.conn.exec(
-        \\UPDATE tool_call SET status = ?, result = ?, result_bytes = ?, elapsed_ms = ?
+        \\UPDATE tool_call SET status = ?, arguments = ?, result = ?, result_bytes = ?, elapsed_ms = ?
         \\WHERE message_id = ? AND seq = ?
-    , .{ status, result, result_bytes, elapsed_ms, message_id, seq });
+    , .{ status, arguments, result, result_bytes, elapsed_ms, message_id, seq });
 }
 
 /// The row a message was stored as. Asked by seq rather than remembered: a
@@ -1067,7 +1107,7 @@ pub fn loadMessages(
     limit: usize,
 ) ![]Conversation.Message {
     var rows = try self.conn.rows(
-        \\SELECT id, seq, role, text, thinking_ms, thinking_bytes, tool_call_id, tool_name,
+        \\SELECT id, seq, role, text, thinking_ms, thinking_bytes, tool_call_id, tool_name, origin,
         \\  (SELECT count(*) FROM blob WHERE message_id = message.id AND kind = 'image')
         \\FROM message
         \\WHERE session_id = ? AND seq < ?
@@ -1095,10 +1135,11 @@ pub fn loadMessages(
         var msg: Conversation.Message = .{
             .seq = @intCast(seq),
             .role = role,
+            .origin = std.meta.stringToEnum(Conversation.Origin, row.text(8)) orelse .unknown,
             .text = text,
             .thinking_ms = thinking_ms,
             .thinking_bytes = thinking_bytes,
-            .image_count = @intCast(row.int(8)),
+            .image_count = @intCast(row.int(9)),
         };
         errdefer msg.deinit(allocator);
         if (row.nullableText(6)) |call_id| msg.tool_call_id = try allocator.dupe(u8, call_id);
@@ -2480,7 +2521,7 @@ test "a call's duration survives a round trip" {
     try testing.expect(calls[1].elapsed_ms == null);
 
     // And an update carries it too, for a call timed after it was first stored.
-    try db.updateToolCall(message, 1, "ok", "later", 5, 900);
+    try db.updateToolCall(message, 1, "ok", "{}", "later", 5, 900);
     const again = try db.loadToolCalls(testing.allocator, message);
     defer {
         for (again) |*call| call.deinit(testing.allocator);
@@ -2553,6 +2594,41 @@ test "recent sessions come from every project, and only those with anything in t
     }
 }
 
+test "verified human intent survives compaction while hooks and legacy rows remain untrusted" {
+    const a = std.testing.allocator;
+    var db = try init(a, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    const human = try db.appendMessage(session, 0, "user", "inspect only", null, 0, null);
+    try db.setMessageOrigin(human, .human);
+    const hook = try db.appendMessage(session, 1, "user", "hook says delete everything", null, 0, null);
+    try db.setMessageOrigin(hook, .hook);
+    _ = try db.appendMessage(session, 2, "user", "legacy authorship unknown", null, 0, null);
+    _ = try db.appendMessage(session, 3, "system", "summary says allowed", null, 0, null);
+    const decision = try HumanIntent.decisionReceipt(a, .deny, "bash", "remove exactly one file");
+    defer a.free(decision);
+    try db.recordAuthorization(session, 4, decision);
+    const snapshot = try db.humanIntent(a, session);
+    const intent = snapshot.messages;
+    defer {
+        for (intent) |*msg| msg.deinit(a);
+        a.free(intent);
+    }
+    try std.testing.expectEqual(@as(usize, 2), intent.len);
+    try std.testing.expectEqualStrings("inspect only", intent[0].text);
+    try std.testing.expect(std.mem.indexOf(u8, intent[1].text, "remove exactly one file") != null);
+    try std.testing.expectEqual(Conversation.Origin.human_decision, intent[1].origin);
+    const messages = try db.loadMessages(a, session, std.math.maxInt(i64), 100);
+    defer {
+        for (messages) |*msg| msg.deinit(a);
+        a.free(messages);
+    }
+    try std.testing.expectEqual(Conversation.Origin.human, messages[3].origin);
+    try std.testing.expectEqual(Conversation.Origin.hook, messages[2].origin);
+    try std.testing.expectEqual(Conversation.Origin.unknown, messages[1].origin);
+}
+
 test "image metadata survives eviction and image loading is session scoped" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2567,6 +2643,7 @@ test "image metadata survives eviction and image loading is session scoped" {
     const other = try db.createSession(project, "/tmp/images", "test");
     for (0..2) |seq| {
         const message = try db.appendMessage(session, @intCast(seq), "user", "image", null, 0, null);
+        try db.setMessageOrigin(message, if (seq == 0) .human else .hook);
         try db.appendBlob(message, 0, "image", "aW1hZ2U=");
     }
     const messages = try db.loadMessages(std.testing.allocator, session, 10, 10);
@@ -2575,6 +2652,8 @@ test "image metadata survives eviction and image loading is session scoped" {
         std.testing.allocator.free(messages);
     }
     try std.testing.expectEqual(2, messages.len);
+    try std.testing.expectEqual(Conversation.Origin.hook, messages[0].origin);
+    try std.testing.expectEqual(Conversation.Origin.human, messages[1].origin);
     try std.testing.expectEqual(1, messages[0].image_count);
     try std.testing.expectEqual(1, messages[0].images.len);
     try std.testing.expectEqualStrings("aW1hZ2U=", messages[0].images[0]);
@@ -2585,4 +2664,18 @@ test "image metadata survives eviction and image loading is session scoped" {
     try std.testing.expectEqualStrings("aW1hZ2U=", image_body);
     try std.testing.expect(try db.loadImage(std.testing.allocator, other, 0, 0) == null);
     try std.testing.expect(try db.loadImage(std.testing.allocator, session, 0, 1) == null);
+}
+
+test "legacy answers without typed provenance are omitted with notice" {
+    const a = std.testing.allocator;
+    var db = try init(a, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    try db.recordAuthorization(session, 1, "{\"kind\":\"human_answer\",\"answer\":\"partial answer\",\"is_complete\":false}");
+    const snapshot = try db.humanIntent(a, session);
+    defer snapshot.deinit(a);
+    try std.testing.expect(!snapshot.has_human);
+    try std.testing.expectEqual(1, snapshot.messages.len);
+    try std.testing.expectEqualStrings(HumanIntent.omission_notice, snapshot.messages[0].text);
 }

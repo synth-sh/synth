@@ -12,11 +12,14 @@ const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
 const log_file = @import("log_file.zig");
 const retry = @import("retry.zig");
+const HttpHooks = @import("http_hooks.zig");
 const window = @import("window.zig");
 const responses = @import("responses.zig");
 const anthropic = @import("messages.zig");
 
 const OpenAIProvider = @This();
+const api_version_path = "/v1";
+const max_messages_temperature: f32 = 1;
 
 pub const Wire = enum {
     chat,
@@ -27,7 +30,7 @@ pub const Wire = enum {
         return switch (self) {
             .chat => "/chat/completions",
             .responses => "/responses",
-            .messages => "/v1/messages",
+            .messages => api_version_path ++ "/messages",
         };
     }
 };
@@ -78,13 +81,7 @@ started: bool = false,
 /// Set at start when OpenAI's own API does not list the model in use.
 is_model_unlisted: bool = false,
 model_listing: ?[]u8 = null,
-/// The socket the turn in flight is reading. Guarded rather than atomic: the
-/// shutdown has to happen while the handle is still owned. See `abort`.
-live_socket: std.posix.fd_t = -1,
-socket_lock: std.Io.Mutex = .init,
-/// Whether a cancel arrived. Kept because one can land before the request has
-/// a socket to shut down, and a no-op then would be a cancel that never took.
-aborted: bool = false,
+socket: @import("socket.zig") = .{},
 /// Set when the model, host, key or label was changed at runtime: the borrowed
 /// field then points here rather than at the config, and this is what has to be
 /// freed.
@@ -122,6 +119,7 @@ pub fn start(self: *OpenAIProvider) !void {
 /// a listing needs: the context window does not matter, and a model the server
 /// has never heard of should not fail the command.
 pub fn startWithoutProbe(self: *OpenAIProvider) !void {
+    self.context_limit = knownWindow(self.model);
     if (self.api_key) |key| {
         if (key.len > 0) {
             self.auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
@@ -140,6 +138,11 @@ pub fn startLike(self: *OpenAIProvider, other: *const OpenAIProvider) !void {
     self.supports_tools = other.supports_tools;
     self.supports_vision = other.supports_vision;
     self.send_stream_options = other.send_stream_options;
+    self.wire = other.wire;
+    self.max_output_tokens = other.max_output_tokens;
+    self.versioned_paths = other.versioned_paths;
+    self.state_tag = other.state_tag;
+    self.retries = other.retries;
 }
 
 /// Read the context window for the current model.
@@ -182,6 +185,7 @@ pub fn provider(self: *OpenAIProvider) Provider {
         .context_limit = self.context_limit,
         .vision = self.supports_vision,
         .userdata = self,
+        .observes_attempts = true,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
@@ -192,50 +196,8 @@ pub fn provider(self: *OpenAIProvider) Provider {
     };
 }
 
-/// No request in flight.
-const no_socket: std.posix.fd_t = -1;
-
-/// Break off the request in flight. Safe to call when there is none.
-///
-/// Under the lock the worker holds while the handle is live, so the socket
-/// cannot be closed underneath the shutdown and land on a reused descriptor.
 pub fn abort(self: *OpenAIProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-
-    self.aborted = true;
-    self.shutdownLocked();
-}
-
-fn shutdownLocked(self: *OpenAIProvider) void {
-    if (self.live_socket == no_socket) return;
-    self.io.vtable.netShutdown(self.io.userdata, self.live_socket, .both) catch {};
-    self.live_socket = no_socket;
-}
-
-/// Worker thread. What `abort` shuts down until `forgetSocket` takes it back.
-fn watch(self: *OpenAIProvider, request: *std.http.Client.Request) void {
-    const connection = request.connection orelse return;
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-
-    self.live_socket = connection.stream_reader.stream.socket.handle;
-    if (self.aborted) self.shutdownLocked();
-}
-
-/// Worker thread. A new turn is not the cancelled one.
-fn armSocket(self: *OpenAIProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.aborted = false;
-    self.live_socket = no_socket;
-}
-
-/// Worker thread. Must run before the request is torn down.
-fn forgetSocket(self: *OpenAIProvider) void {
-    self.socket_lock.lockUncancelable(self.io);
-    defer self.socket_lock.unlock(self.io);
-    self.live_socket = no_socket;
+    self.socket.abort(self.io);
 }
 
 fn abortErased(ptr: *anyopaque) void {
@@ -463,10 +425,14 @@ fn isChatModel(id: []const u8) bool {
 /// the reason a request 404s.
 fn endpoint(self: *const OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     const base = std.mem.trimEnd(u8, self.host, "/");
-    if (!self.versioned_paths or std.mem.endsWith(u8, base, "/v1")) {
+    if (self.versioned_paths and std.mem.startsWith(u8, path, api_version_path ++ "/")) {
+        const root = if (std.mem.endsWith(u8, base, api_version_path)) base[0 .. base.len - api_version_path.len] else base;
+        return std.fmt.allocPrint(arena, "{s}{s}", .{ root, path });
+    }
+    if (!self.versioned_paths or std.mem.endsWith(u8, base, api_version_path)) {
         return std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });
     }
-    return std.fmt.allocPrint(arena, "{s}/v1{s}", .{ base, path });
+    return std.fmt.allocPrint(arena, "{s}" ++ api_version_path ++ "{s}", .{ base, path });
 }
 
 /// The headers every request carries. `authorization` is a standard header the
@@ -479,8 +445,8 @@ fn requestHeaders(self: *const OpenAIProvider, json_body: bool) std.http.Client.
             .{ .override = self.auth_value }
         else
             .default,
-        .accept_encoding = .{ .override = "identity" },
-        .content_type = if (json_body) .{ .override = "application/json" } else .default,
+        .accept_encoding = .{ .override = Provider.identity_encoding },
+        .content_type = if (json_body) .{ .override = Provider.json_content_type } else .default,
     };
 }
 
@@ -521,7 +487,7 @@ fn respond(
     turn: Provider.Turn,
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
-) !Provider.Reply {
+) anyerror!Provider.Reply {
     const self: *OpenAIProvider = @ptrCast(@alignCast(ptr));
     if (!self.started) try self.startWithoutProbe();
 
@@ -534,44 +500,66 @@ fn respond(
     const url = try self.endpoint(arena, self.wire.path());
     const uri = std.Uri.parse(url) catch return error.InvalidHost;
 
-    self.armSocket();
+    self.socket.arm(self.io);
 
     var attempt: usize = 1;
     while (true) {
-        const body = try self.buildRequest(arena, convo, turn);
+        var attempt_turn = turn;
+        attempt_turn.hook_input.model = self.model;
+        attempt_turn.hook_input.provider = self.provider().name;
+        var hook_attempt = Provider.Attempt.begin(attempt_turn, allocator, sink);
+        defer hook_attempt.finish();
+        errdefer |err| hook_attempt.error_message = @errorName(err);
+        if (sink) |stream_sink| if (stream_sink.stopped(stream_sink.userdata)) return error.Canceled;
+        var http: HttpHooks.Exchange = .{ .runner = turn.hooks, .input = hook_attempt.turn.hook_input, .url = url, .protocol = @tagName(self.wire), .stop = turn.stop };
+        const prepared = try http.request(arena, try self.buildRequest(arena, convo, turn), self.requestHeaders(true), self.extra_headers);
+        const body = prepared.body;
         // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
 
         var request = try self.client.request(.POST, uri, .{
-            .headers = self.requestHeaders(true),
-            .extra_headers = self.extra_headers,
+            .headers = prepared.headers,
+            .extra_headers = prepared.extra_headers,
             .redirect_behavior = .unhandled,
             .keep_alive = false,
         });
         defer {
-            self.forgetSocket();
+            self.socket.forget(self.io);
             request.deinit();
         }
         try request.sendBodyComplete(body);
-        self.watch(&request);
+        self.socket.watch(self.io, &request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
         try self.refuseRedirect(response.head);
 
         // Read before the body reader is built, which invalidates the head.
-        const sse = streamed(response.head.content_type);
-        const asked_for = retry.retryAfterMs(headerValue(response.head, "retry-after"));
+        const head = try http.response(arena, response.head);
+        const sse = streamed(head.get("content-type"));
+        const asked_for = retry.retryAfterMs(head.get(retry.retry_after_header));
 
         const transfer = try arena.alloc(u8, transfer_buffer_bytes);
         const reader = response.reader(transfer);
 
-        if (response.head.status.class() != .success) {
-            const why = reader.allocRemaining(arena, .limited(max_listing_bytes)) catch "";
-            self.captureRejection(response.head.status, why);
-            if (self.retryWithout(why)) continue;
-
-            if (self.waitAndRetry(response.head.status, attempt, asked_for, sink)) {
+        if (head.status.class() != .success) {
+            const raw = reader.allocRemaining(arena, .limited(max_listing_bytes)) catch "";
+            const why = (try http.payload(arena, raw, false)).?;
+            self.captureRejection(head.status, why);
+            hook_attempt.error_message = if (Provider.mentionsOverflow(why)) "ContextTooLarge" else "HttpError";
+            hook_attempt.finish();
+            if (self.retryWithout(why)) {
+                if (retry.pause(self.io, self.retries, sink, .{ .attempt = attempt, .allowed = true, .delay_ms = 0, .status = @intFromEnum(head.status), .error_type = @tagName(retry.errorType(head.status)), .error_message = why })) {
+                    self.clearRejection();
+                    attempt += 1;
+                    continue;
+                }
+            } else if (retry.wait(self.io, self.retries, sink, .{
+                .status = head.status,
+                .attempt = attempt,
+                .retry_after_ms = asked_for,
+                .message = self.rejection orelse "",
+            })) {
                 attempt += 1;
                 continue;
             }
@@ -583,38 +571,43 @@ fn respond(
             var stream: responses.ResponseStream = .init(allocator, sink);
             defer stream.deinit();
             stream.provider_tag = self.state_tag;
+            stream.http = &http;
             if (!sse) return error.UnexpectedResponse;
             try stream.readEvents(arena, reader);
             if (stream.failure) |failure| {
                 const detail = failure.refusal.message;
                 self.captureRejection(.ok, detail);
-                return failure.toError();
+                return @as(anyerror!Provider.Reply, failure.toError());
             }
             const reply = try stream.intoReply();
             self.log(arena, logged, reply) catch {};
+            hook_attempt.complete(reply.usage);
             return reply;
         }
         if (self.wire == .messages) {
             var stream: anthropic.Stream = .init(allocator, sink);
             defer stream.deinit();
+            stream.http = &http;
             if (sse) {
                 stream.readEvents(arena, reader) catch |err| {
                     if (stream.rejection.len > 0) self.captureRejection(.ok, stream.rejection);
-                    return err;
+                    return @as(anyerror!Provider.Reply, err);
                 };
             } else {
                 const whole = try reader.allocRemaining(arena, .limited(max_listing_bytes));
                 stream.readWhole(arena, whole) catch |err| {
                     if (stream.rejection.len > 0) self.captureRejection(.ok, stream.rejection);
-                    return err;
+                    return @as(anyerror!Provider.Reply, err);
                 };
             }
             const reply = try stream.intoReply();
             self.log(arena, logged, reply) catch {};
+            hook_attempt.complete(reply.usage);
             return reply;
         }
 
         var collector: Collector = .init(allocator, sink);
+        collector.http = &http;
         errdefer collector.deinit();
 
         if (sse) {
@@ -626,6 +619,7 @@ fn respond(
 
         const reply = try collector.finish();
         self.log(arena, logged, reply) catch {};
+        hook_attempt.complete(reply.usage);
         return reply;
     }
 }
@@ -639,38 +633,6 @@ fn retryWithout(self: *OpenAIProvider, why: []const u8) bool {
     if (!self.send_stream_options) return false;
     if (!containsIgnoreCase(why, "stream_options")) return false;
     self.send_stream_options = false;
-    self.clearRejection();
-    return true;
-}
-
-/// Whether the server is answering with an event stream. Some compatible
-/// servers ignore `stream` and reply with one JSON body, which is worth
-/// handling: the alternative is a turn that reads as empty.
-/// Whether to wait and send this request again, waiting if so.
-///
-/// Only ever reached before anything has been streamed: a retry once the
-/// reader has produced tokens would repeat them.
-fn waitAndRetry(
-    self: *OpenAIProvider,
-    status: std.http.Status,
-    attempt: usize,
-    retry_after_ms: ?u64,
-    sink: ?Provider.Sink,
-) bool {
-    if (attempt >= self.retries.attempts) return false;
-    if (!retry.transient(status)) return false;
-    if (retry.tooLong(self.retries, retry_after_ms)) return false;
-
-    if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
-    }
-
-    const wait = retry.waitMs(self.retries, attempt, retry_after_ms);
-    std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
-
-    if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
-    }
     return true;
 }
 
@@ -693,6 +655,7 @@ fn streamed(content_type: ?[]const u8) bool {
 const Collector = struct {
     allocator: std.mem.Allocator,
     sink: ?Provider.Sink,
+    http: ?*HttpHooks.Exchange = null,
     text: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(Pending) = .empty,
     usage: Provider.Usage = .{},
@@ -737,13 +700,14 @@ const Collector = struct {
 
             const line = std.mem.trimEnd(u8, raw, "\r");
             if (line.len == 0) continue;
-            if (!std.mem.startsWith(u8, line, "data:")) continue;
+            if (!std.mem.startsWith(u8, line, Provider.sse_data_prefix)) continue;
 
-            const payload = std.mem.trimStart(u8, line["data:".len..], " ");
+            const payload = std.mem.trimStart(u8, line[Provider.sse_data_prefix.len..], " ");
             if (std.mem.eql(u8, payload, "[DONE]")) return;
 
             _ = scratch.reset(.retain_capacity);
-            const chunk = std.json.parseFromSliceLeaky(Chunk, scratch.allocator(), payload, .{
+            const prepared = if (self.http) |http| (try http.payload(scratch.allocator(), payload, true)) orelse continue else payload;
+            const chunk = std.json.parseFromSliceLeaky(Chunk, scratch.allocator(), prepared, .{
                 .ignore_unknown_fields = true,
             }) catch continue;
 
@@ -754,7 +718,8 @@ const Collector = struct {
     /// Fold a whole non-streamed body in, which carries `message` where a
     /// stream carries `delta`.
     fn readWhole(self: *Collector, arena: std.mem.Allocator, body: []const u8) !void {
-        const parsed = std.json.parseFromSliceLeaky(Chunk, arena, body, .{
+        const prepared = if (self.http) |http| (try http.payload(arena, body, false)).? else body;
+        const parsed = std.json.parseFromSliceLeaky(Chunk, arena, prepared, .{
             .ignore_unknown_fields = true,
         }) catch return error.UnexpectedResponse;
 
@@ -922,19 +887,23 @@ fn buildRequest(
     convo: *Conversation,
     turn: Provider.Turn,
 ) ![]u8 {
+    if (self.wire == .chat and turn.settings.top_k != null) return error.UnsupportedModelSettings;
+    if (self.wire == .responses and (turn.settings.top_k != null or turn.settings.seed != null or turn.settings.frequency_penalty != null or turn.settings.presence_penalty != null or turn.settings.stop != null)) return error.UnsupportedModelSettings;
+    if (self.wire == .messages and (turn.settings.reasoning_effort != null or turn.settings.seed != null or turn.settings.frequency_penalty != null or turn.settings.presence_penalty != null or (turn.settings.temperature orelse 0) > max_messages_temperature)) return error.UnsupportedModelSettings;
     switch (self.wire) {
         .responses => return responses.buildRequest(.{
+            .effort = turn.settings.reasoning_effort orelse "",
             .model = self.model,
             .context_limit = self.context_limit,
             .supports_vision = self.supports_vision,
             .provider_tag = self.state_tag,
-            .max_output_tokens = self.max_output_tokens,
+            .max_output_tokens = turn.settings.max_output_tokens orelse self.max_output_tokens,
         }, arena, convo, turn),
         .messages => return anthropic.buildRequest(.{
             .model = self.model,
             .context_limit = self.context_limit,
             .vision = self.supports_vision,
-            .max_output_tokens = if (self.max_output_tokens > 0) self.max_output_tokens else 4096,
+            .max_output_tokens = turn.settings.max_output_tokens orelse if (self.max_output_tokens > 0) self.max_output_tokens else anthropic.default_max_output_tokens,
         }, arena, convo, turn),
         .chat => {},
     }
@@ -944,6 +913,17 @@ fn buildRequest(
     try w.writeAll("{\"model\":");
     try std.json.Stringify.encodeJsonString(self.model, .{}, w);
     try w.writeAll(",\"stream\":true");
+    if (turn.settings.reasoning_effort) |v| {
+        try w.writeAll(",\"reasoning_effort\":");
+        try std.json.Stringify.value(v, .{}, w);
+    }
+    try Provider.writeNumericSetting(w, turn.settings, .temperature);
+    if (turn.settings.max_output_tokens) |v| try w.print(",\"max_completion_tokens\":{d}", .{v});
+    inline for (.{ .top_p, .seed, .frequency_penalty, .presence_penalty }) |field| try Provider.writeNumericSetting(w, turn.settings, field);
+    if (turn.settings.stop) |v| {
+        try w.writeAll(",\"stop\":");
+        try std.json.Stringify.value(v, .{}, w);
+    }
     if (self.send_stream_options) {
         try w.writeAll(",\"stream_options\":{\"include_usage\":true}");
     }
@@ -1417,6 +1397,8 @@ test "a host is completed to an API root however it was written" {
             .model = "gpt-4o",
         };
         try testing.expectEqualStrings(case.want, try backend.endpoint(arena, "/models"));
+        const messages = try std.mem.replaceOwned(u8, arena, case.want, "/models", "/messages");
+        try testing.expectEqualStrings(messages, try backend.endpoint(arena, Wire.messages.path()));
     }
 }
 
@@ -1817,103 +1799,4 @@ test "a redirect is reported with where it leads, never followed with the key" {
 
     const said = try backend.describeError(error.Redirected, arena);
     try testing.expect(std.mem.indexOf(u8, said, "301 to https://elsewhere.example/v1/models") != null);
-}
-
-/// A sink that reports the turn as given up on, for the retry tests.
-fn stoppedSink() Provider.Sink {
-    const Always = struct {
-        fn stopped(_: *anyopaque) bool {
-            return true;
-        }
-        fn onThinking(_: *anyopaque, _: []const u8) void {}
-        fn onText(_: *anyopaque, _: []const u8) void {}
-    };
-    const nothing = struct {
-        var slot: u8 = 0;
-    };
-    return .{
-        .userdata = &nothing.slot,
-        .stopped = Always.stopped,
-        .onThinking = Always.onThinking,
-        .onText = Always.onText,
-    };
-}
-
-test "a refusal is not sent again, however many attempts are left" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "http://localhost:1234",
-        .model = "local-model",
-        .retries = .{ .base_ms = 1 },
-    };
-
-    try testing.expect(!backend.waitAndRetry(.bad_request, 1, null, null));
-    try testing.expect(!backend.waitAndRetry(.unauthorized, 1, null, null));
-    try testing.expect(!backend.waitAndRetry(.not_found, 1, null, null));
-}
-
-test "congestion is sent again until the attempts run out" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "http://localhost:1234",
-        .model = "local-model",
-        .retries = .{ .attempts = 3, .base_ms = 1 },
-    };
-
-    try testing.expect(backend.waitAndRetry(.too_many_requests, 1, null, null));
-    try testing.expect(backend.waitAndRetry(.service_unavailable, 2, null, null));
-    try testing.expect(!backend.waitAndRetry(.too_many_requests, 3, null, null));
-}
-
-test "a delay longer than a turn is worth is not waited out" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "http://localhost:1234",
-        .model = "local-model",
-        .retries = .{ .base_ms = 1, .max_retry_after_ms = 1_000 },
-    };
-
-    try testing.expect(backend.waitAndRetry(.too_many_requests, 1, 500, null));
-    try testing.expect(!backend.waitAndRetry(.too_many_requests, 1, 60_000, null));
-}
-
-test "a cancel with no request in flight shuts nothing down" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "https://api.example/v1",
-        .label = "Example",
-        .model = "a-model",
-    };
-    defer backend.deinit();
-
-    // Nothing in flight: a no-op rather than a shutdown of whatever -1 is.
-    backend.abort();
-
-    // What the worker does when its request ends, before the socket is closed.
-    backend.forgetSocket();
-    backend.abort();
-    try testing.expectEqual(no_socket, backend.live_socket);
-
-    // A cancel landing before there is a socket still takes, on the next watch.
-    try testing.expect(backend.aborted);
-
-    // And a new turn is not the cancelled one.
-    backend.armSocket();
-    try testing.expect(!backend.aborted);
-}
-
-test "a turn the user gave up on is not retried" {
-    var backend: OpenAIProvider = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .host = "http://localhost:1234",
-        .model = "local-model",
-        .retries = .{ .base_ms = 1 },
-    };
-
-    try testing.expect(!backend.waitAndRetry(.too_many_requests, 1, null, stoppedSink()));
 }

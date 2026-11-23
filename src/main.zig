@@ -65,6 +65,10 @@ pub fn main(init: std.process.Init) !void {
         .skills => try commands.skills(init),
         .session => |sub| try commands.session(init, sub),
         .mcp => |sub| try commands.mcp_command(init, sub),
+        .hooks => |sub| commands.hooks(init, sub.action, sub.id) catch |err| switch (err) {
+            error.UsageReported => std.process.exit(2),
+            else => return err,
+        },
         .db => |sub| try commands.database(init, sub),
         .remote => |sub| try remote.run(init, sub),
     }

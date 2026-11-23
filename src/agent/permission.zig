@@ -9,6 +9,9 @@
 //! matches only that path.
 
 const std = @import("std");
+const unicode = @import("uucode");
+const Paths = @import("../core/paths.zig");
+const Hooks = @import("../core/hooks.zig");
 const testing = std.testing;
 
 const safety = @import("safety.zig");
@@ -242,4 +245,78 @@ test "allowances stored before word prefixes keep covering what they did" {
     try expectCovers("find *", "find", true);
     try expectCovers("find", "find", true);
     try expectCovers("find", "find .", false);
+}
+
+pub fn protectedPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, target: []const u8, control_files: []const []const u8, hooks: Hooks.Set) !bool {
+    const lexical = try std.fs.path.resolve(arena, &.{ root, target });
+    const resolved = try Paths.resolve(io, arena, root, target);
+    for ([_][]const u8{ lexical, resolved }) |path| {
+        var parts = std.mem.tokenizeScalar(u8, path, '/');
+        while (parts.next()) |part| {
+            if (sameName(part, Paths.synth_config_dir) or sameName(part, ".git")) return true;
+        }
+    }
+    for (control_files) |file| {
+        if (try samePath(arena, io, root, file, lexical, resolved)) return true;
+    }
+    inline for (std.meta.fields(Hooks.Set)) |field| {
+        for (@field(hooks, field.name)) |hook| {
+            if (!hook.enabled or !hook.trusted) continue;
+            if (try samePath(arena, io, root, hook.source, lexical, resolved)) return true;
+        }
+    }
+    return false;
+}
+
+fn samePath(arena: std.mem.Allocator, io: std.Io, root: []const u8, file: []const u8, lexical: []const u8, resolved: []const u8) !bool {
+    if (file.len == 0) return false;
+    const named = std.fs.path.resolve(arena, &.{ root, file }) catch return false;
+    if (sameName(named, lexical)) return true;
+    const actual = Paths.resolve(io, arena, root, file) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    return sameName(actual, resolved);
+}
+
+const Folded = struct {
+    input: std.unicode.Utf8Iterator,
+    single: [1]u21 = undefined,
+    mapping: []const u21 = &.{},
+    index: usize = 0,
+
+    fn next(self: *Folded) ?u21 {
+        if (self.index == self.mapping.len) {
+            const codepoint = self.input.nextCodepoint() orelse return null;
+            self.mapping = unicode.get(.case_folding_full, codepoint).with(&self.single, codepoint);
+            self.index = 0;
+        }
+        const codepoint = self.mapping[self.index];
+        self.index += 1;
+        return codepoint;
+    }
+};
+
+fn sameName(a: []const u8, b: []const u8) bool {
+    const left = std.unicode.Utf8View.init(a) catch return std.mem.eql(u8, a, b);
+    const right = std.unicode.Utf8View.init(b) catch return std.mem.eql(u8, a, b);
+    var lhs: Folded = .{ .input = left.iterator() };
+    var rhs: Folded = .{ .input = right.iterator() };
+    while (lhs.next()) |codepoint| {
+        if (codepoint != (rhs.next() orelse return false)) return false;
+    }
+    return rhs.next() == null;
+}
+
+test "missing hook control files cannot bypass protection through case variants" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const trust = try std.fs.path.join(a, &.{ root, "hook-trust.json" });
+    for ([_][]const u8{ ".SYNTH/hooks.json", ".ſynth/hooks.json", ".GIT/HOOKS/new", ".git/config", ".git/objects/new", "HOOK-TRUST.json", "hook-truſt.json", "hooK-trust.json" }) |target| {
+        try testing.expect(try protectedPath(a, testing.io, root, target, &.{trust}, .{}));
+    }
 }

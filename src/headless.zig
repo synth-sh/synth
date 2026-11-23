@@ -4,6 +4,7 @@ const std = @import("std");
 
 const pkg = @import("pkg");
 
+const Hooks = @import("core/hooks.zig");
 const Conversation = @import("core/conversation.zig");
 const Stack = @import("agent/stack.zig");
 const Auth = @import("core/auth.zig");
@@ -16,13 +17,13 @@ const McpStore = @import("core/mcp_store.zig");
 const humanize = @import("core/humanize.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
+const terminal = @import("terminal_output.zig");
 
-const dim = "\x1b[2m";
-const bold = "\x1b[1m";
+const dim = terminal.dim;
 const green = "\x1b[32m";
 const yellow = "\x1b[33m";
 const red = "\x1b[31m";
-const reset = "\x1b[0m";
+const reset = terminal.reset;
 
 /// One headless turn: same loop and provider as the TUI, printing to stdout.
 pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !void {
@@ -75,8 +76,12 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     });
     defer backend.deinit();
 
-    try backend.start();
-    backend.ensureModel() catch {};
+    if (config.model_requests.agent != null) {
+        try backend.startWithoutProbe();
+    } else {
+        try backend.start();
+        backend.ensureModel() catch {};
+    }
 
     const stack = try Stack.create(allocator, io, .{
         .config = &config,
@@ -90,6 +95,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     });
     defer stack.destroy();
     const loop = &stack.loop;
+    loop.stream_display = false;
     const convo = &stack.convo;
     const runner = &stack.runner;
     if (!allow_mutating) loop.setApprovals(.ask);
@@ -115,7 +121,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         reset,
         if (config.auto_approve_safe_commands) "run without asking" else "off",
     });
-    try out.print("{s}▸ you{s} {s}\n", .{ bold, reset, prompt });
+    try terminal.writeTranscriptLine(out, "you", prompt);
     try out.flush();
 
     try loop.submit(prompt, .{});
@@ -136,12 +142,12 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         if (loop.state == .awaiting_approval) {
             const call = loop.pendingCall().?;
             try out.print("{s}  ? approve {s}{s}{s} {s}\n", .{
-                yellow, bold, call.name, reset, call.arguments,
+                yellow, terminal.bold, call.name, reset, call.arguments,
             });
             try out.flush();
             switch (answer(allow_mutating, started, loop.approvals)) {
-                .approve => try loop.decide(.once),
-                .refuse => try loop.decide(.deny),
+                .approve => try loop.decideHeadless(true),
+                .refuse => try loop.decideHeadless(false),
                 .stop => {
                     try out.print("{s}stopping: auto mode blocked too many calls{s}\n", .{ red, reset });
                     try out.flush();
@@ -156,11 +162,14 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     }
     if (loop.takeHookNotice()) |notice| {
         defer allocator.free(notice);
-        try out.print("{s}hook blocked prompt{s} {s}\n", .{ red, reset, notice });
+        try out.print("{s}hook notice{s} {s}\n", .{ red, reset, notice });
         try out.flush();
+        if (loop.outcome == .failed) return error.HookRejected;
+        if (loop.steps == 0) return error.HookRejected;
         return;
     }
     _ = try report(out, convo, printed);
+    if (loop.outcome == .failed) return error.RunFailed;
 
     try out.print("\n{s}{d} messages, {d} model calls{s}\n", .{ dim, convo.messages.items.len, loop.steps, reset });
     try out.flush();
@@ -197,8 +206,8 @@ fn report(out: *std.Io.Writer, convo: *Conversation, from: usize) !usize {
                     var buffer: [humanize.duration_bytes]u8 = undefined;
                     try out.print("{s}  · thought {s}{s}\n", .{ dim, humanize.duration(&buffer, ms), reset });
                 }
-                if (msg.text.len > 0) {
-                    try out.print("{s}▸ {s}{s} {s}\n", .{ bold, pkg.name, reset, msg.text });
+                if (msg.displayedText().len > 0) {
+                    try terminal.writeTranscriptLine(out, pkg.name, msg.displayedText());
                 }
                 for (msg.tool_calls) |call| {
                     const colour = switch (call.status) {

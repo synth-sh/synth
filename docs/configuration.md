@@ -2,13 +2,14 @@
 
 ## Files
 
-Three files, split by what they hold.
+Synth stores settings, credentials, and session data separately.
 
 | file | holds | where |
 | --- | --- | --- |
 | `config.json` | what you set by hand | `$XDG_CONFIG_HOME/synth/` |
 | `auth.json` | API keys, one per provider | `$XDG_DATA_HOME/synth/` |
 | `synth.db` | sessions, messages, approvals, the provider and model in use | `$XDG_DATA_HOME/synth/` |
+| `hook-trust.json` | hook trust and enable state | `$XDG_DATA_HOME/synth/` |
 
 Every `config.json` key is optional. An absent one keeps the built-in default.
 
@@ -17,7 +18,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `system_prompt` | string | the built-in brief | Replaces the base instructions entirely. |
 | `think` | bool | `true` | Ask for reasoning output. Turn off for models that do not support it. |
 | `auto_approve_safe_commands` | bool | `true` | Let a preset of read-only shell commands run without a prompt. Off makes every command a question, however harmless. |
-| `approvals` | string | `"ask"` | Who decides a call that would otherwise ask: `ask` puts it to you, `auto` has the session's model judge it (see [Auto approvals](usage.md#auto-approvals)), `all` runs everything, paths outside the project included - for a machine set aside for the agent. `PreToolUse` hooks still run under each. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
+| `approvals` | string | `"ask"` | `ask` prompts, `auto` uses a [model reviewer](usage.md#auto-approvals), and `all` skips ordinary approval prompts, including for paths outside the project. Hook policies and actions requiring human approval still apply. |
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |
@@ -25,8 +26,10 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See [MCP](mcp.md). |
-| `hooks` | object | none | Commands run on selected agent lifecycle events. See [Hooks](hooks.md). |
-| `hook_timeout_ms` | number | `30000` | How long a hook command may run before it is killed. |
+| `hooks` | object | none | Commands and MCP tools triggered by [hook events](hooks-reference.md#hook-events). |
+| `model_requests` | object | active session model | Choose [models by request purpose](#models-by-request-purpose). |
+| `model_classes` | array | `[]` | Declare model trust and tier for [hook filters](hooks-reference.md#filter-by-agent-request-purpose-or-model). |
+| `hook_timeout_ms` | integer | `30000` | Default hook timeout in milliseconds, from 1 to 86,400,000. |
 | `web` | object | none | Settings for the web tools. See below. |
 | `prune` | object | shed after 30 days | What a prune throws away. See [Pruning](#pruning). |
 | `bell` | string | `unfocused` | When a finished turn says so: `unfocused`, `always` or `never`. See below. |
@@ -41,8 +44,8 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 }
 ```
 
-The provider, its host, the model and the theme are **not** in here. They are
-set by using the app and kept in the database.
+Synth stores the active provider, host, model, and theme in the database.
+Use `model_requests` in this file to configure dedicated routes.
 
 `debug_log` is the first thing to reach for when a model goes quiet: it shows
 whether a request was sent at all, and how large it had grown.
@@ -74,8 +77,10 @@ That works, but DuckDuckGo throttles it after a handful of searches and answers
 with a page that has no results on it, which the tool reports as such. A Brave
 Search key in `BRAVE_API_KEY` switches it to an API that does not throttle.
 
-A debug build keeps all three files in the working directory, so a checkout
-never touches installed state.
+Debug builds keep `config.json`, `auth.json`, and `synth.db` in the working
+directory. Debug hook trust lives under `$XDG_DATA_HOME/synth-dev/`.
+If `XDG_DATA_HOME` is unset, both builds use `~/.local/share/` as the base
+for hook trust.
 
 `"bell"` decides when a finished turn says so: `unfocused` (the default),
 `always`, or `never`. It sends both a desktop notification and BEL, because
@@ -139,3 +144,68 @@ synth db vacuum        hand freed pages back to the filesystem
 `db status` is a dry run: it says what a prune would take without taking it.
 A day count given to `db prune` only ever sheds, so losing a transcript stays
 something `config.json` has to ask for.
+
+## Models by request purpose
+
+Use `model_requests` to choose a model for `agent`, `approval_judge`, or
+`compaction` requests. By default, a purpose without a route uses the
+provider and model selected in `/model`.
+
+To use a ChatGPT plan or GitHub Copilot model for agent turns and Ollama
+for approvals, select your hosted model in `/model` and add this to your
+user `config.json`. Replace `qwen3` with a model installed on your Ollama
+server.
+
+```json
+{
+  "approvals": "auto",
+  "model_requests": {
+    "approval_judge": "local-review",
+    "reviewer_fallback": "deny",
+    "routes": [{
+      "id": "local-review",
+      "provider": "ollama",
+      "endpoint": "http://localhost:11434",
+      "model": "qwen3",
+      "purposes": ["approval_judge"]
+    }]
+  }
+}
+```
+
+| Setting | Behavior |
+| --- | --- |
+| `agent`, `approval_judge`, `compaction` | Select a route ID. Omitted purposes use the active provider by default. |
+| `restrict_routes` | Requires a route for all three purposes and disables provider discovery and switching. Tool network access still follows tool permissions and hook trust. |
+| `reviewer_timeout_ms` | Approval review deadline, including preparation and retries. Defaults to 30,000 ms and accepts 1–300,000. |
+| `reviewer_fallback` | On timeout, error, or missing verified human intent, `ask` (default) requests human approval and `deny` refuses the call. If a resumed session lacks a verified human prompt, send a fresh one. |
+
+Each route needs an `id`, `provider` (`openai` or `ollama`), HTTP(S)
+`endpoint`, and `model`. For `openai`, set `protocol` to `chat` (default),
+`responses`, or `messages`. A named route opens its own connection, so its
+endpoint and credentials come from the route. Supply an explicit `api_key`
+if the route needs one.
+
+To pin agent turns to the OpenAI API, add this entry to `model_requests.routes`
+and set `model_requests.agent` to `"cloud-agent"`. Use a model ID and key
+from your API account.
+
+```json
+{
+  "id": "cloud-agent",
+  "provider": "openai",
+  "protocol": "responses",
+  "endpoint": "https://api.openai.com/v1",
+  "model": "YOUR_OPENAI_MODEL_ID",
+  "api_key": "YOUR_OPENAI_API_KEY",
+  "purposes": ["agent"]
+}
+```
+
+Use `purposes` to restrict which requests can use a route and `settings`
+to set supported generation controls such as `max_output_tokens`. Set
+`context_limit` to the usable window in tokens, up to 1,048,576. Zero uses
+the backend default or known model limit. Ollama receives a positive limit as
+`num_ctx` and uses its server default when the limit is zero. See [Model request
+hooks](hooks-reference.md#model-requests) for per-request changes and the
+[configuration schema](../config.schema.json) for all keys.

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
+const HttpHooks = @import("http_hooks.zig");
 const OpenAI = @import("openai.zig");
 const window = @import("window.zig");
 
@@ -34,6 +35,8 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     const w = &out.writer;
     try w.writeAll("{\"model\":");
     try writeString(w, options.model);
+    try Provider.writeNumericSetting(w, turn.settings, .temperature);
+    try Provider.writeNumericSetting(w, turn.settings, .top_p);
     try w.writeAll(",\"input\":[");
     var input: InputWriter = .{ .writer = w, .supports_vision = options.supports_vision, .provider_tag = options.provider_tag };
     try input.text("developer", Item.input_text, instructions);
@@ -139,7 +142,7 @@ const InputWriter = struct {
     /// the turn made tool calls.
     fn assistant(self: *InputWriter, arena: std.mem.Allocator, msg: Conversation.Message, content: []const u8) !bool {
         if (msg.provider_state) |state| {
-            if (try self.recorded(arena, state)) |made_calls| return made_calls;
+            if (try self.recorded(arena, state, msg.tool_calls)) |made_calls| return made_calls;
         }
         if (content.len > 0) try self.text("assistant", Item.output_text, content);
         for (msg.tool_calls) |call| {
@@ -154,15 +157,25 @@ const InputWriter = struct {
         return msg.tool_calls.len > 0;
     }
 
-    fn recorded(self: *InputWriter, arena: std.mem.Allocator, state: []const u8) !?bool {
+    fn recorded(self: *InputWriter, arena: std.mem.Allocator, state: []const u8, calls: []const Conversation.ToolCall) !?bool {
         const Record = struct { provider: []const u8 = "", items: []const std.json.Value = &.{} };
         const record = std.json.parseFromSliceLeaky(Record, arena, state, .{ .ignore_unknown_fields = true }) catch return null;
         if (!std.mem.eql(u8, record.provider, self.provider_tag) or record.items.len == 0) return null;
 
         var made_calls = false;
-        for (record.items) |item| {
+        for (record.items) |recorded_item| {
+            var item = recorded_item;
             if (itemType(item)) |kind| {
-                if (std.mem.eql(u8, kind, Item.function_call)) made_calls = true;
+                if (std.mem.eql(u8, kind, Item.function_call)) {
+                    made_calls = true;
+                    if (stringField(item.object, "call_id")) |id| {
+                        for (calls) |call| {
+                            if (!std.mem.eql(u8, call.id, id)) continue;
+                            try item.object.put(arena, "arguments", .{ .string = if (call.arguments.len > 0) call.arguments else "{}" });
+                            break;
+                        }
+                    }
+                }
             }
             try self.separator();
             try std.json.Stringify.value(item, .{}, self.writer);
@@ -333,6 +346,7 @@ pub const Failure = struct {
 /// Everything one streamed response produces: the reply, plus each completed
 /// output item kept verbatim for replay.
 pub const ResponseStream = struct {
+    http: ?*HttpHooks.Exchange = null,
     allocator: std.mem.Allocator,
     provider_tag: []const u8 = "chatgpt",
     sink: ?Provider.Sink,
@@ -396,11 +410,12 @@ pub const ResponseStream = struct {
             };
 
             const trimmed = std.mem.trimEnd(u8, line.written(), "\r");
-            if (std.mem.startsWith(u8, trimmed, "data:")) {
-                const payload = std.mem.trimStart(u8, trimmed["data:".len..], " ");
+            if (std.mem.startsWith(u8, trimmed, Provider.sse_data_prefix)) {
+                const payload = std.mem.trimStart(u8, trimmed[Provider.sse_data_prefix.len..], " ");
                 const is_event = payload.len > 0 and !std.mem.eql(u8, payload, "[DONE]");
                 if (is_event) {
-                    const event = std.json.parseFromSliceLeaky(std.json.Value, scratch, payload, .{}) catch null;
+                    const prepared = if (self.http) |http| (try http.payload(scratch, payload, true)) orelse continue else payload;
+                    const event = std.json.parseFromSliceLeaky(std.json.Value, scratch, prepared, .{}) catch null;
                     if (event) |parsed| try self.apply(parsed);
                 }
             }

@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const ShellWords = @import("../core/shell_words.zig");
 
 pub const Verdict = enum { safe, ask };
 
@@ -199,35 +200,8 @@ fn unquote(argument: []const u8) []const u8 {
     return out;
 }
 
-/// Split a segment's arguments on whitespace, keeping quoted runs whole.
-pub fn arguments(text: []const u8) ArgumentIterator {
-    return .{ .text = text };
-}
-
-pub const ArgumentIterator = struct {
-    text: []const u8,
-    at: usize = 0,
-
-    pub fn next(self: *ArgumentIterator) ?[]const u8 {
-        while (self.at < self.text.len and isSpace(self.text[self.at])) self.at += 1;
-        if (self.at >= self.text.len) return null;
-
-        const start = self.at;
-        while (self.at < self.text.len and !isSpace(self.text[self.at])) {
-            const c = self.text[self.at];
-            if (c == '\'' or c == '"') {
-                self.at = skipQuoted(self.text, self.at) orelse self.text.len;
-                continue;
-            }
-            self.at += 1;
-        }
-        return self.text[start..self.at];
-    }
-};
-
-fn isSpace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
-}
+pub const arguments = ShellWords.arguments;
+const skipQuoted = ShellWords.skipQuoted;
 
 /// The commands `command` runs, in the order they appear, or null when the line
 /// uses something this splitter will not vouch for. A `cd` is not a command
@@ -288,26 +262,6 @@ fn append(arena: std.mem.Allocator, found: *std.ArrayList(Segment), segment: []c
 
     try found.append(arena, .{ .program = base, .invoked = first, .arguments = trimmed[end..] });
     return true;
-}
-
-/// Step over a quoted run, returning the index just past the closing quote.
-/// Null for an unterminated quote, or for a substitution inside a double-quoted
-/// string, which the caller treats as un-splittable.
-fn skipQuoted(command: []const u8, at: usize) ?usize {
-    const quote = command[at];
-    var i = at + 1;
-    while (i < command.len) : (i += 1) {
-        if (quote == '"') {
-            if (command[i] == '\\') {
-                i += 1;
-                continue;
-            }
-            if (command[i] == '`') return null;
-            if (command[i] == '$' and i + 1 < command.len and command[i + 1] == '(') return null;
-        }
-        if (command[i] == quote) return i + 1;
-    }
-    return null;
 }
 
 /// Step over a redirect, returning the index just past it. Only `/dev/null` and

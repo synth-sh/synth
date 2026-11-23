@@ -11,7 +11,6 @@ const std = @import("std");
 const testing = std.testing;
 
 const Conversation = @import("../core/conversation.zig");
-const mention = @import("../core/mention.zig");
 const todo = @import("../core/todo.zig");
 const mcp_tools = @import("../tools/mcp.zig");
 const Config = @import("../core/config.zig");
@@ -27,6 +26,9 @@ pub const Hello = struct {
 };
 
 pub const method = struct {
+    pub const hooks = "_synth/hooks";
+    pub const change_directory = "_synth/change_directory";
+    pub const add_directory = "_synth/add_directory";
     /// Agent to client: everything about the session, after it is set up.
     pub const snapshot = "_synth/snapshot";
     pub const appended = "_synth/appended";
@@ -82,17 +84,24 @@ pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
     arguments: []const u8,
+    prepared_action: ?[]const u8 = null,
+    approved_action: ?[]const u8 = null,
     status: Conversation.ToolCall.Status,
-    /// The preview the agent holds; `load_tool_result` fetches the rest.
     result: ?[]const u8 = null,
     result_bytes: u64 = 0,
     elapsed_ms: ?u64 = null,
-};
 
-pub const Attachment = struct {
-    path: []const u8,
-    content: []const u8,
-    content_bytes: u64 = 0,
+    fn copyFields(from_call: anytype, to_call: anytype) void {
+        inline for (@typeInfo(ToolCall).@"struct".fields) |field| {
+            @field(to_call, field.name) = @field(from_call, field.name);
+        }
+    }
+
+    fn toConversation(self: ToolCall) Conversation.ToolCall {
+        var call: Conversation.ToolCall = .{ .id = self.id, .name = self.name, .arguments = self.arguments };
+        copyFields(self, &call);
+        return call;
+    }
 };
 
 /// A transcript message as the agent holds it in memory: heavy bodies are
@@ -100,6 +109,7 @@ pub const Attachment = struct {
 pub const Message = struct {
     seq: u64,
     role: Conversation.Role,
+    origin: Conversation.Origin = .unknown,
     text: []const u8,
     thinking: ?[]const u8 = null,
     thinking_ms: ?u64 = null,
@@ -107,69 +117,40 @@ pub const Message = struct {
     tool_calls: []const ToolCall = &.{},
     tool_name: ?[]const u8 = null,
     tool_call_id: ?[]const u8 = null,
-    attachments: []const Attachment = &.{},
+    attachments: []Conversation.Attachment = &.{},
     /// Includes images whose bodies are only available through load_image.
     image_count: u32 = 0,
 
-    /// Borrows `msg`'s strings; only the arrays are allocated.
     pub fn from(arena: std.mem.Allocator, msg: *const Conversation.Message) !Message {
         const calls = try arena.alloc(ToolCall, msg.tool_calls.len);
-        for (msg.tool_calls, calls) |call, *out| out.* = .{
-            .id = call.id,
-            .name = call.name,
-            .arguments = call.arguments,
-            .status = call.status,
-            .result = call.result,
-            .result_bytes = call.result_bytes,
-            .elapsed_ms = call.elapsed_ms,
-        };
-        const attachments = try arena.alloc(Attachment, msg.attachments.len);
-        for (msg.attachments, attachments) |attachment, *out| out.* = .{
-            .path = attachment.path,
-            .content = attachment.content,
-            .content_bytes = attachment.content_bytes,
-        };
+        for (msg.tool_calls, calls) |call, *out| ToolCall.copyFields(call, out);
         return .{
             .seq = msg.seq,
             .image_count = @max(msg.image_count, @as(u32, @intCast(msg.images.len))),
             .role = msg.role,
-            .text = msg.text,
+            .origin = msg.origin,
+            .text = msg.displayedText(),
             .thinking = msg.thinking,
             .thinking_ms = msg.thinking_ms,
             .thinking_bytes = msg.thinking_bytes,
             .tool_calls = calls,
             .tool_name = msg.tool_name,
             .tool_call_id = msg.tool_call_id,
-            .attachments = attachments,
+            .attachments = msg.attachments,
         };
     }
 
     /// A transcript message owning a copy of everything, `seq` kept.
     pub fn toOwned(self: Message, allocator: std.mem.Allocator) !Conversation.Message {
-        var arena_state: std.heap.ArenaAllocator = .init(allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
+        const calls = try allocator.alloc(Conversation.ToolCall, self.tool_calls.len);
+        defer allocator.free(calls);
+        for (self.tool_calls, calls) |call, *out| out.* = call.toConversation();
 
-        const calls = try arena.alloc(Conversation.ToolCall, self.tool_calls.len);
-        for (self.tool_calls, calls) |call, *out| out.* = .{
-            .id = call.id,
-            .name = call.name,
-            .arguments = call.arguments,
-            .status = call.status,
-            .result = call.result,
-            .result_bytes = call.result_bytes,
-            .elapsed_ms = call.elapsed_ms,
-        };
-        const attachments = try arena.alloc(mention.Attachment, self.attachments.len);
-        for (self.attachments, attachments) |attachment, *out| out.* = .{
-            .path = attachment.path,
-            .content = attachment.content,
-            .content_bytes = attachment.content_bytes,
-        };
         const view: Conversation.Message = .{
             .seq = self.seq,
             .image_count = self.image_count,
             .role = self.role,
+            .origin = self.origin,
             .text = self.text,
             .thinking = self.thinking,
             .thinking_ms = self.thinking_ms,
@@ -177,15 +158,25 @@ pub const Message = struct {
             .tool_calls = calls,
             .tool_name = self.tool_name,
             .tool_call_id = self.tool_call_id,
-            .attachments = attachments,
+            .attachments = self.attachments,
         };
         return view.clone(allocator);
     }
 };
 
+pub const Directory = struct {
+    pub const Source = enum { register_repo_root, slash_command };
+
+    sessionId: []const u8,
+    path: []const u8,
+    source: Source = .register_repo_root,
+};
+
 /// Everything about a session that is not its transcript, sent whole whenever
 /// any of it changes.
 pub const Status = struct {
+    cwd: []const u8 = "",
+    additional_roots: []const []const u8 = &.{},
     state: Loop.State = .idle,
     /// What the session says it is doing: `Loop.label`.
     label: []const u8 = "",
@@ -410,12 +401,13 @@ test "a message survives the wire and comes back owned" {
 
     var convo: Conversation = .init(testing.allocator);
     defer convo.deinit();
-    var calls = [_]Conversation.ToolCall{.{ .id = "c0", .name = "read", .arguments = "{}", .status = .ok, .result = "body", .result_bytes = 9000 }};
-    var attachments = [_]mention.Attachment{.{ .path = "a.zig", .content = "const a = 1;" }};
+    var calls = [_]Conversation.ToolCall{.{ .id = "c0", .name = "read", .arguments = "{}", .status = .ok, .result = "body", .result_bytes = 9000, .started_ms = 100 }};
+    var attachments = [_]Conversation.Attachment{.{ .path = "a.zig", .content = "const a = 1;" }};
     const original = try convo.append(.{ .role = .assistant, .text = "done", .thinking = "why", .tool_calls = &calls, .attachments = &attachments });
 
     var out: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(try Message.from(arena, original), .{ .emit_null_optional_fields = false }, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"started_ms\"") == null);
     const parsed = try std.json.parseFromSliceLeaky(Message, arena, out.written(), .{});
     var owned = try parsed.toOwned(testing.allocator);
     defer owned.deinit(testing.allocator);
@@ -425,4 +417,13 @@ test "a message survives the wire and comes back owned" {
     try testing.expectEqualStrings("body", owned.tool_calls[0].result.?);
     try testing.expectEqual(@as(u64, 9000), owned.tool_calls[0].result_bytes);
     try testing.expectEqualStrings("const a = 1;", owned.attachments[0].content);
+    try testing.expectError(error.MissingField, std.json.parseFromSliceLeaky(ToolCall, arena,
+        \\{"id":"c0","name":"read","arguments":"{}"}
+    , .{}));
 }
+
+pub const Hooks = struct {
+    sessionId: []const u8,
+    action: @import("../core/hook_store.zig").Action = .list,
+    id: []const u8 = "",
+};

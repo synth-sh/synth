@@ -3,7 +3,7 @@
 # UserPromptSubmit hook. Stops a prompt carrying a live credential before it
 # reaches the model or the transcript.
 #
-#   { "command": "./examples/hooks/block-secrets.sh" }
+#   { "hooks": [{ "command": "./examples/hooks/block-secrets.sh" }] }
 #
 # The complement to synth's own redaction, which masks secrets on the way out
 # of a tool. This one covers the way in, where a pasted key would otherwise be
