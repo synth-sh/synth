@@ -83,6 +83,13 @@ pub fn close(self: *Picker) void {
     self.release();
 }
 
+/// Move the cursor to `level`, if it is offered.
+pub fn select(self: *Picker, level: []const u8) void {
+    for (self.levels, 0..) |candidate, i| {
+        if (std.mem.eql(u8, candidate, level)) self.cursor = i;
+    }
+}
+
 pub fn selected(self: *const Picker) ?[]const u8 {
     if (self.cursor >= self.levels.len) return null;
     return self.levels[self.cursor];
@@ -186,4 +193,15 @@ test "a current level the model does not list is simply not shown" {
     try picker.show("Effort", "gpt-test", &.{ "low", "medium" }, "");
     try testing.expectEqual(@as(usize, 2), picker.levels.len);
     try testing.expectEqualStrings("low", picker.selected().?);
+}
+
+test "selecting a level that is not offered leaves the cursor where it was" {
+    var picker: Picker = .init(testing.allocator);
+    defer picker.deinit();
+
+    try picker.show("Review model", "gpt-test", &.{ "big", "small" }, "big");
+    picker.select("small");
+    try testing.expectEqualStrings("small", picker.selected().?);
+    picker.select("gone");
+    try testing.expectEqualStrings("small", picker.selected().?);
 }

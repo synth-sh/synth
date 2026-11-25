@@ -599,11 +599,11 @@ fn chooseReviewModel(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !v
     try self.mirror.listModels(0);
 }
 
-/// Open the review model picker on the agent's provider's models, once
-/// `/review-model` has asked for them.
+/// Open the review model picker on the agent's provider's models once
+/// `/review-model` has asked for them, and keep it current while it is open.
 fn offerReviewModels(self: *Model, models: synth.Models) !void {
-    if (!self.review_models_requested) return;
-    if (models.pending == 0) self.review_models_requested = false;
+    if (!self.review_models_requested and !self.review_picker.open) return;
+    self.review_models_requested = false;
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
@@ -615,7 +615,9 @@ fn offerReviewModels(self: *Model, models: synth.Models) !void {
         if (!is_other_provider) try names.append(arena, offered.name);
     }
     const current = self.mirror.status.review_model;
+    const highlighted = try arena.dupe(u8, self.review_picker.selected() orelse "");
     try self.review_picker.show("Review model", if (current.len > 0) current else self.mirror.status.model, names.items, if (current.len > 0) current else configured_review_model);
+    self.review_picker.select(highlighted);
 }
 
 pub fn setReviewModel(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !void {
@@ -647,4 +649,29 @@ pub fn toggleMcpServer(self: *Model, ctx: *vxfw.EventContext) !void {
 pub fn refreshMcpPicker(self: *Model) !void {
     if (!self.mcp_picker.isOpen()) return;
     try self.mcp_picker.refresh(self.mirror.status.mcp);
+}
+
+test "the review picker opens for its own request, and a later listing only refreshes it" {
+    const testing = std.testing;
+    var model: Model = undefined;
+    try @import("test_model.zig").offline(&model);
+    defer model.deinit();
+    const listing: synth.Models = .{ .offered = &.{ .{ .name = "big" }, .{ .name = "small" } } };
+
+    try offerReviewModels(&model, listing);
+    try testing.expect(!model.review_picker.open);
+
+    model.review_models_requested = true;
+    try offerReviewModels(&model, .{ .offered = listing.offered, .pending = 1 });
+    try testing.expect(model.review_picker.open);
+    try testing.expect(!model.review_models_requested);
+
+    model.review_picker.select("small");
+    try offerReviewModels(&model, .{ .offered = &.{ .{ .name = "big" }, .{ .name = "small" }, .{ .name = "tiny" } } });
+    try testing.expectEqual(@as(usize, 4), model.review_picker.levels.len);
+    try testing.expectEqualStrings("small", model.review_picker.selected().?);
+
+    model.review_picker.close();
+    try offerReviewModels(&model, listing);
+    try testing.expect(!model.review_picker.open);
 }
