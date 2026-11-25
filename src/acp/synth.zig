@@ -68,6 +68,9 @@ pub const method = struct {
     pub const checkpoints = "_synth/checkpoints";
     /// Who decides calls that would stop for approval, from now on.
     pub const set_approval_mode = "_synth/set_approval_mode";
+    /// The model auto mode judges calls on, remembered for the provider; ""
+    /// goes back to the configured one.
+    pub const set_review_model = "_synth/set_review_model";
     /// Put back every file the turns from `seq` on changed, or with `apply`
     /// false, only say which. Answered with `[]Loop.Rewound`.
     pub const rewind = "_synth/rewind";
@@ -207,6 +210,8 @@ pub const Status = struct {
     /// The reasoning effort in force, and the levels the model offers.
     effort: []const u8 = "",
     efforts: []const []const u8 = &.{},
+    /// The model auto mode judges calls on, or "" for the agent's own.
+    review_model: []const u8 = "",
     usage: Loop.Usage = .{},
     todos: []const todo.Item = &.{},
     /// Every configured MCP server, and where it stands.
@@ -387,6 +392,8 @@ pub const Checkpoint = struct {
 pub const Rewind = struct { sessionId: []const u8, seq: u64, apply: bool = false };
 
 pub const SetApprovalMode = struct { sessionId: []const u8, mode: Config.Approvals };
+
+pub const SetReviewModel = struct { sessionId: []const u8, model: []const u8 };
 
 pub const SetApprovals = struct {
     sessionId: []const u8,

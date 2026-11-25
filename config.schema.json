@@ -269,6 +269,37 @@
                         "deny"
                     ],
                     "default": "ask"
+                },
+                "reviewer_models": {
+                    "type": "object",
+                    "properties": {
+                        "ollama": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "ollama-cloud": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "openai": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "openai-compat": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "copilot": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "chatgpt": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    },
+                    "additionalProperties": false,
+                    "description": "A model for approval reviews on each provider, by provider id. /review-model overrides the active provider's; an approval_judge route takes precedence."
                 }
             }
         }

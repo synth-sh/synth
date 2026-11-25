@@ -569,6 +569,35 @@ test "approvals are read from the file" {
     try testing.expectEqual(Approvals.auto, config.approvals);
 }
 
+test "review models are read per provider, and an empty one or an unknown provider is refused" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "config.json" });
+    defer testing.allocator.free(path);
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    try testing.expectEqual(null, config.model_requests.reviewerModel("chatgpt"));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_requests\":{\"reviewer_models\":{\"chatgpt\":\"gpt-5.4-mini\",\"copilot\":\"claude-haiku-5.5\"}}}" });
+    try config.applyFile(io, path);
+    try testing.expectEqualStrings("gpt-5.4-mini", config.model_requests.reviewerModel("chatgpt").?);
+    try testing.expectEqualStrings("claude-haiku-5.5", config.model_requests.reviewerModel("copilot").?);
+    try testing.expectEqual(null, config.model_requests.reviewerModel("ollama"));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_requests\":{\"reviewer_models\":{\"chatgpt\":\"\"}}}" });
+    try testing.expectError(error.InvalidReviewerModel, config.applyFile(io, path));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_requests\":{\"reviewer_models\":{\"chatpgt\":\"gpt-5.4-mini\"}}}" });
+    try testing.expectError(error.UnknownReviewerProvider, config.applyFile(io, path));
+}
+
 test "lifecycle hooks are read from the file" {
     const testing = std.testing;
     const io = testing.io;

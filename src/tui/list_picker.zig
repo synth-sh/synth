@@ -1,5 +1,5 @@
-//! The reasoning effort switcher: the current model's levels, the one in use
-//! on top.
+//! A short list to pick one from, the one in use on top: a model's reasoning
+//! effort levels, or the models auto mode can judge calls on.
 
 const std = @import("std");
 const testing = std.testing;
@@ -23,8 +23,9 @@ levels: [][]const u8 = &.{},
 cursor: usize = 0,
 /// Whether the first level is the one in use, and so marked.
 current_on_top: bool = false,
-/// Owned.
-model: []const u8 = "",
+title: []const u8 = "",
+/// Shown dimmed beside the title. Owned.
+subtitle: []const u8 = "",
 
 pub fn init(allocator: std.mem.Allocator) Picker {
     return .{ .allocator = allocator };
@@ -38,14 +39,16 @@ fn release(self: *Picker) void {
     for (self.levels) |level| self.allocator.free(level);
     self.allocator.free(self.levels);
     self.levels = &.{};
-    self.allocator.free(self.model);
-    self.model = "";
+    self.allocator.free(self.subtitle);
+    self.subtitle = "";
 }
 
-/// Show `offered` with `current` on top. Both are borrowed for the call.
-pub fn show(self: *Picker, model: []const u8, offered: []const []const u8, current: []const u8) !void {
+/// Show `offered` with `current` on top. Both are borrowed for the call;
+/// `title` for as long as the picker is open.
+pub fn show(self: *Picker, title: []const u8, subtitle: []const u8, offered: []const []const u8, current: []const u8) !void {
     self.release();
-    self.model = try self.allocator.dupe(u8, model);
+    self.title = title;
+    self.subtitle = try self.allocator.dupe(u8, subtitle);
 
     const ordered = try self.allocator.alloc([]const u8, offered.len);
     var filled: usize = 0;
@@ -112,9 +115,10 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
     if (!self.open) return null;
 
     const frame_rows: u16 = 6;
-    const visible: u16 = @intCast(self.levels.len);
+    if (size.width < 32 or size.height <= frame_rows) return null;
+    const visible: u16 = @intCast(@min(self.levels.len, size.height - frame_rows));
     const height: u16 = frame_rows + @max(visible, 1);
-    if (size.width < 32 or size.height < height) return null;
+    const first = (self.cursor + 1) -| visible;
 
     const width = @min(box_width, size.width -| 4);
     const origin_row = (size.height -| height) / 2;
@@ -123,13 +127,13 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
     const surface = try w.surfaceClamped(ctx.arena, parent, .{ .width = width, .height = height });
     w.fill(surface, theme.card.cell);
 
-    const title_end = w.writeText(surface, pad, 1, "Effort", theme.on_card(theme.fg).bold().cell);
-    _ = w.writeText(surface, title_end + 1, 1, self.model, theme.on_card(theme.fg_dim).cell);
+    const title_end = w.writeText(surface, pad, 1, self.title, theme.on_card(theme.fg).bold().cell);
+    _ = w.writeText(surface, title_end + 1, 1, self.subtitle, theme.on_card(theme.fg_dim).cell);
     w.writeTextRight(surface, 1, pad, "esc", theme.on_card(theme.fg_dim).cell);
 
     const first_row: u16 = 3;
-    for (self.levels, 0..) |level, i| {
-        const y: u16 = @intCast(first_row + i);
+    for (self.levels[first..][0..visible], first..) |level, i| {
+        const y: u16 = @intCast(first_row + i - first);
         const chosen = i == self.cursor;
         const base = if (chosen) theme.card.withBg(theme.surface_alt) else theme.card;
         if (chosen) w.fillRow(surface, y, 1, width - 2, base.cell);
@@ -152,7 +156,7 @@ test "the level in use comes first, then the rest mildest first" {
     var picker: Picker = .init(testing.allocator);
     defer picker.deinit();
 
-    try picker.show("gpt-test", &.{ "low", "medium", "high", "ultra" }, "high");
+    try picker.show("Effort", "gpt-test", &.{ "low", "medium", "high", "ultra" }, "high");
     try testing.expectEqual(@as(usize, 4), picker.levels.len);
     try testing.expectEqualStrings("high", picker.levels[0]);
     try testing.expectEqualStrings("low", picker.levels[1]);
@@ -165,7 +169,7 @@ test "arrows move the choice and stop at the ends" {
     var picker: Picker = .init(testing.allocator);
     defer picker.deinit();
 
-    try picker.show("gpt-test", &.{ "low", "medium" }, "medium");
+    try picker.show("Effort", "gpt-test", &.{ "low", "medium" }, "medium");
     try testing.expectEqual(Action.none, picker.handleKey(.{ .codepoint = vaxis.Key.up }));
     try testing.expectEqualStrings("medium", picker.selected().?);
     _ = picker.handleKey(.{ .codepoint = vaxis.Key.down });
@@ -179,7 +183,7 @@ test "a current level the model does not list is simply not shown" {
     var picker: Picker = .init(testing.allocator);
     defer picker.deinit();
 
-    try picker.show("gpt-test", &.{ "low", "medium" }, "");
+    try picker.show("Effort", "gpt-test", &.{ "low", "medium" }, "");
     try testing.expectEqual(@as(usize, 2), picker.levels.len);
     try testing.expectEqualStrings("low", picker.selected().?);
 }

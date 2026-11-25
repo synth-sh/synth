@@ -23,6 +23,7 @@ const recap = @import("../agent/recap.zig");
 const ask_user = @import("../tools/ask.zig");
 const pkg = @import("pkg");
 const Input = @import("input.zig");
+const ListPicker = @import("list_picker.zig");
 const markdown = @import("markdown.zig");
 const Selection = @import("selection.zig");
 const transcript_map = @import("transcript_map.zig");
@@ -194,14 +195,16 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
         root.cursor = dialog.cursor;
     }
 
-    if (try self.effort_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
-        dialog_open = true;
-        try children.append(ctx.arena, .{
-            .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
-            .surface = dialog.surface,
-            .z_index = 3,
-        });
-        try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
+    for ([_]*ListPicker{ &self.effort_picker, &self.review_picker }) |picker| {
+        if (try picker.draw(ctx, self.plainWidget(), max)) |dialog| {
+            dialog_open = true;
+            try children.append(ctx.arena, .{
+                .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
+                .surface = dialog.surface,
+                .z_index = 3,
+            });
+            try self.selection.addRegion(regionOf(children.items[children.items.len - 1]));
+        }
     }
 
     if (try self.theme_picker.draw(ctx, self.plainWidget(), max)) |dialog| {

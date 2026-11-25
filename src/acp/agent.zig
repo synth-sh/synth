@@ -407,6 +407,10 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     } else if (eql(u8, method, m.search)) {
         const asked = try rpc.parse(synth.Search, arena, params);
         return connection.reply(id, try session.search(arena, asked.query, asked.limit));
+    } else if (eql(u8, method, m.set_review_model)) {
+        const asked = try rpc.parse(synth.SetReviewModel, arena, params);
+        try session.chooseReviewModel(asked.model);
+        try session.publish(arena, true);
     } else if (eql(u8, method, m.set_approval_mode)) {
         const asked = try rpc.parse(synth.SetApprovalMode, arena, params);
         session.stack.loop.setApprovals(asked.mode);
@@ -1529,6 +1533,7 @@ const Session = struct {
             self.stack.loop.session_public_id = self.handle;
         }
         self.restoreEffort();
+        self.restoreReviewModel();
         self.stack.loop.handoff = .{ .files = self.files(), .terminal = self.terminal() };
         if (options.source == .providers) {
             var arena_state: std.heap.ArenaAllocator = .init(allocator);
@@ -2291,6 +2296,7 @@ const Session = struct {
             .switchable = loop.provider.switchable(),
             .effort = loop.provider.effort,
             .efforts = loop.provider.effortsFor(loop.provider.model).levels,
+            .review_model = loop.reviewModel(),
             .usage = loop.usage,
             .todos = loop.todos.items.items,
             .mcp = try self.stack.mcp_host.statuses(arena),
@@ -2445,6 +2451,7 @@ const Session = struct {
         };
         db.setActiveProvider(entry.id) catch |err| self.notice(.warning, "Could not remember the provider: {s}", .{@errorName(err)});
         self.restoreEffort();
+        self.restoreReviewModel();
     }
 
     fn announceProvider(self: *Session) void {
@@ -2579,6 +2586,26 @@ const Session = struct {
         const remembered = self.agent.options.db.rememberedEffort(self.allocator, self.providerId(), loop.provider.model) catch "";
         defer self.allocator.free(remembered);
         loop.setEffort(remembered);
+    }
+
+    /// Judge on the model last chosen for this provider, else the configured one.
+    fn restoreReviewModel(self: *Session) void {
+        const key = std.fmt.allocPrint(self.allocator, "review_model:{s}", .{self.providerId()}) catch return;
+        defer self.allocator.free(key);
+        const remembered = self.agent.options.db.setting(self.allocator, key) catch return;
+        defer self.allocator.free(remembered);
+        self.stack.loop.setReviewModel(if (remembered.len > 0) remembered else self.configuredReviewModel()) catch {};
+    }
+
+    fn chooseReviewModel(self: *Session, model: []const u8) !void {
+        try self.stack.loop.setReviewModel(if (model.len > 0) model else self.configuredReviewModel());
+        const key = try std.fmt.allocPrint(self.allocator, "review_model:{s}", .{self.providerId()});
+        defer self.allocator.free(key);
+        try self.agent.options.db.setSetting(key, model);
+    }
+
+    fn configuredReviewModel(self: *Session) ?[]const u8 {
+        return self.stack.loop.model_policy.reviewerModel(self.providerId());
     }
 
     fn chooseEffort(self: *Session, level: []const u8) !void {

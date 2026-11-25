@@ -446,6 +446,18 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (self.review_picker.open) {
+                switch (self.review_picker.handleKey(key)) {
+                    .none => {},
+                    .cancel => self.review_picker.close(),
+                    .choose => {
+                        if (self.review_picker.selected()) |model| try commands.setReviewModel(self, ctx, model);
+                        self.review_picker.close();
+                    },
+                }
+                return ctx.consumeAndRedraw();
+            }
+
             if (self.theme_picker.open) {
                 switch (try self.theme_picker.handleKey(ctx, key)) {
                     .none => {},

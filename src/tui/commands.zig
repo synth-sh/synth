@@ -19,6 +19,7 @@ const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 const keys = @import("keys.zig");
 const Database = @import("../core/database.zig");
 const Mirror = @import("../acp/mirror.zig");
+const synth = @import("../acp/synth.zig");
 const client = @import("../acp/connection.zig");
 const Model = @import("model.zig");
 const ModelPicker = @import("model_picker.zig");
@@ -165,6 +166,11 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
+    if (isCommand(line, "/review-model")) {
+        try chooseReviewModel(self, ctx, std.mem.trim(u8, line["/review-model".len..], " "));
+        ctx.redraw = true;
+        return true;
+    }
     if (isCommand(line, "/effort")) {
         try chooseEffort(self, ctx, std.mem.trim(u8, line["/effort".len..], " "));
         ctx.redraw = true;
@@ -267,6 +273,7 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             };
             try self.models.refill(entries, offer.models.recent);
             self.models.asking = offer.models.pending;
+            try offerReviewModels(self, offer.models);
             ctx.redraw = true;
         },
         .subagent => |transcript| try self.receiveSubagent(transcript.seq, transcript.call, transcript.live, transcript.messages),
@@ -554,7 +561,7 @@ fn chooseEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void 
     if (efforts.levels.len == 0) {
         return self.notification.show(ctx, .info, try std.fmt.allocPrint(arena, "{s} has no effort setting", .{provider.model}));
     }
-    if (level.len == 0) return self.effort_picker.show(provider.model, efforts.levels, provider.effort);
+    if (level.len == 0) return self.effort_picker.show("Effort", provider.model, efforts.levels, provider.effort);
 
     const is_offered = for (efforts.levels) |candidate| {
         if (std.mem.eql(u8, candidate, level)) break true;
@@ -575,6 +582,47 @@ pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void
     defer arena_state.deinit();
     const said = try std.fmt.allocPrint(arena_state.allocator(), "{s} now runs at {s} effort", .{ self.mirror.provider.model, level });
     try self.notification.show(ctx, .info, said);
+}
+
+/// The row in the review model picker that goes back to the configured model.
+const configured_review_model = "default";
+
+/// `/review-model` alone lists the provider's models to pick from; with a
+/// name, judges on that one.
+fn chooseReviewModel(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !void {
+    if (try offerProvidersInstead(self)) return;
+    if (name.len > 0) return setReviewModel(self, ctx, name);
+    if (!self.mirror.status.switchable) {
+        return self.notification.showFmt(ctx, .info, "{s} offers no other model to judge calls on", .{self.mirror.status.provider});
+    }
+    self.review_models_requested = true;
+    try self.mirror.listModels(0);
+}
+
+/// Open the review model picker on the agent's provider's models, once
+/// `/review-model` has asked for them.
+fn offerReviewModels(self: *Model, models: synth.Models) !void {
+    if (!self.review_models_requested) return;
+    if (models.pending == 0) self.review_models_requested = false;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.append(arena, configured_review_model);
+    for (models.offered) |offered| {
+        const is_other_provider = offered.provider_id.len > 0 and !std.mem.eql(u8, offered.provider_id, self.mirror.status.provider_id);
+        if (!is_other_provider) try names.append(arena, offered.name);
+    }
+    const current = self.mirror.status.review_model;
+    try self.review_picker.show("Review model", if (current.len > 0) current else self.mirror.status.model, names.items, if (current.len > 0) current else configured_review_model);
+}
+
+pub fn setReviewModel(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !void {
+    const is_configured = std.mem.eql(u8, name, configured_review_model);
+    try self.mirror.setReviewModel(if (is_configured) "" else name);
+    if (is_configured) return self.notification.show(ctx, .info, "Auto mode judges calls on the configured model");
+    try self.notification.showFmt(ctx, .info, "Auto mode judges calls on {s}", .{name});
 }
 
 /// Switch to a model picked from the list, connecting its provider first when
