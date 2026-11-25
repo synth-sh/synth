@@ -75,6 +75,9 @@ pub const Turn = struct {
     stop: ?*const std.atomic.Value(bool) = null,
     model_policy: @import("../core/model_policy.zig").Policy = .{},
     settings: ModelSettings = .{},
+    /// Another model on the same provider to send this request to, or "" for
+    /// the one selected.
+    model: []const u8 = "",
     /// The system prompt, complete. Borrowed for the length of the call.
     system: []const u8,
     /// Tool definitions as JSON, from `Registry.schemaJson`. Empty means the

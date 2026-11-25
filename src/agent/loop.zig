@@ -248,6 +248,9 @@ judging: ?Judging = null,
 /// Calls auto mode blocked in a row, and in all, toward handing decisions back.
 blocks_in_row: u32 = 0,
 blocks_total: u32 = 0,
+/// The model auto mode's judge runs on, chosen for this session over the
+/// configured one. Owned.
+review_model: ?[]const u8 = null,
 
 /// How a tool call starts a subagent. Installed by whoever assembled the loop,
 /// because the implementation needs a loop and the loop must not need it.
@@ -750,6 +753,7 @@ pub fn requestStop(self: *Loop) void {
 }
 
 pub fn deinit(self: *Loop) void {
+    if (self.review_model) |model| self.allocator.free(model);
     if (self.canceller) |*canceller| {
         canceller.await(self.io);
         self.canceller = null;
@@ -2172,6 +2176,20 @@ pub fn setApprovals(self: *Loop, mode: Config.Approvals) void {
     self.blocks_total = 0;
 }
 
+/// Judge calls on `model`, a model on the agent's provider; null judges on the
+/// agent's own.
+pub fn setReviewModel(self: *Loop, model: ?[]const u8) !void {
+    const owned = if (model) |name| try self.allocator.dupe(u8, name) else null;
+    if (self.review_model) |previous| self.allocator.free(previous);
+    self.review_model = owned;
+}
+
+/// The model calls are judged on, or "" for the agent's own.
+pub fn reviewModel(self: *const Loop) []const u8 {
+    const asker = self.parent orelse self;
+    return asker.review_model orelse "";
+}
+
 /// Blocks in a row, and in a session, after which auto mode hands decisions
 /// back to the person: something is off, with the task or with the judge.
 const max_blocks_in_row = 3;
@@ -2248,6 +2266,7 @@ fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
     const request = try Request.start(self.allocator, self.io, self.provider, convo, .{
         .backend = self.backend,
         .model_policy = self.model_policy,
+        .model = self.reviewModel(),
         .system = classifier.system_prompt,
         .hooks = self.hooks,
         .hook_input = try self.exportHookInput(.{ .event = .pre_model_request, .request_purpose = .approval_judge }),
@@ -4217,6 +4236,19 @@ test "a subagent transcript is stored as a session of its own" {
     const child = try db.subagentSession(call_row) orelse return error.NoSubagentSession;
     try testing.expect(child != parent);
     try testing.expectEqual(@as(u64, 2), try db.countMessages(child));
+}
+
+test "the judge runs on the session's review model, else the agent's" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try testing.expectEqualStrings("", loop.reviewModel());
+    try loop.setReviewModel("chosen");
+    try testing.expectEqualStrings("chosen", loop.reviewModel());
+    try loop.setReviewModel(null);
+    try testing.expectEqualStrings("", loop.reviewModel());
 }
 
 test "auto mode runs what its judge allows, and lets edits inside the project through unjudged" {

@@ -82,6 +82,7 @@ pub fn start(
             .backend = turn.backend,
             .model_policy = turn.model_policy,
             .settings = turn.settings,
+            .model = try allocator.dupe(u8, turn.model),
             .system = try allocator.dupe(u8, turn.system),
             .tools_json = try allocator.dupe(u8, turn.tools_json),
             .instruction = try allocator.dupe(u8, turn.instruction),
@@ -184,6 +185,7 @@ pub fn destroy(self: *Request) void {
 
 fn freeTurn(self: *Request) void {
     self.hook_arena.deinit();
+    self.allocator.free(self.turn.model);
     self.allocator.free(self.turn.system);
     self.allocator.free(self.turn.tools_json);
     self.allocator.free(self.turn.instruction);
