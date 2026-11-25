@@ -87,6 +87,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         .config = &config,
         .provider = backend.provider(),
         .backend = &backend,
+        .provider_id = active.entry.id,
         .cwd = path_buf[0..n],
         .home = init.environ_map.get("HOME"),
         .db = &db,

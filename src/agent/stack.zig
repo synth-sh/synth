@@ -61,6 +61,9 @@ pub const Options = struct {
     /// Where subagents get clients of their own. Null leaves them on
     /// `provider`.
     backend: ?*Backend = null,
+    /// Catalog id of `provider`, which picks its configured review model, or ""
+    /// when it is not from the catalog.
+    provider_id: []const u8 = "",
     /// Where the session runs; the project is whatever repository holds it.
     cwd: []const u8,
     home: ?[]const u8 = null,
@@ -153,6 +156,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.loop.approvals = config.approvals;
     self.loop.backend = options.backend;
     self.loop.model_policy = config.model_requests;
+    try self.loop.setReviewModel(config.model_requests.reviewerModel(options.provider_id));
     if (config.max_turn_ms) |ms| self.loop.max_turn_ms = ms;
     if (config.max_stall_ms) |ms| self.loop.max_stall_ms = ms;
     if (config.max_turn_tokens) |tokens| self.loop.max_turn_tokens = tokens;
@@ -397,4 +401,38 @@ test "trusted current config policy blocks replacement definitions before adopti
     defer parsed.deinit();
     try std.testing.expectEqualStrings("project_settings", parsed.value.object.get("source").?.string);
     try std.testing.expect(std.mem.endsWith(u8, parsed.value.object.get("file_path").?.string, "/.synth/hooks.json"));
+}
+
+test "a stack judges on the review model configured for its provider" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_requests\":{\"reviewer_models\":{\"chatgpt\":\"gpt-5.4-mini\"}}}" });
+    const config_path = try std.fs.path.join(a, &.{ cwd, "config.json" });
+    defer a.free(config_path);
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var config = try Config.load(a, io, &env, config_path, ":memory:");
+    defer config.arena.deinit();
+    var backend: Backend = .init(.ollama, .{
+        .allocator = testing.allocator,
+        .io = io,
+        .host = "http://127.0.0.1:9",
+        .label = "test",
+    });
+    defer backend.deinit();
+
+    const configured = try create(a, io, .{ .config = &config, .provider = backend.provider(), .backend = &backend, .provider_id = "chatgpt", .cwd = cwd });
+    defer configured.destroy();
+    try testing.expectEqualStrings("gpt-5.4-mini", configured.loop.reviewModel());
+
+    const unconfigured = try create(a, io, .{ .config = &config, .provider = backend.provider(), .backend = &backend, .provider_id = "ollama", .cwd = cwd });
+    defer unconfigured.destroy();
+    try testing.expectEqualStrings("", unconfigured.loop.reviewModel());
 }

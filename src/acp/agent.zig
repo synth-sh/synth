@@ -1518,6 +1518,10 @@ const Session = struct {
                 .providers => |providers| providers.backend,
                 .provider => null,
             },
+            .provider_id = switch (options.source) {
+                .providers => |providers| providers.active_id,
+                .provider => "",
+            },
             .cwd = owned_cwd,
             .home = options.home,
             .db = options.db,
