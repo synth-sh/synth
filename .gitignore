@@ -7,6 +7,7 @@ zig-pkg
 *.db
 *.db-shm
 *.db-wal
+*.db-locks/
 
 # Logs
 *.log
