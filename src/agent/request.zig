@@ -499,3 +499,28 @@ test "request settings and retry hooks enforce bounds before transport" {
     denied.join();
     try std.testing.expectEqual(error.ModelRouteDenied, denied.failed.?);
 }
+
+test "a judge asking for another model gets a backend of its own on it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Backend = @import("../provider/backend.zig");
+    var base: Backend = .init(.openai, .{ .allocator = a, .io = io, .host = "http://127.0.0.1:9/v1", .label = "primary", .model = "large" });
+    defer base.deinit();
+    try base.startWithoutProbe();
+    var convo = Conversation.init(a);
+    defer convo.deinit();
+    _ = try convo.addUser("judge this", &.{}, &.{});
+
+    const judge = try start(a, io, base.provider(), &convo, .{
+        .system = "test",
+        .backend = &base,
+        .model = "small",
+        .settings = .{ .attempts = 1 },
+        .hook_input = .{ .event = .pre_model_request, .request_purpose = .approval_judge },
+    });
+    defer judge.destroy();
+    judge.join();
+    try std.testing.expect(judge.owned_backend != null);
+    try std.testing.expectEqualStrings("small", judge.provider.model);
+    try std.testing.expectEqualStrings("large", base.model());
+}
