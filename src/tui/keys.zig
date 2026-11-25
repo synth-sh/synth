@@ -342,7 +342,10 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             self.tick_pending = false;
             try commands.followSignIn(self);
             const changes = try self.mirror.poll();
-            if (self.mirror.takeModelsFailed()) self.models.asking = 0;
+            if (self.mirror.takeModelsFailed()) {
+                self.models.asking = 0;
+                self.review_models_requested = false;
+            }
             if (self.mirror.takeFailedDraft()) |draft| {
                 defer self.allocator.free(draft);
                 if (self.input.text.items.len == 0) {
@@ -441,6 +444,18 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .choose => {
                         if (self.effort_picker.selected()) |level| try commands.setEffort(self, ctx, level);
                         self.effort_picker.close();
+                    },
+                }
+                return ctx.consumeAndRedraw();
+            }
+
+            if (self.review_picker.open) {
+                switch (self.review_picker.handleKey(key)) {
+                    .none => {},
+                    .cancel => self.review_picker.close(),
+                    .choose => {
+                        if (self.review_picker.selected()) |model| try commands.setReviewModel(self, ctx, model);
+                        self.review_picker.close();
                     },
                 }
                 return ctx.consumeAndRedraw();

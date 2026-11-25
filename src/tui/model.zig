@@ -40,7 +40,7 @@ const SessionPicker = @import("session_picker.zig");
 const Slash = @import("slash.zig");
 const theme = @import("theme.zig");
 const ThemePicker = @import("theme_picker.zig");
-const EffortPicker = @import("effort_picker.zig");
+const ListPicker = @import("list_picker.zig");
 const McpPicker = @import("mcp_picker.zig");
 const PermissionPicker = @import("permission_picker.zig");
 const RewindPicker = @import("rewind_picker.zig");
@@ -219,7 +219,12 @@ connect: Connect = undefined,
 /// The theme switcher. Closed unless `/theme` opened it.
 theme_picker: ThemePicker = undefined,
 /// The reasoning effort switcher. Closed unless `/effort` opened it.
-effort_picker: EffortPicker = undefined,
+effort_picker: ListPicker = undefined,
+/// The models auto mode can judge calls on. Closed unless `/review-model`
+/// opened it.
+review_picker: ListPicker = undefined,
+/// `/review-model` is waiting on the provider's models to open its picker.
+review_models_requested: bool = false,
 mcp_picker: McpPicker = undefined,
 permission_picker: PermissionPicker = undefined,
 rewind_picker: RewindPicker = undefined,
@@ -583,6 +588,7 @@ pub fn deinit(self: *Model) void {
     self.connect.deinit();
     self.theme_picker.deinit();
     self.effort_picker.deinit();
+    self.review_picker.deinit();
     self.mcp_picker.deinit();
     self.permission_picker.deinit();
     self.rewind_picker.deinit();
@@ -615,6 +621,7 @@ pub fn wire(self: *Model) !void {
     self.connect = .init(self.allocator);
     self.theme_picker = .init(self.allocator);
     self.effort_picker = .init(self.allocator);
+    self.review_picker = .init(self.allocator);
     self.mcp_picker = .init(self.allocator);
     self.permission_picker = .init(self.allocator);
     self.rewind_picker = .init(self.allocator);

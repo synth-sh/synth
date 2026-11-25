@@ -46,6 +46,11 @@ options: Options,
 client: Client,
 unsupported_stream_options: std.ArrayList([stream_options_key_bytes]u8) = .empty,
 transport_mutex: std.Io.Mutex = .init,
+/// Where auto mode's judge last left the ChatGPT cache, kept apart from the
+/// agent's so neither evicts the other's prompt prefix.
+review_cache: ?ReviewCache = null,
+
+const ReviewCache = struct { key: [32]u8, message_count: u64 };
 
 fn streamOptionsKey(client: *const OpenAIProvider) [stream_options_key_bytes]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -203,6 +208,13 @@ pub const Spawned = struct {
         }
     }
 
+    /// Send to another of the same provider's models.
+    pub fn useModel(self: *Spawned, name: []const u8) !void {
+        const selected = self.backend.provider();
+        const set = selected.set_model orelse return error.ModelSwitchUnsupported;
+        _ = try set(selected.userdata, name);
+    }
+
     pub fn probe(self: *Spawned, route: @import("../core/model_policy.zig").Route) void {
         if (self.backend.client == .ollama) {
             self.backend.client.ollama.probe();
@@ -274,6 +286,22 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     return child;
 }
 
+/// Point a child judging a call at the cache the last judgement left, rather
+/// than the agent's: their prompts share no prefix.
+pub fn resumeCache(self: *Backend, child: *Spawned, purpose: @import("../core/model_policy.zig").Purpose) void {
+    if (purpose != .approval_judge or child.backend.client != .chatgpt) return;
+    self.transport_mutex.lockUncancelable(self.options.io);
+    defer self.transport_mutex.unlock(self.options.io);
+    const client = &child.backend.client.chatgpt;
+    const cache = self.review_cache orelse {
+        client.cache_key = null;
+        client.last_message_count = 0;
+        return;
+    };
+    client.cache_key = cache.key;
+    client.last_message_count = cache.message_count;
+}
+
 fn rememberStreamOptions(self: *Backend, client: *const OpenAIProvider) !void {
     if (client.wire != .chat or client.send_stream_options) return;
     const key = streamOptionsKey(client);
@@ -298,8 +326,13 @@ pub fn rememberTransport(self: *Backend, child: *const Spawned, purpose: @import
             if (same_target) parent.runtime_limit = learned.runtime_limit;
         },
         .chatgpt => |*parent| {
-            if (purpose != .agent or child.backend.client != .chatgpt) return;
+            if (child.backend.client != .chatgpt) return;
             const learned = &child.backend.client.chatgpt;
+            if (purpose == .approval_judge) {
+                if (learned.cache_key) |key| self.review_cache = .{ .key = key, .message_count = learned.last_message_count };
+                return;
+            }
+            if (purpose != .agent) return;
             if (parent.store == learned.store and std.mem.eql(u8, parent.model, learned.model)) {
                 parent.cache_key = learned.cache_key;
                 parent.last_message_count = learned.last_message_count;
@@ -609,4 +642,47 @@ test "named routes isolate credentials models and retry settings" {
     try std.testing.expectEqual(@as(usize, 1), review.backend.client.openai.retries.attempts);
     try std.testing.expectEqualStrings("main", base.model());
     try std.testing.expectEqualStrings("primary-secret", base.currentKey().?);
+}
+
+test "a judge's child switches to its own model and leaves the agent's alone" {
+    const a = std.testing.allocator;
+    var base: Backend = .init(.openai, .{ .allocator = a, .io = std.testing.io, .host = "http://127.0.0.1:9/v1", .label = "primary", .model = "large" });
+    defer base.deinit();
+    try base.startWithoutProbe();
+    const judge = try base.spawn(a);
+    defer judge.deinit();
+    try judge.useModel("small");
+    try std.testing.expectEqualStrings("small", judge.backend.model());
+    try std.testing.expectEqualStrings("large", base.model());
+}
+
+test "judgements share a ChatGPT cache of their own, apart from the agent's" {
+    const a = std.testing.allocator;
+    var base: Backend = .init(.chatgpt, .{ .allocator = a, .io = std.testing.io, .host = "", .label = "ChatGPT plan" });
+    defer base.deinit();
+    try base.startWithoutProbe();
+    const agent_key = [_]u8{'a'} ** 32;
+    const judge_key = [_]u8{'j'} ** 32;
+    base.client.chatgpt.cache_key = agent_key;
+    base.client.chatgpt.last_message_count = 12;
+
+    const first = try base.spawn(a);
+    defer first.deinit();
+    base.resumeCache(first, .approval_judge);
+    try std.testing.expect(first.backend.client.chatgpt.cache_key == null);
+    first.backend.client.chatgpt.cache_key = judge_key;
+    first.backend.client.chatgpt.last_message_count = 1;
+    base.rememberTransport(first, .approval_judge);
+
+    const second = try base.spawn(a);
+    defer second.deinit();
+    base.resumeCache(second, .approval_judge);
+    try std.testing.expectEqualSlices(u8, &judge_key, &second.backend.client.chatgpt.cache_key.?);
+    try std.testing.expectEqual(@as(u64, 1), second.backend.client.chatgpt.last_message_count);
+    try std.testing.expectEqualSlices(u8, &agent_key, &base.client.chatgpt.cache_key.?);
+
+    const agent = try base.spawn(a);
+    defer agent.deinit();
+    base.resumeCache(agent, .agent);
+    try std.testing.expectEqualSlices(u8, &agent_key, &agent.backend.client.chatgpt.cache_key.?);
 }

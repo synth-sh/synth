@@ -803,6 +803,7 @@ fn keepStatus(self: *Mirror, status: synth.Status) !void {
     };
     kept.effort = try arena.dupe(u8, status.effort);
     kept.efforts = try dupeAll(arena, status.efforts);
+    kept.review_model = try arena.dupe(u8, status.review_model);
     kept.todos = &.{};
     const servers = try arena.alloc(mcp_tools.Status, status.mcp.len);
     for (status.mcp, servers) |server, *copy| copy.* = .{
@@ -1279,6 +1280,12 @@ pub fn changeDirectory(self: *Mirror, path: []const u8) !void {
 
 pub fn addDirectory(self: *Mirror, path: []const u8) !void {
     try self.send(synth.method.add_directory, synth.Directory{ .sessionId = self.status.handle, .path = path, .source = .slash_command }, .{ .command = "Adding directory" });
+}
+
+/// Judge calls in auto mode on `model`, or "" for the configured one. The
+/// status says when it took.
+pub fn setReviewModel(self: *Mirror, model: []const u8) !void {
+    try self.send(synth.method.set_review_model, synth.SetReviewModel{ .sessionId = self.status.handle, .model = model }, .{ .command = "Changing the review model" });
 }
 
 /// Hand decisions on calls to `mode`. The status says when it took.

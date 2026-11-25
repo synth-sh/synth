@@ -54,6 +54,7 @@ pub const commands: []const Command = &.{
     .{ .name = SlashCommand.compact, .description = "summarise the conversation so far, freeing context", .is_destructive = true },
     .{ .name = "model", .description = "switch the model this session runs on", .argument = optional_name },
     .{ .name = "effort", .description = "set how hard the model thinks, where it has levels", .argument = .{ .optional = "level" } },
+    .{ .name = "review-model", .description = "choose the model auto mode judges calls on", .argument = optional_name },
     .{ .name = "sessions", .description = "switch to another session" },
     .{ .name = "detach", .description = "leave this session running, to come back to later" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },

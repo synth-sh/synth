@@ -179,6 +179,7 @@ server.
 | `restrict_routes` | Requires a route for all three purposes and disables provider discovery and switching. Tool network access still follows tool permissions and hook trust. |
 | `reviewer_timeout_ms` | Approval review deadline, including preparation and retries. Defaults to 30,000 ms and accepts 1–300,000. |
 | `reviewer_fallback` | On timeout, error, or missing verified human intent, `ask` (default) requests human approval and `deny` refuses the call. If a resumed session lacks a verified human prompt, send a fresh one. |
+| `reviewer_models` | A model for approval reviews on each provider, keyed by provider ID (`ollama`, `ollama-cloud`, `openai`, `openai-compat`, `copilot`, `chatgpt`), such as `{"chatgpt": "gpt-5.4-mini"}`; an unknown ID is an error. The active provider's entry applies, so switching providers switches the reviewer too; a provider without one reviews on the session model. `/review-model` overrides the entry for the provider you're on. An `approval_judge` route takes precedence over both. |
 
 Each route needs an `id`, `provider` (`openai` or `ollama`), HTTP(S)
 `endpoint`, and `model`. For `openai`, set `protocol` to `chat` (default),

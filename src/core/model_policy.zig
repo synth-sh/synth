@@ -10,6 +10,7 @@ pub const max_stops = 16;
 pub const max_stop_bytes = 4096;
 pub const max_attempts = 4;
 pub const max_retry_delay_ms = @import("../provider/retry.zig").max_delay_ms;
+const catalog = @import("../provider/catalog.zig");
 pub const default_review_ms = 30_000;
 pub const max_review_ms = 300_000;
 pub const effort_levels = [_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh" };
@@ -78,6 +79,9 @@ pub const Policy = struct {
     restrict_routes: bool = false,
     reviewer_timeout_ms: u32 = default_review_ms,
     reviewer_fallback: Fallback = .ask,
+    /// A model for auto mode's judge on each provider, by catalog id, when no
+    /// route is selected for it.
+    reviewer_models: std.json.ArrayHashMap([]const u8) = .{},
 
     pub fn selected(self: Policy, purpose: Purpose) ?[]const u8 {
         return switch (purpose) {
@@ -85,6 +89,10 @@ pub const Policy = struct {
             .approval_judge => self.approval_judge,
             .compaction => self.compaction,
         };
+    }
+
+    pub fn reviewerModel(self: Policy, provider_id: []const u8) ?[]const u8 {
+        return self.reviewer_models.map.get(provider_id);
     }
 
     pub fn route(self: Policy, id: []const u8, purpose: Purpose) !Route {
@@ -98,6 +106,10 @@ pub const Policy = struct {
 
     pub fn validate(self: Policy) !void {
         if (self.reviewer_timeout_ms == 0 or self.reviewer_timeout_ms > max_review_ms) return error.InvalidReviewerTimeout;
+        for (self.reviewer_models.map.keys(), self.reviewer_models.map.values()) |provider_id, model| {
+            if (catalog.find(provider_id) == null) return error.UnknownReviewerProvider;
+            if (model.len == 0) return error.InvalidReviewerModel;
+        }
         for (self.routes, 0..) |value, i| {
             if (value.id.len == 0 or value.model.len == 0 or value.purposes.len == 0 or value.context_limit > max_context_limit) return error.InvalidModelRoute;
             const uri = std.Uri.parse(value.endpoint) catch return error.InvalidModelRoute;

@@ -76,7 +76,10 @@ shell allowances such as `npm run *` still go to review. Preset read-only
 shell commands skip review by default, including commands that read outside the
 project. Set `auto_approve_safe_commands` to `false` to review those commands.
 
-The session model reviews calls by default. Use [models by request purpose](configuration.md#models-by-request-purpose)
+The session model reviews calls by default, at its lowest reasoning effort.
+Use `/review-model` to pick another model from the same provider, such as a
+smaller one; the choice is remembered for that provider. Use
+[models by request purpose](configuration.md#models-by-request-purpose)
 to configure a separate reviewer, deadline, or fallback. With the default
 fallback, three refusals in a row or twenty in a session return decisions to
 you. With `reviewer_fallback: "deny"`, repeated refusals stop the turn.

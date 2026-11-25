@@ -60,7 +60,19 @@ pub fn prepare(self: *Request) !void {
             self.provider = owned.provider();
         }
         self.turn.settings.merge(route.settings);
-    } else if (self.turn.model_policy.restrict_routes) return error.ModelRouteDenied;
+    } else if (self.turn.model_policy.restrict_routes) {
+        return error.ModelRouteDenied;
+    } else if (self.turn.model.len > 0 and !std.mem.eql(u8, self.turn.model, self.provider.model)) {
+        const owned = try self.ownBackend();
+        self.provider_mutex.lockUncancelable(self.io);
+        defer self.provider_mutex.unlock(self.io);
+        try owned.useModel(self.turn.model);
+        self.provider = owned.provider();
+    }
+    if (purpose == .approval_judge and self.turn.backend != null and self.turn.settings.reasoning_effort == null) {
+        const levels = self.provider.effortsFor(self.provider.model).levels;
+        if (levels.len > 0) self.turn.settings.reasoning_effort = levels[0];
+    }
     self.turn.hook_input.model = try a.dupe(u8, self.provider.model);
     self.turn.hook_input.provider = try a.dupe(u8, self.provider.name);
     self.turn.hook_input.request_settings = try std.json.Stringify.valueAlloc(a, self.turn.settings, .{ .emit_null_optional_fields = false });
@@ -72,7 +84,10 @@ pub fn prepare(self: *Request) !void {
     inline for (std.meta.fields(@import("../core/model_policy.zig").Settings)) |field| {
         if (@field(self.turn.settings, field.name) != null) needs_isolation = true;
     }
-    if (needs_isolation and self.turn.backend != null) _ = try self.ownBackend();
+    if (needs_isolation and self.turn.backend != null) {
+        const owned = try self.ownBackend();
+        self.turn.backend.?.resumeCache(owned, purpose);
+    }
     if (self.owned_backend) |owned| {
         self.provider_mutex.lockUncancelable(self.io);
         defer self.provider_mutex.unlock(self.io);
